@@ -575,7 +575,7 @@ describe("ReportsPage", () => {
     }
   });
 
-  it("renders all five line charts by default", async () => {
+  it("renders all four line charts by default", async () => {
     useReportsMock.mockReturnValue(
       asUseReportsResult({
         data: EMPTY_REPORT,
@@ -591,7 +591,6 @@ describe("ReportsPage", () => {
       "Cost by Day",
       "Tokens by Day",
       "Time to First Token",
-      "Tokens per Second",
       "Queue Wait",
     ]) {
       expect(await screen.findByText(heading)).toBeInTheDocument();
@@ -634,7 +633,7 @@ describe("ReportsPage", () => {
 
     renderWithProviders(<ReportsPage />);
 
-    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+    await user.click(screen.getByRole("button", { name: "Charts (4)" }));
     for (const chartOption of screen.getAllByRole("menuitemcheckbox")) {
       await user.click(chartOption);
     }
@@ -674,7 +673,7 @@ describe("ReportsPage", () => {
     const callsBeforeToggle = useReportsMock.mock.calls.slice(-2).map(
       ([filters, timeZone]) => [filters, timeZone],
     );
-    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+    await user.click(screen.getByRole("button", { name: "Charts (4)" }));
     await user.click(
       screen.getByRole("menuitemcheckbox", { name: "Queue Wait" }),
     );
