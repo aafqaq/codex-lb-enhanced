@@ -1,0 +1,26 @@
+# Staging environment — based on the external DB install mode with moderate scale and monitoring enabled.
+replicaCount: 2
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+
+postgresql:
+  enabled: false
+
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+ingress:
+  enabled: true
+  # Render the full nginx annotation set (streaming safety + sticky hashing).
+  nginx:
+    enabled: true
+  hosts:
+    - host: codex-lb.staging.example.com
+      paths:
+        - path: /
+          pathType: Prefix

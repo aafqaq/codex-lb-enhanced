@@ -1,0 +1,82 @@
+import path from "node:path";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import react from "@vitejs/plugin-react-swc";
+import tailwindcss from "@tailwindcss/vite";
+import { defineConfig } from "vitest/config";
+
+const proxyTarget = process.env.API_PROXY_TARGET || "http://localhost:2455";
+const packageJson = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version?: string };
+const appVersion = packageJson.version ?? "0.0.0";
+const manualChunkPackages: Record<string, string[]> = {
+  "vendor-react": ["react", "react-dom", "react-router-dom"],
+  "vendor-query": ["@tanstack/react-query"],
+  // recharts is intentionally NOT a manual chunk: forcing it into one made
+  // the bundler hoist shared helper modules into that group, which turned
+  // the (lazy-only) 580 KB chart bundle into a static import of the entry
+  // chunk, modulepreloaded before first paint.
+  "vendor-ui": ["radix-ui"],
+};
+
+function manualChunks(id: string): string | undefined {
+  if (!id.includes("/node_modules/")) {
+    return undefined;
+  }
+
+  for (const [chunkName, packages] of Object.entries(manualChunkPackages)) {
+    if (packages.some((packageName) => id.includes(`/node_modules/${packageName}/`))) {
+      return chunkName;
+    }
+  }
+
+  return undefined;
+}
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  define: {
+    __APP_VERSION__: JSON.stringify(appVersion),
+  },
+  resolve: {
+    alias: {
+      "@": path.resolve(path.dirname(fileURLToPath(import.meta.url)), "./src"),
+    },
+  },
+  server: {
+    proxy: {
+      "/api": proxyTarget,
+      "/v1": proxyTarget,
+      "/backend-api": proxyTarget,
+      "/health": proxyTarget,
+    },
+  },
+  build: {
+    outDir: "../app/static",
+    emptyOutDir: true,
+    chunkSizeWarningLimit: 600,
+    rollupOptions: {
+      output: {
+        manualChunks,
+      },
+    },
+  },
+  test: {
+    globals: true,
+    environment: "jsdom",
+    setupFiles: "./src/test/setup.ts",
+    exclude: ["browser-smoke/**", "screenshots/**", "node_modules/**"],
+    fileParallelism: false,
+    testTimeout: 15_000,
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html"],
+      thresholds: {
+        lines: 70,
+        functions: 70,
+        branches: 70,
+        statements: 70,
+      },
+    },
+  },
+});

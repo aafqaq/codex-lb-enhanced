@@ -1,0 +1,1406 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import math
+import time
+from collections.abc import Awaitable, Callable, Collection, Hashable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Final, Mapping, Protocol, cast
+
+from app.core import usage as usage_core
+from app.core.auth.refresh import RefreshError
+from app.core.balancer import (
+    PERMANENT_FAILURE_CODES,
+    QUOTA_EXCEEDED_COOLDOWN_SECONDS,
+    RATE_LIMITED_MIN_COOLDOWN_SECONDS,
+    account_status_for_permanent_failure,
+    plausible_rate_limit_reset_at,
+)
+from app.core.clients.usage import UsageFetchError, fetch_usage
+from app.core.config.settings import get_settings
+from app.core.crypto import TokenEncryptor
+from app.core.plan_types import ACCOUNT_PLAN_TYPES, coerce_account_plan_type, normalize_account_plan_type
+from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError, resolve_upstream_route
+from app.core.usage.models import AdditionalRateLimitPayload, UsagePayload, UsageWindow
+from app.core.utils.request_id import get_request_id
+from app.core.utils.shared_future import wait_on_shared_future
+from app.core.utils.time import utcnow
+from app.db.models import Account, AccountStatus, UsageHistory
+from app.db.session import get_background_session
+from app.modules.accounts.auth_manager import AccountsRepositoryPort, AuthManager
+from app.modules.accounts.background_repository import BackgroundAccountsRepository
+from app.modules.accounts.repository import AccountsRepository as SessionAccountsRepository
+from app.modules.proxy.account_cache import get_account_selection_cache, mark_account_routing_unavailable
+from app.modules.usage.additional_quota_keys import canonicalize_additional_quota_key
+from app.modules.usage.background_repository import BackgroundAdditionalUsageRepository, BackgroundUsageRepository
+from app.modules.usage.plan_downgrade_observations import (
+    InMemoryPlanDowngradeObservationStore,
+    PlanDowngradeObservationStorePort,
+    credential_fingerprint,
+    get_plan_downgrade_observation_store,
+)
+from app.modules.usage.repository import AdditionalUsageRepository, UsageWindowWrite
+from app.modules.usage.repository import UsageRepository as SessionUsageRepository
+
+logger = logging.getLogger(__name__)
+
+
+class UsageRepositoryPort(Protocol):
+    async def latest_entry_for_account(
+        self,
+        account_id: str,
+        *,
+        window: str | None = None,
+    ) -> UsageHistory | None: ...
+
+    async def add_account_snapshot(
+        self,
+        account_id: str,
+        windows: Collection[UsageWindowWrite],
+        *,
+        recorded_at: datetime | None = None,
+    ) -> list[UsageHistory]: ...
+
+
+class AdditionalUsageRepositoryPort(Protocol):
+    async def add_entry(
+        self,
+        account_id: str,
+        limit_name: str,
+        metered_feature: str,
+        window: str,
+        used_percent: float,
+        reset_at: int | None = None,
+        window_minutes: int | None = None,
+        recorded_at: datetime | None = None,
+        quota_key: str | None = None,
+    ) -> None: ...
+
+    async def delete_for_account(self, account_id: str) -> None: ...
+
+    async def delete_for_account_and_quota_key(self, account_id: str, quota_key: str) -> None: ...
+
+    async def delete_for_account_and_limit(self, account_id: str, limit_name: str) -> None: ...
+
+    async def delete_for_account_quota_key_window(
+        self,
+        account_id: str,
+        quota_key: str,
+        window: str,
+    ) -> None: ...
+
+    async def delete_for_account_limit_window(
+        self,
+        account_id: str,
+        limit_name: str,
+        window: str,
+    ) -> None: ...
+
+    async def list_quota_keys(
+        self,
+        *,
+        account_ids: Collection[str] | None = None,
+        since: datetime | None = None,
+    ) -> list[str]: ...
+
+    async def list_limit_names(
+        self,
+        *,
+        account_ids: Collection[str] | None = None,
+        since: datetime | None = None,
+    ) -> list[str]: ...
+
+    async def latest_recorded_at_for_account(self, account_id: str) -> datetime | None: ...
+
+
+class AccountsRepositoryWithStatusComparePort(AccountsRepositoryPort, Protocol):
+    async def update_status_if_current(
+        self,
+        account_id: str,
+        status: AccountStatus,
+        deactivation_reason: str | None = None,
+        reset_at: int | None = None,
+        blocked_at: int | None = None,
+        *,
+        expected_status: AccountStatus,
+        expected_deactivation_reason: str | None = None,
+        expected_reset_at: int | None = None,
+        expected_blocked_at: int | None = None,
+        expected_refresh_token_encrypted: bytes | None = None,
+    ) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AccountRefreshResult:
+    usage_written: bool
+    fetch_succeeded: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _MergedAdditionalWindow:
+    limit_name: str
+    metered_feature: str
+    used_percent: float
+    reset_at: int | None
+    window_minutes: int | None
+
+
+# Module-level freshness cache for additional-only accounts (no main UsageHistory
+# entry). Used as a fast path to avoid DB queries on every pass within the same
+# process. Updated only after a successful refresh that wrote data.
+_last_successful_refresh: dict[str, datetime] = {}
+_usage_refresh_auth_cooldowns: dict[str, float] = {}
+
+# Fallback for consecutive workspace-less "free" observations (issue #1456) used
+# only when persistence is explicitly disabled -- the DB-less unit-test harness.
+# The process default is the database-backed
+# :class:`PlanDowngradeObservationStore`, so the observation sequence stays
+# coherent across replicas sharing one database; this fallback preserves
+# single-process behavior instead of dropping the guard when no database is
+# available.
+_FALLBACK_PLAN_DOWNGRADE_OBSERVATIONS = InMemoryPlanDowngradeObservationStore()
+
+# Number of consecutive agreeing observations required before a workspace-less
+# paid -> free downgrade is persisted. Deliberately a constant rather than a
+# CODEX_LB_* setting: two observations is the minimum that distinguishes a real
+# expiry from a single degraded response, and operators gain nothing from tuning
+# it (PRINCIPLES.md P2, settings-surface ratchet in issue #1340).
+_FREE_PLAN_DOWNGRADE_CONFIRMATIONS: Final[int] = 2
+
+
+class _UsageRefreshSingleflight:
+    def __init__(self) -> None:
+        self._inflight: dict[Hashable, asyncio.Task[AccountRefreshResult]] = {}
+        self._lock = asyncio.Lock()
+
+    async def run(
+        self,
+        account_id: Hashable,
+        factory: Callable[[], Awaitable[AccountRefreshResult]],
+        *,
+        join_existing: bool = True,
+    ) -> AccountRefreshResult:
+        while True:
+            wait_for_existing: asyncio.Task[AccountRefreshResult] | None = None
+            async with self._lock:
+                task = self._inflight.get(account_id)
+                if task is None or task.done():
+                    task = asyncio.create_task(self._run_factory(factory))
+                    self._inflight[account_id] = task
+                    task.add_done_callback(
+                        lambda done, *, key=account_id: self._clear_if_current(key, done),
+                    )
+                    break
+                if join_existing:
+                    break
+                wait_for_existing = task
+            if wait_for_existing is None:
+                break
+            try:
+                await wait_on_shared_future(wait_for_existing)
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise
+            except Exception:
+                pass
+        return await wait_on_shared_future(task)
+
+    async def _run_factory(
+        self,
+        factory: Callable[[], Awaitable[AccountRefreshResult]],
+    ) -> AccountRefreshResult:
+        return await factory()
+
+    def _clear_if_current(
+        self,
+        key: Hashable,
+        task: asyncio.Task[AccountRefreshResult],
+    ) -> None:
+        current = self._inflight.get(key)
+        if current is task:
+            self._inflight.pop(key, None)
+        if task.cancelled():
+            return
+        with contextlib.suppress(BaseException):
+            task.exception()
+
+    def clear(self) -> None:
+        self._inflight.clear()
+
+    async def cancel_all(self) -> None:
+        async with self._lock:
+            tasks = list(self._inflight.values())
+            self._inflight.clear()
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return
+        with contextlib.suppress(BaseException):
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+_USAGE_REFRESH_SINGLEFLIGHT = _UsageRefreshSingleflight()
+
+
+def _usage_refresh_singleflight_key(
+    account_id: str,
+    *,
+    own_singleflight_session: bool = False,
+) -> str | tuple[str, str]:
+    return ("owned-session", account_id) if own_singleflight_session else account_id
+
+
+class UsageUpdater:
+    def __init__(
+        self,
+        usage_repo: UsageRepositoryPort,
+        accounts_repo: AccountsRepositoryPort | None = None,
+        additional_usage_repo: AdditionalUsageRepositoryPort | AdditionalUsageRepository | None = None,
+        *,
+        auth_manager: AuthManager | None = None,
+    ) -> None:
+        self._usage_repo = usage_repo
+        self._accounts_repo = accounts_repo
+        self._additional_usage_repo = additional_usage_repo
+        self._encryptor = TokenEncryptor()
+        self._auth_manager = (
+            auth_manager if auth_manager is not None else AuthManager(accounts_repo) if accounts_repo else None
+        )
+
+    async def refresh_accounts(
+        self,
+        accounts: list[Account],
+        latest_usage: Mapping[str, UsageHistory],
+        *,
+        own_singleflight_sessions: bool = False,
+    ) -> bool:
+        """Refresh usage for all accounts. Returns True if usage rows were written."""
+        settings = get_settings()
+        if not settings.usage_refresh_enabled:
+            return False
+
+        refreshed = False
+        now = utcnow()
+        interval = settings.usage_refresh_interval_seconds
+        _prune_usage_refresh_auth_cooldowns()
+        for account in accounts:
+            if account.status in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
+                continue
+            if _is_usage_refresh_in_cooldown(account.id):
+                continue
+            latest = await self._freshness_usage_entry(account, latest_usage.get(account.id))
+            bypass_freshness = _quota_recovery_should_bypass_freshness(account, latest=latest)
+            if not bypass_freshness and await self._usage_is_fresh_with_siblings(
+                account,
+                latest,
+                now=now,
+                interval_seconds=interval,
+            ):
+                continue
+            # Additional-only accounts have no main UsageHistory entry.
+            # Check DB-backed freshness (works across workers/restarts)
+            # with process-local cache as a fast path.
+            # NOTE: When a successful fetch returns empty additional data
+            # (all rows deleted), the DB has no timestamp to consult.
+            # Cross-worker may re-fetch; process-local cache (line ~138)
+            # prevents redundant calls within the same worker.
+            if latest is None:
+                last_ok = _last_successful_refresh.get(account.id)
+                if not bypass_freshness and last_ok and (now - last_ok).total_seconds() < interval:
+                    continue
+                if self._additional_usage_repo is not None:
+                    additional_fresh_at = await self._additional_usage_repo.latest_recorded_at_for_account(
+                        account.id,
+                    )
+                    if (
+                        not bypass_freshness
+                        and additional_fresh_at
+                        and (now - additional_fresh_at).total_seconds() < interval
+                    ):
+                        _last_successful_refresh[account.id] = additional_fresh_at
+                        continue
+            # NOTE: AsyncSession is not safe for concurrent use. Run sequentially
+            # within the request-scoped session to avoid PK collisions and
+            # flush-time warnings (SAWarning: Session.add during flush).
+            try:
+                if own_singleflight_sessions:
+
+                    async def refresh_factory(account_id: str = account.id) -> AccountRefreshResult:
+                        return await self._refresh_account_if_stale_with_owned_session(
+                            account_id,
+                            interval_seconds=interval,
+                        )
+
+                else:
+
+                    async def refresh_factory(account: Account = account) -> AccountRefreshResult:
+                        return await self._refresh_account_if_stale(
+                            account,
+                            usage_account_id=account.chatgpt_account_id,
+                            interval_seconds=interval,
+                        )
+
+                result = await _USAGE_REFRESH_SINGLEFLIGHT.run(
+                    _usage_refresh_singleflight_key(
+                        account.id,
+                        own_singleflight_session=own_singleflight_sessions,
+                    ),
+                    refresh_factory,
+                    join_existing=not own_singleflight_sessions,
+                )
+                if not own_singleflight_sessions:
+                    await self._sync_account_from_repo(account)
+                refreshed = refreshed or result.usage_written
+                # Only cache when the upstream fetch actually succeeded.
+                # Transient errors (401 retry failure, 5xx, etc.) must not
+                # suppress retries within the interval.
+                if result.fetch_succeeded:
+                    _last_successful_refresh[account.id] = now
+                    _clear_usage_refresh_auth_cooldown(account.id)
+            except Exception as exc:
+                logger.warning(
+                    "Usage refresh failed account_id=%s request_id=%s error=%s",
+                    account.id,
+                    get_request_id(),
+                    exc,
+                    exc_info=True,
+                )
+                # swallow per-account failures so the whole refresh loop keeps going
+                continue
+        return refreshed
+
+    async def force_refresh(
+        self,
+        account: Account,
+        *,
+        ignore_refresh_disabled: bool = False,
+        access_token_override: str | None = None,
+    ) -> bool:
+        """Refresh one account regardless of cached/fresh usage rows."""
+        result = await self.force_refresh_result(
+            account,
+            ignore_refresh_disabled=ignore_refresh_disabled,
+            access_token_override=access_token_override,
+        )
+        return result.usage_written
+
+    async def force_refresh_result(
+        self,
+        account: Account,
+        *,
+        ignore_refresh_disabled: bool = False,
+        access_token_override: str | None = None,
+    ) -> AccountRefreshResult:
+        """Refresh one account and expose whether the upstream fetch completed."""
+        settings = get_settings()
+        if not settings.usage_refresh_enabled and not ignore_refresh_disabled:
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+        if account.status in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+        try:
+            result = await _USAGE_REFRESH_SINGLEFLIGHT.run(
+                account.id,
+                lambda: self._refresh_account(
+                    account,
+                    usage_account_id=account.chatgpt_account_id,
+                    access_token_override=access_token_override,
+                ),
+                join_existing=False,
+            )
+            await self._sync_account_from_repo(account)
+            if result.fetch_succeeded:
+                _last_successful_refresh[account.id] = utcnow()
+                _clear_usage_refresh_auth_cooldown(account.id)
+            return result
+        except Exception as exc:
+            logger.warning(
+                "Forced usage refresh failed account_id=%s request_id=%s error=%s",
+                account.id,
+                get_request_id(),
+                exc,
+                exc_info=True,
+            )
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+
+    async def _refresh_account_if_stale(
+        self,
+        account: Account,
+        *,
+        usage_account_id: str | None,
+        interval_seconds: int,
+    ) -> AccountRefreshResult:
+        primary_latest = await self._usage_repo.latest_entry_for_account(account.id, window="primary")
+        latest = await self._freshness_usage_entry(account, primary_latest)
+        if not _quota_recovery_should_bypass_freshness(account, latest=latest):
+            if await self._usage_is_fresh_with_siblings(
+                account,
+                latest,
+                now=utcnow(),
+                interval_seconds=interval_seconds,
+            ):
+                return AccountRefreshResult(usage_written=False)
+        return await self._refresh_account(
+            account,
+            usage_account_id=usage_account_id,
+        )
+
+    async def _additional_usage_is_stale(self, account_id: str, *, now: datetime, interval_seconds: int) -> bool:
+        # The upstream fetch is the only path that syncs additional
+        # (per-model) rate limits; live main-window rows must not keep an
+        # account "fresh" while its additional rows age past the interval,
+        # or gated-model routing starves on additional_quota_data_unavailable.
+        if self._additional_usage_repo is None:
+            return False
+        latest_at = await self._additional_usage_repo.latest_recorded_at_for_account(account_id)
+        if latest_at is None:
+            # No additional rows ever fetched: live rows alone must not
+            # suppress the fetch, or a first gated-model use would never be
+            # discovered. Non-gated accounts simply keep the pre-live poll
+            # cadence.
+            return True
+        return (now - latest_at).total_seconds() >= interval_seconds
+
+    async def _freshness_usage_entry(self, account: Account, latest: UsageHistory | None) -> UsageHistory | None:
+        if latest is not None:
+            return latest
+        if usage_core.capacity_for_plan(account.plan_type, "monthly") is None:
+            return None
+        return await self._usage_repo.latest_entry_for_account(account.id, window="monthly")
+
+    async def _usage_is_fresh_with_siblings(
+        self,
+        account: Account,
+        latest: UsageHistory | None,
+        *,
+        now: datetime,
+        interval_seconds: int,
+    ) -> bool:
+        if _latest_usage_is_fresh(latest, now=now, interval_seconds=interval_seconds):
+            return not await self._additional_usage_is_stale(account.id, now=now, interval_seconds=interval_seconds)
+        # A stale (or elapsed-reset) newest row of one window must not
+        # permanently defeat freshness once upstream stops reporting that
+        # window: a strictly newer sibling-window row proves a later fetch
+        # happened without rewriting the stale window, so the newest row's
+        # own freshness governs the account instead. When no primary-slot
+        # row exists at all (upstream omitted the short window from the
+        # first fetch), any sibling row is that proof.
+        newest = latest
+        for window in _MAIN_USAGE_WINDOWS:
+            if latest is not None and window == latest.window:
+                continue
+            if window == "monthly" and usage_core.capacity_for_plan(account.plan_type, "monthly") is None:
+                # A lingering monthly row from a former plan (e.g. after a
+                # free-to-paid upgrade) is not applicable usage and must not
+                # suppress refreshes.
+                continue
+            sibling = await self._usage_repo.latest_entry_for_account(account.id, window=window)
+            if sibling is not None and (newest is None or sibling.recorded_at > newest.recorded_at):
+                newest = sibling
+        if newest is None or newest is latest:
+            return False
+        if (
+            latest is not None
+            and (newest.recorded_at - latest.recorded_at).total_seconds() <= usage_core.SIBLING_FETCH_MARGIN_SECONDS
+        ):
+            return False
+        if not _latest_usage_is_fresh(newest, now=now, interval_seconds=interval_seconds):
+            return False
+        return not await self._additional_usage_is_stale(account.id, now=now, interval_seconds=interval_seconds)
+
+    async def _refresh_account_if_stale_with_owned_session(
+        self,
+        account_id: str,
+        *,
+        interval_seconds: int,
+    ) -> AccountRefreshResult:
+        @contextlib.asynccontextmanager
+        async def refresh_repo_factory():
+            async with get_background_session() as refresh_session:
+                yield SessionAccountsRepository(refresh_session)
+
+        async with get_background_session() as session:
+            accounts_repo = SessionAccountsRepository(session)
+            usage_repo = SessionUsageRepository(session)
+            additional_usage_repo = AdditionalUsageRepository(session)
+            account = await accounts_repo.get_by_id(account_id)
+            if account is None:
+                return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+            if account.status in (AccountStatus.PAUSED, AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
+                return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+            return await UsageUpdater(
+                usage_repo,
+                accounts_repo,
+                additional_usage_repo,
+                auth_manager=AuthManager(accounts_repo, refresh_repo_factory=refresh_repo_factory),
+            )._refresh_account_if_stale(
+                account,
+                usage_account_id=account.chatgpt_account_id,
+                interval_seconds=interval_seconds,
+            )
+
+    async def _refresh_account(
+        self,
+        account: Account,
+        *,
+        usage_account_id: str | None,
+        access_token_override: str | None = None,
+    ) -> AccountRefreshResult:
+        access_token = access_token_override or self._encryptor.decrypt(account.access_token_encrypted)
+        payload: UsagePayload | None = None
+        try:
+            route = await _resolve_upstream_route_for_account(account, operation="usage_refresh")
+            payload = await fetch_usage(
+                access_token=access_token,
+                account_id=usage_account_id,
+                route=route,
+                allow_direct_egress=route is None,
+            )
+        except UpstreamProxyRouteError as exc:
+            logger.warning(
+                "Usage refresh upstream proxy route unavailable account_id=%s reason=%s",
+                account.id,
+                exc.reason,
+            )
+            _mark_usage_refresh_auth_cooldown(account.id, 0)
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+        except UsageFetchError as exc:
+            if _should_deactivate_for_usage_error(exc):
+                await self._deactivate_for_client_error(account, exc)
+                return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+            if access_token_override is not None:
+                _mark_usage_refresh_auth_cooldown(account.id, exc.status_code)
+                return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+            if exc.status_code != 401 or not self._auth_manager:
+                _mark_usage_refresh_auth_cooldown(account.id, exc.status_code)
+                return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+            try:
+                account = await self._auth_manager.ensure_fresh(account, force=True)
+            except RefreshError:
+                _mark_usage_refresh_auth_cooldown(account.id, exc.status_code)
+                return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+            access_token = self._encryptor.decrypt(account.access_token_encrypted)
+            try:
+                route = await _resolve_upstream_route_for_account(account, operation="usage_refresh")
+                payload = await fetch_usage(
+                    access_token=access_token,
+                    account_id=usage_account_id,
+                    route=route,
+                    allow_direct_egress=route is None,
+                )
+            except UpstreamProxyRouteError as route_exc:
+                logger.warning(
+                    "Usage refresh retry upstream proxy route unavailable account_id=%s reason=%s",
+                    account.id,
+                    route_exc.reason,
+                )
+                _mark_usage_refresh_auth_cooldown(account.id, 0)
+                return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+            except UsageFetchError as retry_exc:
+                if _should_deactivate_for_usage_error(retry_exc):
+                    await self._deactivate_for_client_error(account, retry_exc)
+                else:
+                    _mark_usage_refresh_auth_cooldown(account.id, retry_exc.status_code)
+                return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+
+        if payload is None:
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+
+        if await _payload_mismatches_account_slot(account, payload):
+            logger.warning(
+                "Usage refresh payload identity mismatch; skipping account mutation "
+                "account_id=%s stored_workspace_id=%s payload_workspace_id=%s stored_plan_type=%s "
+                "payload_plan_type=%s stored_seat_type=%s payload_seat_type=%s request_id=%s",
+                account.id,
+                account.workspace_id,
+                payload.workspace_id,
+                account.plan_type,
+                payload.plan_type,
+                account.seat_type,
+                payload.seat_type,
+                get_request_id(),
+            )
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+
+        identity_matches_slot = await self._sync_identity_metadata(account, payload)
+        if not identity_matches_slot:
+            logger.warning(
+                "Usage refresh payload reported a workspace slot owned by another account; "
+                "skipping account usage mutation account_id=%s payload_workspace_id=%s request_id=%s",
+                account.id,
+                payload.workspace_id,
+                get_request_id(),
+            )
+            return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+
+        now_epoch = _now_epoch()
+        if self._additional_usage_repo is not None:
+            if payload.additional_rate_limits:
+                merged_limits = _merge_additional_rate_limits(
+                    payload.additional_rate_limits,
+                    account_id=account.id,
+                    now_epoch=now_epoch,
+                )
+                current_entries: set[tuple[str, str]] = set()
+                for quota_key, windows in merged_limits.items():
+                    for window, merged_window in windows.items():
+                        current_entries.add((quota_key, window))
+                        await _add_additional_usage_entry(
+                            self._additional_usage_repo,
+                            account_id=account.id,
+                            limit_name=merged_window.limit_name,
+                            metered_feature=merged_window.metered_feature,
+                            quota_key=quota_key,
+                            window=window,
+                            used_percent=merged_window.used_percent,
+                            reset_at=merged_window.reset_at,
+                            window_minutes=merged_window.window_minutes,
+                        )
+                current_quota_keys = {name for name, _ in current_entries}
+                existing_quota_keys = await _list_additional_usage_quota_keys(
+                    self._additional_usage_repo,
+                    account_ids=[account.id],
+                )
+                for stale_key in existing_quota_keys:
+                    if stale_key not in current_quota_keys:
+                        await _delete_additional_usage_quota_key(
+                            self._additional_usage_repo,
+                            account.id,
+                            stale_key,
+                        )
+                        continue
+                    for window in ("primary", "secondary"):
+                        if (stale_key, window) not in current_entries:
+                            await _delete_additional_usage_quota_key_window(
+                                self._additional_usage_repo,
+                                account.id,
+                                stale_key,
+                                window,
+                            )
+            elif payload.additional_rate_limits is not None:
+                await self._additional_usage_repo.delete_for_account(account.id)
+
+        rate_limit = payload.rate_limit
+        if rate_limit is None:
+            additional_synced = self._additional_usage_repo is not None and payload.additional_rate_limits is not None
+            return AccountRefreshResult(usage_written=additional_synced)
+        # Treat both None and empty rate_limit (both windows absent) as
+        # additional-only to avoid falling through to window processing.
+        normalized_windows = usage_core.normalize_rate_limit_windows(
+            rate_limit.primary_window,
+            rate_limit.secondary_window,
+        )
+        primary = normalized_windows.primary
+        secondary = normalized_windows.secondary
+        monthly = normalized_windows.monthly
+        if primary is None and secondary is None:
+            if monthly is None:
+                additional_synced = (
+                    self._additional_usage_repo is not None and payload.additional_rate_limits is not None
+                )
+                return AccountRefreshResult(usage_written=additional_synced)
+        if primary is None and secondary is None and monthly is None:
+            additional_synced = self._additional_usage_repo is not None and payload.additional_rate_limits is not None
+            return AccountRefreshResult(usage_written=additional_synced)
+        credits_has, credits_unlimited, credits_balance = _credits_snapshot(payload)
+        snapshot_windows: list[UsageWindowWrite] = []
+
+        if primary and primary.used_percent is not None:
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="primary",
+                    used_percent=float(primary.used_percent),
+                    reset_at=_reset_at(primary.reset_at, primary.reset_after_seconds, now_epoch),
+                    window_minutes=_window_minutes(primary.limit_window_seconds),
+                    credits_has=credits_has,
+                    credits_unlimited=credits_unlimited,
+                    credits_balance=credits_balance,
+                )
+            )
+
+        if secondary and secondary.used_percent is not None:
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="secondary",
+                    used_percent=float(secondary.used_percent),
+                    reset_at=_reset_at(secondary.reset_at, secondary.reset_after_seconds, now_epoch),
+                    window_minutes=_window_minutes(secondary.limit_window_seconds),
+                )
+            )
+
+        if monthly and monthly.used_percent is not None:
+            snapshot_windows.append(
+                UsageWindowWrite(
+                    window="monthly",
+                    used_percent=float(monthly.used_percent),
+                    reset_at=_reset_at(monthly.reset_at, monthly.reset_after_seconds, now_epoch),
+                    window_minutes=_window_minutes(monthly.limit_window_seconds),
+                    credits_has=credits_has,
+                    credits_unlimited=credits_unlimited,
+                    credits_balance=credits_balance,
+                )
+            )
+
+        entries = await self._usage_repo.add_account_snapshot(
+            account.id,
+            snapshot_windows,
+        )
+        usage_written = any(_usage_entry_written(entry) for entry in entries)
+        await self._recover_quota_status_from_usage(account, primary=primary, secondary=secondary, monthly=monthly)
+        return AccountRefreshResult(usage_written=usage_written)
+
+    async def _deactivate_for_client_error(self, account: Account, exc: UsageFetchError) -> None:
+        if not self._auth_manager:
+            return
+        reason = f"Usage API error: HTTP {exc.status_code} - {exc.message}"
+        status = (
+            account_status_for_permanent_failure(exc.code)
+            if exc.code in PERMANENT_FAILURE_CODES
+            else AccountStatus.DEACTIVATED
+        )
+        logger.warning(
+            "Marking account unavailable due to client error account_id=%s account_status=%s status=%s "
+            "message=%s request_id=%s",
+            account.id,
+            status.value,
+            exc.status_code,
+            exc.message,
+            get_request_id(),
+        )
+        await self._auth_manager._repo.update_status(account.id, status, reason)
+        account.status = status
+        account.deactivation_reason = reason
+        mark_account_routing_unavailable(account.id)
+        get_account_selection_cache().invalidate()
+
+    async def _sync_identity_metadata(self, account: Account, payload: UsagePayload) -> bool:
+        next_plan_type = coerce_account_plan_type(payload.plan_type, account.plan_type or "free")
+        payload_workspace_id = _clean_optional(payload.workspace_id)
+        next_workspace_id = payload_workspace_id or account.workspace_id
+        next_workspace_label = _clean_optional(payload.workspace_label) or account.workspace_label
+        next_seat_type = _clean_optional(payload.seat_type) or account.seat_type
+        if self._auth_manager and payload_workspace_id and not account.workspace_id:
+            slot_taken = await self._auth_manager._repo.workspace_slot_taken(
+                account_id=account.id,
+                email=account.email,
+                chatgpt_account_id=account.chatgpt_account_id,
+                workspace_id=payload_workspace_id,
+            )
+            if slot_taken:
+                logger.warning(
+                    "Usage payload reported workspace_id=%s for legacy account_id=%s, but that slot "
+                    "is already owned by another account; skipping usage payload",
+                    payload_workspace_id,
+                    account.id,
+                )
+                return False
+        if (
+            next_plan_type == account.plan_type
+            and next_workspace_id == account.workspace_id
+            and next_workspace_label == account.workspace_label
+            and next_seat_type == account.seat_type
+        ):
+            return True
+
+        account.plan_type = next_plan_type
+        account.workspace_id = next_workspace_id
+        account.workspace_label = next_workspace_label
+        account.seat_type = next_seat_type
+        if not self._auth_manager:
+            return True
+
+        # Identity/plan/workspace sync only. This runs against a stale in-memory
+        # ``account`` snapshot taken well before the write, so it MUST route
+        # through the metadata-only writer, which structurally cannot touch
+        # token ciphertext. Persisting token material from this snapshot would
+        # clobber a peer replica's concurrent refresh-token rotation.
+        await self._auth_manager._repo.update_account_metadata(
+            account.id,
+            plan_type=account.plan_type,
+            email=account.email,
+            chatgpt_account_id=account.chatgpt_account_id,
+            workspace_id=account.workspace_id,
+            workspace_label=account.workspace_label,
+            seat_type=account.seat_type,
+        )
+        return True
+
+    async def _recover_quota_status_from_usage(
+        self,
+        account: Account,
+        *,
+        primary: UsageWindow | None,
+        secondary: UsageWindow | None,
+        monthly: UsageWindow | None = None,
+    ) -> None:
+        if not self._auth_manager:
+            return
+        if account.status == AccountStatus.RATE_LIMITED:
+            if account.blocked_at is not None:
+                # An account marked RATE_LIMITED by an actual 429 always
+                # carries a blocked_at marker. Honor the persisted cooldown
+                # deadline (Retry-After hint, upstream reset metadata, or the
+                # backoff floor) so the periodic usage refresh cannot flip the
+                # account back to ACTIVE — erasing reset_at that peer replicas
+                # rely on — while the upstream cooldown is still running.
+                # Fresh usage showing quota is not evidence the 429 window
+                # ended: throttles are not always quota-based. Rows without
+                # blocked_at are stale window-derived markings and keep the
+                # fresh-usage recovery below.
+                now = time.time()
+                cooldown_deadline = plausible_rate_limit_reset_at(account.reset_at, now=now) or (
+                    float(account.blocked_at) + RATE_LIMITED_MIN_COOLDOWN_SECONDS
+                )
+                if now < cooldown_deadline:
+                    return
+            long_window = monthly or secondary
+            if primary is None and monthly is None:
+                return
+            if primary is not None and not _window_has_available_quota(primary):
+                return
+            if primary is None and (long_window is None or not _window_has_available_quota(long_window)):
+                return
+            if long_window is not None and not _window_has_available_quota(long_window):
+                return
+            target_status = AccountStatus.ACTIVE
+            target_reset_at = None
+            expected_status = AccountStatus.RATE_LIMITED
+        elif account.status == AccountStatus.QUOTA_EXCEEDED:
+            if account.blocked_at is not None and time.time() < account.blocked_at + QUOTA_EXCEEDED_COOLDOWN_SECONDS:
+                return
+            long_window = monthly or secondary
+            windows = [window for window in (primary, long_window) if window is not None]
+            if long_window is None or not _window_has_available_quota(long_window):
+                return
+            if primary is not None and _window_is_exhausted(primary):
+                target_status = AccountStatus.RATE_LIMITED
+                target_reset_at = _reset_at(primary.reset_at, primary.reset_after_seconds, _now_epoch())
+            else:
+                if any(_window_is_exhausted(window) for window in windows):
+                    return
+                target_status = AccountStatus.ACTIVE
+                target_reset_at = None
+            if not any(_window_has_available_quota(window) for window in windows):
+                return
+            expected_status = AccountStatus.QUOTA_EXCEEDED
+        else:
+            return
+
+        repo = cast(AccountsRepositoryWithStatusComparePort, self._auth_manager._repo)
+        updated = await repo.update_status_if_current(
+            account.id,
+            target_status,
+            None,
+            target_reset_at,
+            blocked_at=None,
+            expected_status=expected_status,
+            expected_deactivation_reason=account.deactivation_reason,
+            expected_reset_at=account.reset_at,
+            expected_blocked_at=account.blocked_at,
+        )
+        if not updated:
+            await self._sync_account_from_repo(account)
+            return
+        account.status = target_status
+        account.deactivation_reason = None
+        account.reset_at = target_reset_at
+        account.blocked_at = None
+
+    async def _sync_account_from_repo(self, account: Account) -> None:
+        if not self._accounts_repo:
+            return
+        stored = await self._accounts_repo.get_by_id(account.id)
+        if stored is None:
+            return
+        account.chatgpt_account_id = stored.chatgpt_account_id
+        account.email = stored.email
+        account.workspace_id = stored.workspace_id
+        account.workspace_label = stored.workspace_label
+        account.seat_type = stored.seat_type
+        account.plan_type = stored.plan_type
+        account.access_token_encrypted = stored.access_token_encrypted
+        account.refresh_token_encrypted = stored.refresh_token_encrypted
+        account.id_token_encrypted = stored.id_token_encrypted
+        account.last_refresh = stored.last_refresh
+        account.status = stored.status
+        account.deactivation_reason = stored.deactivation_reason
+        account.reset_at = stored.reset_at
+        account.blocked_at = stored.blocked_at
+
+
+def build_background_usage_updater() -> UsageUpdater:
+    accounts_repo = BackgroundAccountsRepository()
+    return UsageUpdater(
+        BackgroundUsageRepository(),
+        accounts_repo=accounts_repo,
+        additional_usage_repo=BackgroundAdditionalUsageRepository(),
+        auth_manager=AuthManager(accounts_repo),
+    )
+
+
+def _credits_snapshot(payload: UsagePayload) -> tuple[bool | None, bool | None, float | None]:
+    credits = payload.credits
+    if credits is None:
+        return None, None, None
+    credits_has = credits.has_credits
+    credits_unlimited = credits.unlimited
+    balance_value = credits.balance
+    return credits_has, credits_unlimited, _parse_credits_balance(balance_value)
+
+
+async def _payload_mismatches_account_slot(account: Account, payload: UsagePayload) -> bool:
+    payload_workspace_id = _clean_optional(payload.workspace_id)
+    if account.workspace_id and payload_workspace_id and account.workspace_id != payload_workspace_id:
+        # The payload reports a different workspace slot than the one this
+        # account is bound to; refuse to write another workspace's usage/plan.
+        # This guard is unconditional: repetition never makes a conflicting
+        # workspace identity trustworthy.
+        return True
+    if not payload_workspace_id and payload.plan_type:
+        payload_plan_type = coerce_account_plan_type(payload.plan_type, account.plan_type or "free")
+        normalized_payload_plan_type = normalize_account_plan_type(payload.plan_type)
+        stored_plan_type = coerce_account_plan_type(account.plan_type, "free")
+        recognized_paid_plans = ACCOUNT_PLAN_TYPES - {"free"}
+        # A transition from free into a recognized paid plan (e.g. Free -> Plus)
+        # or between paid plans (e.g. Plus -> Pro) is a legitimate plan change,
+        # not an identity mismatch: the usage payload carries no independent
+        # account identifier and is fetched per-account token, so plan_type alone
+        # cannot establish identity. A workspace-less payload that instead
+        # introduces "free" or an unrecognized plan stays untrusted -- the
+        # signature of a degraded or wrong-identity usage response that must not
+        # silently rewrite the stored plan.
+        if payload_plan_type != stored_plan_type and not (
+            stored_plan_type == "unknown"
+            and normalized_payload_plan_type in recognized_paid_plans
+            or (
+                not account.workspace_id
+                and stored_plan_type in ACCOUNT_PLAN_TYPES
+                and payload_plan_type in recognized_paid_plans
+            )
+        ):
+            # A subscription that expires reports "free" every cycle from that
+            # account's own token, so an agreeing repeat observation is no
+            # longer the single-sample degraded signature above. Persist the
+            # downgrade only once it has been confirmed (issue #1456).
+            if await _free_plan_downgrade_is_confirmed(
+                account,
+                stored_plan_type=stored_plan_type,
+                normalized_payload_plan_type=normalized_payload_plan_type,
+            ):
+                return False
+            return True
+        if normalize_account_plan_type(payload.plan_type) in (ACCOUNT_PLAN_TYPES - {"free"}):
+            # The account reports a recognized paid plan, which is positive
+            # evidence that it is still paid, so any pending downgrade evidence
+            # is discarded. An unrecognized value is absence of evidence and
+            # deliberately does not reach here.
+            await _clear_workspace_less_free_plan_observations(account.id)
+    return False
+
+
+async def _free_plan_downgrade_is_confirmed(
+    account: Account,
+    *,
+    stored_plan_type: str,
+    normalized_payload_plan_type: str | None,
+) -> bool:
+    """Record a workspace-less paid -> free observation and report confirmation.
+
+    Only a recognized ``free`` payload against a recognized paid stored plan on a
+    workspace-less account is confirmable. Unrecognized plan values never
+    accumulate, so a degraded response reporting garbage can never downgrade an
+    account no matter how often it repeats.
+    """
+    if normalized_payload_plan_type != "free":
+        return False
+    if stored_plan_type not in (ACCOUNT_PLAN_TYPES - {"free"}):
+        return False
+    if account.workspace_id:
+        # The account is bound to a workspace, so a payload that omits
+        # ``workspace_id`` cannot establish that it describes this slot. A
+        # workspace-bound seat (Team/Business/Enterprise) must not be demoted to
+        # free on the strength of a payload that never names its workspace,
+        # however many times it repeats.
+        return False
+    fingerprint = credential_fingerprint(account)
+    store = _plan_downgrade_observation_store()
+    # One atomic step records the observation and returns the resulting count.
+    # The fingerprint digests the account's stable seat identity, not token
+    # material, so routine token rotation between two observations does not
+    # restart the sequence and a real expiry still converges (#1456). Credential
+    # replacement (re-import or in-place reauthentication) resets pending
+    # evidence at the replacement site itself -- the accounts repository
+    # discards it in the same transaction that applies the fresh material --
+    # while the fingerprint comparison here restarts the count for any
+    # remaining path that rebinds the row's seat identity. Doing this as a read
+    # followed by a write would leave an await between the two halves, letting
+    # concurrent refreshes for one account lose an increment.
+    observations = await store.observe(
+        account.id,
+        credential_fingerprint=fingerprint,
+        observed_plan_type="free",
+    )
+    if observations < _FREE_PLAN_DOWNGRADE_CONFIRMATIONS:
+        logger.info(
+            "Usage refresh observed a workspace-less downgrade to free; awaiting confirmation "
+            "account_id=%s stored_plan_type=%s observations=%s required=%s request_id=%s",
+            account.id,
+            stored_plan_type,
+            observations,
+            _FREE_PLAN_DOWNGRADE_CONFIRMATIONS,
+            get_request_id(),
+        )
+        return False
+    await store.clear(account.id)
+    logger.info(
+        "Usage refresh confirmed a workspace-less downgrade to free; persisting plan change "
+        "account_id=%s stored_plan_type=%s observations=%s request_id=%s",
+        account.id,
+        stored_plan_type,
+        observations,
+        get_request_id(),
+    )
+    return True
+
+
+def _plan_downgrade_observation_store() -> PlanDowngradeObservationStorePort:
+    """Resolve the shared store, falling back to process-local state.
+
+    The database-backed store is the process default so the observation sequence
+    is coherent across replicas. When persistence is explicitly disabled (the
+    DB-less unit-test harness), the fallback preserves the previous
+    single-process behavior rather than losing the guard entirely.
+    """
+    store = get_plan_downgrade_observation_store()
+    if store is not None:
+        return store
+    return _FALLBACK_PLAN_DOWNGRADE_OBSERVATIONS
+
+
+async def _clear_workspace_less_free_plan_observations(account_id: str) -> None:
+    await _plan_downgrade_observation_store().clear(account_id)
+
+
+def _clean_optional(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _usage_entry_written(entry: UsageHistory | None) -> bool:
+    return entry is not None
+
+
+def _window_has_available_quota(window: UsageWindow) -> bool:
+    used_percent = window.used_percent
+    return used_percent is not None and float(used_percent) < 100.0
+
+
+def _window_is_exhausted(window: UsageWindow) -> bool:
+    used_percent = window.used_percent
+    return used_percent is not None and float(used_percent) >= 100.0
+
+
+def _prefer_merged_additional_window(
+    existing: _MergedAdditionalWindow,
+    candidate: _MergedAdditionalWindow,
+    *,
+    quota_key: str,
+    window: str,
+) -> _MergedAdditionalWindow:
+    if candidate.used_percent > existing.used_percent:
+        logger.warning(
+            "Additional usage refresh saw conflicting aliases for the same canonical quota window; "
+            "keeping the higher usage sample account_quota=%s window=%s existing_limit=%s candidate_limit=%s "
+            "request_id=%s",
+            quota_key,
+            window,
+            existing.limit_name,
+            candidate.limit_name,
+            get_request_id(),
+        )
+        return candidate
+    if candidate.used_percent < existing.used_percent:
+        logger.warning(
+            "Additional usage refresh saw conflicting aliases for the same canonical quota window; "
+            "keeping the higher usage sample account_quota=%s window=%s existing_limit=%s candidate_limit=%s "
+            "request_id=%s",
+            quota_key,
+            window,
+            existing.limit_name,
+            candidate.limit_name,
+            get_request_id(),
+        )
+        return existing
+    preferred = sorted(
+        (existing, candidate),
+        key=lambda entry: (entry.limit_name, entry.metered_feature),
+    )[0]
+    if preferred != existing or existing != candidate:
+        logger.info(
+            "Additional usage refresh coalesced duplicate aliases for canonical quota window "
+            "account_quota=%s window=%s chosen_limit=%s request_id=%s",
+            quota_key,
+            window,
+            preferred.limit_name,
+            get_request_id(),
+        )
+    return preferred
+
+
+def _merge_additional_rate_limits(
+    additional_rate_limits: Collection[AdditionalRateLimitPayload],
+    *,
+    account_id: str,
+    now_epoch: int,
+) -> dict[str, dict[str, _MergedAdditionalWindow]]:
+    merged: dict[str, dict[str, _MergedAdditionalWindow]] = {}
+    for additional in additional_rate_limits:
+        limit_name = getattr(additional, "limit_name", None)
+        metered_feature = getattr(additional, "metered_feature", None)
+        quota_key = canonicalize_additional_quota_key(
+            limit_name=limit_name,
+            metered_feature=metered_feature,
+        )
+        if quota_key is None:
+            logger.warning(
+                "Skipping additional usage item without resolvable quota key "
+                "account_id=%s limit_name=%s metered_feature=%s request_id=%s",
+                account_id,
+                limit_name,
+                metered_feature,
+                get_request_id(),
+            )
+            continue
+        rate_limit = getattr(additional, "rate_limit", None)
+        if rate_limit is None:
+            continue
+        for window_name, usage_window in (
+            ("primary", getattr(rate_limit, "primary_window", None)),
+            ("secondary", getattr(rate_limit, "secondary_window", None)),
+        ):
+            if usage_window is None or usage_window.used_percent is None:
+                continue
+            candidate = _MergedAdditionalWindow(
+                limit_name=str(limit_name),
+                metered_feature=str(metered_feature),
+                used_percent=float(usage_window.used_percent),
+                reset_at=_reset_at(usage_window.reset_at, usage_window.reset_after_seconds, now_epoch),
+                window_minutes=_window_minutes(usage_window.limit_window_seconds),
+            )
+            windows = merged.setdefault(quota_key, {})
+            existing = windows.get(window_name)
+            windows[window_name] = (
+                candidate
+                if existing is None
+                else _prefer_merged_additional_window(
+                    existing,
+                    candidate,
+                    quota_key=quota_key,
+                    window=window_name,
+                )
+            )
+    return merged
+
+
+async def _add_additional_usage_entry(
+    repo: AdditionalUsageRepositoryPort | AdditionalUsageRepository,
+    *,
+    account_id: str,
+    limit_name: str,
+    metered_feature: str,
+    quota_key: str,
+    window: str,
+    used_percent: float,
+    reset_at: int | None,
+    window_minutes: int | None,
+) -> None:
+    await repo.add_entry(
+        account_id=account_id,
+        limit_name=limit_name,
+        metered_feature=metered_feature,
+        quota_key=quota_key,
+        window=window,
+        used_percent=used_percent,
+        reset_at=reset_at,
+        window_minutes=window_minutes,
+    )
+
+
+async def _list_additional_usage_quota_keys(
+    repo: AdditionalUsageRepositoryPort | AdditionalUsageRepository,
+    *,
+    account_ids: Collection[str] | None = None,
+) -> list[str]:
+    return await repo.list_quota_keys(account_ids=account_ids)
+
+
+async def _delete_additional_usage_quota_key(
+    repo: AdditionalUsageRepositoryPort | AdditionalUsageRepository,
+    account_id: str,
+    quota_key: str,
+) -> None:
+    await repo.delete_for_account_and_quota_key(account_id, quota_key)
+
+
+async def _delete_additional_usage_quota_key_window(
+    repo: AdditionalUsageRepositoryPort | AdditionalUsageRepository,
+    account_id: str,
+    quota_key: str,
+    window: str,
+) -> None:
+    await repo.delete_for_account_quota_key_window(account_id, quota_key, window)
+
+
+def _latest_usage_is_fresh(
+    latest: UsageHistory | None,
+    *,
+    now: datetime,
+    interval_seconds: int,
+) -> bool:
+    if latest is None:
+        return False
+    if (now - latest.recorded_at).total_seconds() >= interval_seconds:
+        return False
+    if latest.reset_at is not None:
+        now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+        if now_epoch >= latest.reset_at:
+            return False
+    return True
+
+
+_MAIN_USAGE_WINDOWS = ("primary", "secondary", "monthly")
+
+
+def _quota_recovery_should_bypass_freshness(account: Account, *, latest: UsageHistory | None) -> bool:
+    if _account_needs_post_reset_refresh(account, latest=latest):
+        return True
+    if account.status != AccountStatus.QUOTA_EXCEEDED:
+        return False
+    if account.blocked_at is None:
+        return latest is None
+    cooldown_expires_at = account.blocked_at + QUOTA_EXCEEDED_COOLDOWN_SECONDS
+    if time.time() < cooldown_expires_at:
+        return False
+    if latest is None:
+        return True
+    recorded_at = latest.recorded_at
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+    return recorded_at.timestamp() < cooldown_expires_at
+
+
+def _account_needs_post_reset_refresh(account: Account, *, latest: UsageHistory | None) -> bool:
+    if account.status not in (AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED):
+        return False
+    if account.reset_at is None:
+        return False
+    if time.time() < account.reset_at:
+        return False
+    if latest is None:
+        return True
+    recorded_at = latest.recorded_at
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+    return recorded_at.timestamp() < float(account.reset_at)
+
+
+def _parse_credits_balance(value: str | int | float | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _window_minutes(limit_seconds: int | None) -> int | None:
+    if not limit_seconds or limit_seconds <= 0:
+        return None
+    return max(1, math.ceil(limit_seconds / 60))
+
+
+def _now_epoch() -> int:
+    return int(utcnow().replace(tzinfo=timezone.utc).timestamp())
+
+
+def _reset_at(reset_at: int | None, reset_after_seconds: int | None, now_epoch: int) -> int | None:
+    if reset_at is not None:
+        return int(reset_at)
+    if reset_after_seconds is None:
+        return None
+    return now_epoch + max(0, int(reset_after_seconds))
+
+
+# The usage endpoint can return 403 for accounts that are still otherwise usable
+# for proxy traffic, so treat it as a refresh failure instead of a permanent
+# account-level deactivation signal.
+_DEACTIVATING_USAGE_STATUS_CODES = {402, 404}
+_DEACTIVATING_USAGE_MESSAGE_HINTS = (
+    "your openai account has been deactivated",
+    "account has been deactivated",
+)
+
+
+def _should_deactivate_for_usage_error(exc: UsageFetchError) -> bool:
+    if exc.status_code in _DEACTIVATING_USAGE_STATUS_CODES:
+        return True
+    if exc.code in PERMANENT_FAILURE_CODES:
+        return True
+    lowered = exc.message.lower()
+    return any(hint in lowered for hint in _DEACTIVATING_USAGE_MESSAGE_HINTS)
+
+
+async def _resolve_upstream_route_for_account(account: Account, *, operation: str) -> ResolvedUpstreamRoute | None:
+    async with get_background_session() as session:
+        return await resolve_upstream_route(
+            session,
+            account_id=account.id,
+            operation=operation,
+            scope="account",
+        )
+
+
+def _mark_usage_refresh_auth_cooldown(account_id: str, status_code: int) -> None:
+    if status_code not in {401, 403}:
+        return
+    cooldown_seconds = max(0.0, float(get_settings().usage_refresh_auth_failure_cooldown_seconds))
+    if cooldown_seconds <= 0:
+        return
+    _usage_refresh_auth_cooldowns[account_id] = time.monotonic() + cooldown_seconds
+
+
+def _is_usage_refresh_in_cooldown(account_id: str) -> bool:
+    expires_at = _usage_refresh_auth_cooldowns.get(account_id)
+    if expires_at is None:
+        return False
+    if expires_at > time.monotonic():
+        return True
+    _usage_refresh_auth_cooldowns.pop(account_id, None)
+    return False
+
+
+def _clear_usage_refresh_auth_cooldown(account_id: str) -> None:
+    _usage_refresh_auth_cooldowns.pop(account_id, None)
+
+
+def _prune_usage_refresh_auth_cooldowns() -> None:
+    now = time.monotonic()
+    stale = [account_id for account_id, expires_at in _usage_refresh_auth_cooldowns.items() if expires_at <= now]
+    for account_id in stale:
+        _usage_refresh_auth_cooldowns.pop(account_id, None)
+
+
+def _clear_usage_refresh_state() -> None:
+    _usage_refresh_auth_cooldowns.clear()
+    _last_successful_refresh.clear()
+    _FALLBACK_PLAN_DOWNGRADE_OBSERVATIONS.clear_all()
+    _USAGE_REFRESH_SINGLEFLIGHT.clear()

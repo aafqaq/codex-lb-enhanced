@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from app.core.usage.types import UsageTrendBucket
+from app.modules.accounts.mappers import build_account_usage_trends
+
+
+def _bucket(
+    epoch: int,
+    account_id: str,
+    window: str,
+    avg_used: float,
+    samples: int = 1,
+    reset_at: int | None = None,
+    window_minutes: int | None = None,
+    recorded_at: datetime | None = None,
+) -> UsageTrendBucket:
+    return UsageTrendBucket(
+        bucket_epoch=epoch,
+        account_id=account_id,
+        window=window,
+        avg_used_percent=avg_used,
+        samples=samples,
+        reset_at=reset_at,
+        window_minutes=window_minutes,
+        recorded_at=recorded_at,
+    )
+
+
+# Use a value already aligned to BUCKET_SECONDS so tests are predictable
+BUCKET_SECONDS = 21600  # 6h
+SINCE_EPOCH = (1_700_000_000 // BUCKET_SECONDS) * BUCKET_SECONDS
+BUCKET_COUNT = 4  # 4 buckets → spans 24h
+
+
+class TestBuildAccountUsageTrends:
+    def test_empty_buckets_returns_empty(self):
+        result = build_account_usage_trends([], SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+        assert result == {}
+
+    def test_single_account_single_window(self):
+        buckets = [
+            _bucket(SINCE_EPOCH, "a1", "primary", 20.0),
+            _bucket(SINCE_EPOCH + BUCKET_SECONDS, "a1", "primary", 40.0),
+        ]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+
+        assert "a1" in result
+        trend = result["a1"]
+        assert len(trend.primary) == BUCKET_COUNT
+
+        # First bucket: 100 - 20 = 80
+        assert trend.primary[0].v == 80.0
+        # Second bucket: 100 - 40 = 60
+        assert trend.primary[1].v == 60.0
+        # Third and fourth buckets: forward-filled with last value (60)
+        assert trend.primary[2].v == 60.0
+        assert trend.primary[3].v == 60.0
+
+    def test_values_are_remaining_percent(self):
+        buckets = [_bucket(SINCE_EPOCH, "a1", "primary", 75.0)]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+        assert result["a1"].primary[0].v == 25.0
+
+    def test_used_percent_clamped_to_0_100(self):
+        buckets = [_bucket(SINCE_EPOCH, "a1", "primary", 110.0)]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+        # 100 - 110 = -10, clamped to 0
+        assert result["a1"].primary[0].v == 0.0
+
+    def test_missing_buckets_filled_with_default(self):
+        # No data at all for bucket 0, data at bucket 1
+        buckets = [_bucket(SINCE_EPOCH + BUCKET_SECONDS, "a1", "primary", 50.0)]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+
+        # Bucket 0: no data → default 100.0
+        assert result["a1"].primary[0].v == 100.0
+        # Bucket 1: 100 - 50 = 50
+        assert result["a1"].primary[1].v == 50.0
+
+    def test_dual_window(self):
+        buckets = [
+            _bucket(SINCE_EPOCH, "a1", "primary", 20.0),
+            _bucket(SINCE_EPOCH, "a1", "secondary", 30.0),
+        ]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+        trend = result["a1"]
+        assert trend.primary[0].v == 80.0
+        assert trend.secondary[0].v == 70.0
+
+    def test_multiple_accounts(self):
+        buckets = [
+            _bucket(SINCE_EPOCH, "a1", "primary", 10.0),
+            _bucket(SINCE_EPOCH, "a2", "primary", 90.0),
+        ]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+        assert result["a1"].primary[0].v == 90.0
+        assert result["a2"].primary[0].v == 10.0
+
+    def test_missing_window_returns_empty_list(self):
+        buckets = [_bucket(SINCE_EPOCH, "a1", "primary", 20.0)]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+        # secondary was not in any bucket → empty list
+        assert result["a1"].secondary == []
+
+    def test_secondary_scheduled_line_uses_bucket_reset_deadline(self):
+        reset_at = SINCE_EPOCH + 4 * BUCKET_SECONDS
+        buckets = [
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "secondary",
+                30.0,
+                reset_at=reset_at,
+                window_minutes=(4 * BUCKET_SECONDS) // 60,
+            ),
+        ]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+
+        scheduled = result["a1"].secondary_scheduled
+        assert [point.v for point in scheduled] == [100.0, 75.0, 50.0, 25.0]
+
+    def test_secondary_scheduled_line_uses_weekly_primary_bucket(self):
+        reset_at = SINCE_EPOCH + 10080 * 60
+        buckets = [
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "primary",
+                30.0,
+                reset_at=reset_at,
+                window_minutes=10080,
+            ),
+        ]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+
+        assert result["a1"].primary == []
+        assert [point.v for point in result["a1"].secondary] == [70.0, 70.0, 70.0, 70.0]
+        scheduled = result["a1"].secondary_scheduled
+        assert [point.v for point in scheduled] == [100.0, 96.43, 92.86, 89.29]
+
+    def test_secondary_trend_prefers_real_secondary_over_weekly_primary_bucket(self):
+        reset_at = SINCE_EPOCH + 10080 * 60
+        stale_recorded_at = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        fresh_recorded_at = datetime(2026, 5, 2, tzinfo=timezone.utc)
+        buckets = [
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "primary",
+                90.0,
+                reset_at=reset_at + BUCKET_SECONDS,
+                window_minutes=10080,
+                recorded_at=stale_recorded_at,
+            ),
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "secondary",
+                20.0,
+                reset_at=reset_at,
+                window_minutes=10080,
+                recorded_at=fresh_recorded_at,
+            ),
+        ]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+
+        assert result["a1"].primary == []
+        assert [point.v for point in result["a1"].secondary] == [80.0, 80.0, 80.0, 80.0]
+        assert result["a1"].secondary_scheduled[1].v == 96.43
+
+    def test_secondary_trend_prefers_fresher_weekly_primary_over_stale_secondary(self):
+        reset_at = SINCE_EPOCH + 10080 * 60
+        stale_recorded_at = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        fresh_recorded_at = datetime(2026, 5, 2, tzinfo=timezone.utc)
+        buckets = [
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "primary",
+                10.0,
+                reset_at=reset_at,
+                window_minutes=10080,
+                recorded_at=fresh_recorded_at,
+            ),
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "secondary",
+                80.0,
+                reset_at=reset_at,
+                window_minutes=10080,
+                recorded_at=stale_recorded_at,
+            ),
+        ]
+
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+
+        assert result["a1"].primary == []
+        assert [point.v for point in result["a1"].secondary] == [90.0, 90.0, 90.0, 90.0]
+
+    def test_secondary_trend_prefers_fresher_secondary_over_stale_weekly_primary(self):
+        reset_at = SINCE_EPOCH + 10080 * 60
+        stale_recorded_at = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        fresh_recorded_at = datetime(2026, 5, 2, tzinfo=timezone.utc)
+        buckets = [
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "primary",
+                10.0,
+                reset_at=reset_at,
+                window_minutes=10080,
+                recorded_at=stale_recorded_at,
+            ),
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "secondary",
+                80.0,
+                reset_at=reset_at,
+                window_minutes=10080,
+                recorded_at=fresh_recorded_at,
+            ),
+        ]
+
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+
+        assert result["a1"].primary == []
+        assert [point.v for point in result["a1"].secondary] == [20.0, 20.0, 20.0, 20.0]
+
+    def test_monthly_buckets_render_on_secondary_series_without_primary_line(self):
+        reset_at = SINCE_EPOCH + 43200 * 60
+        buckets = [
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "monthly",
+                5.0,
+                reset_at=reset_at,
+                window_minutes=43200,
+            )
+        ]
+
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+
+        assert result["a1"].primary == []
+        assert [point.v for point in result["a1"].secondary] == [95.0, 95.0, 95.0, 95.0]
+        assert result["a1"].secondary_scheduled[0].v == 100.0
+
+    def test_secondary_scheduled_line_jumps_after_weekly_reset(self):
+        first_reset = SINCE_EPOCH + BUCKET_SECONDS
+        second_reset = SINCE_EPOCH + 5 * BUCKET_SECONDS
+        buckets = [
+            _bucket(
+                SINCE_EPOCH,
+                "a1",
+                "secondary",
+                95.0,
+                reset_at=first_reset,
+                window_minutes=(4 * BUCKET_SECONDS) // 60,
+            ),
+            _bucket(
+                SINCE_EPOCH + 2 * BUCKET_SECONDS,
+                "a1",
+                "secondary",
+                5.0,
+                reset_at=second_reset,
+                window_minutes=(4 * BUCKET_SECONDS) // 60,
+            ),
+        ]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+
+        scheduled = result["a1"].secondary_scheduled
+        assert [point.v for point in scheduled] == [25.0, 0.0, 75.0, 50.0]
+
+    def test_timestamps_are_utc(self):
+        buckets = [_bucket(SINCE_EPOCH, "a1", "primary", 0.0)]
+        result = build_account_usage_trends(buckets, SINCE_EPOCH, BUCKET_SECONDS, BUCKET_COUNT)
+        for point in result["a1"].primary:
+            assert point.t.tzinfo is not None

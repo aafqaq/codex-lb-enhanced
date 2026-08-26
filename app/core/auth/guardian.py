@@ -1,0 +1,356 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import importlib
+import logging
+import random
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Protocol, TypeVar, cast
+
+from app.core.auth.refresh import RefreshError
+from app.core.utils.time import to_utc_naive, utcnow
+from app.db.models import Account, AccountStatus
+from app.db.session import get_background_session
+from app.modules.accounts.auth_manager import AuthManager
+from app.modules.accounts.repository import AccountsRepository
+from app.modules.proxy.account_cache import get_account_selection_cache
+
+logger = logging.getLogger(__name__)
+
+# Guardian cadence and backoff tuning (fixed; issue #1340 / PRINCIPLES.md P2).
+# The guardian is a background refresher; these values are implementation
+# details, not operator contract. ``AuthGuardianScheduler`` keeps them as
+# constructor fields so tests can exercise the behavior.
+_INTERVAL_SECONDS = 21600
+_MAX_REFRESH_AGE_SECONDS = 43200
+_BATCH_SIZE = 100
+_CONCURRENCY = 3
+_JITTER_SECONDS = 300.0
+_FAILURE_BACKOFF_BASE_SECONDS = 300.0
+_FAILURE_BACKOFF_MAX_SECONDS = 3600.0
+
+# RATE_LIMITED and QUOTA_EXCEEDED recover to ACTIVE through usage-refresh
+# reconciliation, then become guardian-eligible within the max-age window.
+_AUTH_GUARDIAN_ELIGIBLE_STATUSES = frozenset({AccountStatus.ACTIVE, AccountStatus.PAUSED})
+
+
+_T = TypeVar("_T")
+
+
+class _LeaderElectionLike(Protocol):
+    async def run_if_leader(self, fn: Callable[[], Awaitable[_T]]) -> _T | None: ...
+
+
+class _AccountsRepositoryLike(Protocol):
+    async def list_accounts(self, *, refresh_existing: bool = False) -> list[Account]: ...
+
+    async def get_by_id(self, account_id: str) -> Account | None: ...
+
+
+class _AuthManagerLike(Protocol):
+    async def ensure_fresh(self, account: Account, *, force: bool = False) -> Account: ...
+
+
+_RepoFactory = Callable[[], AbstractAsyncContextManager[_AccountsRepositoryLike]]
+_AuthManagerFactory = Callable[[_AccountsRepositoryLike], _AuthManagerLike]
+_LeaderElectionFactory = Callable[[], _LeaderElectionLike]
+_Sleep = Callable[[float], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class _FailureBackoff:
+    attempts: int
+    retry_after_monotonic: float
+
+
+@dataclass(slots=True)
+class AuthGuardianScheduler:
+    interval_seconds: int
+    enabled: bool
+    max_age_seconds: int
+    batch_size: int
+    concurrency: int
+    jitter_seconds: float
+    failure_backoff_base_seconds: float = 300.0
+    failure_backoff_max_seconds: float = 3600.0
+    # When leader election is disabled, each refresh pass first counts live
+    # bridge-ring replicas and skips the pass if more than one is registered
+    # (the static instance ring is empty in Helm/compose deployments, so the
+    # build-time guard alone cannot see dynamically registered replicas).
+    # Defaults to True so directly constructed schedulers skip the dynamic
+    # check; build_auth_guardian_scheduler wires the real setting.
+    leader_election_enabled: bool = True
+    live_replica_count: Callable[[], Awaitable[int]] = field(default_factory=lambda: _count_live_bridge_ring_members)
+    leader_election_factory: _LeaderElectionFactory = field(default_factory=lambda: _get_leader_election)
+    repo_factory: _RepoFactory = field(default_factory=lambda: _default_accounts_repo_factory)
+    auth_manager_factory: _AuthManagerFactory = field(default_factory=lambda: _default_auth_manager_factory)
+    sleep: _Sleep = field(default_factory=lambda: asyncio.sleep)
+    now: Callable[[], datetime] = field(default_factory=lambda: utcnow)
+    _task: asyncio.Task[None] | None = None
+    _stop: asyncio.Event = field(default_factory=asyncio.Event)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _failures: dict[str, _FailureBackoff] = field(default_factory=dict)
+
+    async def start(self) -> None:
+        if not self.enabled:
+            return
+        if self._task and not self._task.done():
+            return
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+    async def _run_loop(self) -> None:
+        while not self._stop.is_set():
+            jitter = _jitter_delay(self.jitter_seconds)
+            if jitter > 0:
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=jitter)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+            try:
+                await self._refresh_once()
+            except Exception:
+                logger.exception("Auth Guardian refresh pass failed")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.interval_seconds)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _refresh_once(self) -> None:
+        if not self.leader_election_enabled:
+            live_replicas = await self.live_replica_count()
+            if live_replicas > 1:
+                logger.warning(
+                    "Auth Guardian skipped refresh pass: %d live replicas registered in the bridge ring "
+                    "while leader election is disabled; set CODEX_LB_LEADER_ELECTION_ENABLED=true so a "
+                    "single elected replica performs proactive refresh work",
+                    live_replicas,
+                )
+                return
+        await self.leader_election_factory().run_if_leader(self._refresh_as_leader)
+
+    async def _refresh_as_leader(self) -> None:
+        async with self._lock:
+            async with self.repo_factory() as repo:
+                accounts = await repo.list_accounts(refresh_existing=True)
+                candidates = select_auth_guardian_candidates(
+                    accounts,
+                    now=self.now(),
+                    max_age_seconds=self.max_age_seconds,
+                    limit=len(accounts),
+                )
+                candidate_ids = [account.id for account in candidates if not self._in_backoff(account.id)]
+                candidate_ids = candidate_ids[: max(0, self.batch_size)]
+            if not candidate_ids:
+                return
+            semaphore = asyncio.Semaphore(max(1, self.concurrency))
+            await asyncio.gather(*(self._refresh_candidate(account_id, semaphore) for account_id in candidate_ids))
+
+    async def _refresh_candidate(self, account_id: str, semaphore: asyncio.Semaphore) -> None:
+        if self._in_backoff(account_id):
+            return
+        async with semaphore:
+            async with self.repo_factory() as repo:
+                account = await repo.get_by_id(account_id)
+                if account is None:
+                    self._failures.pop(account_id, None)
+                    return
+                source_status = account.status.value
+                if not _auth_guardian_account_is_stale_eligible(
+                    account,
+                    now=self.now(),
+                    max_age_seconds=self.max_age_seconds,
+                ):
+                    return
+                manager = self.auth_manager_factory(repo)
+                try:
+                    refresh_task = asyncio.create_task(manager.ensure_fresh(account, force=True))
+                    try:
+                        await asyncio.shield(refresh_task)
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(Exception):
+                            await refresh_task
+                        raise
+                except RefreshError as exc:
+                    self._record_failure(account_id)
+                    if exc.is_permanent:
+                        get_account_selection_cache().invalidate()
+                    logger.warning(
+                        "Auth Guardian refresh failed account_id=%s account_alias=%s status=%s code=%s permanent=%s "
+                        "transport=%s",
+                        account.id,
+                        _safe_account_alias(account),
+                        source_status,
+                        exc.code,
+                        exc.is_permanent,
+                        exc.transport_error,
+                    )
+                    return
+                except Exception as exc:
+                    self._record_failure(account_id)
+                    logger.warning(
+                        "Auth Guardian refresh failed account_id=%s account_alias=%s status=%s error_type=%s",
+                        account.id,
+                        _safe_account_alias(account),
+                        source_status,
+                        exc.__class__.__name__,
+                        exc_info=True,
+                    )
+                    return
+                self._failures.pop(account_id, None)
+                get_account_selection_cache().invalidate()
+                logger.info(
+                    "Auth Guardian refreshed account_id=%s account_alias=%s status=%s",
+                    account.id,
+                    _safe_account_alias(account),
+                    source_status,
+                )
+
+    def _in_backoff(self, account_id: str) -> bool:
+        failure = self._failures.get(account_id)
+        if failure is None:
+            return False
+        if failure.retry_after_monotonic > time.monotonic():
+            return True
+        return False
+
+    def _record_failure(self, account_id: str) -> None:
+        previous = self._failures.get(account_id)
+        attempts = 1 if previous is None else previous.attempts + 1
+        base = max(0.0, float(self.failure_backoff_base_seconds))
+        cap = max(base, float(self.failure_backoff_max_seconds))
+        delay = min(cap, base * (2 ** min(attempts - 1, 6)))
+        delay += _jitter_delay(self.jitter_seconds)
+        self._failures[account_id] = _FailureBackoff(
+            attempts=attempts,
+            retry_after_monotonic=time.monotonic() + delay,
+        )
+
+
+def select_auth_guardian_candidates(
+    accounts: list[Account],
+    *,
+    now: datetime,
+    max_age_seconds: int,
+    limit: int,
+) -> list[Account]:
+    candidates = [
+        account
+        for account in accounts
+        if _auth_guardian_account_is_stale_eligible(
+            account,
+            now=now,
+            max_age_seconds=max_age_seconds,
+        )
+    ]
+    candidates.sort(key=lambda account: to_utc_naive(account.last_refresh))
+    return candidates[: max(0, limit)]
+
+
+def build_auth_guardian_scheduler() -> AuthGuardianScheduler:
+    from app.core.config.settings import get_settings
+
+    settings = get_settings()
+    multi_replica = len(settings.http_responses_session_bridge_instance_ring) > 1
+    # Deliberate exception to the "disabled election means every replica is
+    # leader" escape hatch: concurrent force token refreshes across replicas
+    # can invalidate rotated refresh tokens, so without election the guardian
+    # must not run in a multi-replica ring at all.
+    enabled = settings.auth_guardian_enabled and (settings.leader_election_enabled or not multi_replica)
+    if settings.auth_guardian_enabled and not enabled:
+        logger.warning(
+            "Auth Guardian disabled: multi-replica deployment without leader election; "
+            "set CODEX_LB_LEADER_ELECTION_ENABLED=true to run it leader-gated"
+        )
+    return AuthGuardianScheduler(
+        interval_seconds=_INTERVAL_SECONDS,
+        enabled=enabled,
+        max_age_seconds=_MAX_REFRESH_AGE_SECONDS,
+        batch_size=_BATCH_SIZE,
+        concurrency=_CONCURRENCY,
+        jitter_seconds=_JITTER_SECONDS,
+        failure_backoff_base_seconds=_FAILURE_BACKOFF_BASE_SECONDS,
+        failure_backoff_max_seconds=_FAILURE_BACKOFF_MAX_SECONDS,
+        leader_election_enabled=settings.leader_election_enabled,
+    )
+
+
+def _auth_guardian_account_is_stale_eligible(
+    account: Account,
+    *,
+    now: datetime,
+    max_age_seconds: int,
+) -> bool:
+    if account.status not in _AUTH_GUARDIAN_ELIGIBLE_STATUSES:
+        return False
+    age = to_utc_naive(now) - to_utc_naive(account.last_refresh)
+    return age > timedelta(seconds=max_age_seconds)
+
+
+def _get_leader_election() -> _LeaderElectionLike:
+    module = importlib.import_module("app.core.scheduling.leader_election")
+    return cast(_LeaderElectionLike, module.get_leader_election())
+
+
+async def _count_live_bridge_ring_members() -> int:
+    from sqlalchemy import func, select
+
+    from app.db.models import BridgeRingMember
+    from app.modules.proxy.ring_membership import RING_STALE_THRESHOLD_SECONDS
+
+    cutoff = utcnow() - timedelta(seconds=RING_STALE_THRESHOLD_SECONDS)
+    async with get_background_session() as session:
+        result = await session.execute(
+            select(func.count()).select_from(BridgeRingMember).where(BridgeRingMember.last_heartbeat_at >= cutoff)
+        )
+        return int(result.scalar_one() or 0)
+
+
+@asynccontextmanager
+async def _default_accounts_repo_factory() -> AsyncIterator[AccountsRepository]:
+    async with get_background_session() as session:
+        yield AccountsRepository(session)
+
+
+def _default_auth_manager_factory(repo: _AccountsRepositoryLike) -> _AuthManagerLike:
+    return AuthManager(cast(AccountsRepository, repo), refresh_repo_factory=_default_accounts_repo_factory)
+
+
+def _jitter_delay(max_seconds: float) -> float:
+    if max_seconds <= 0:
+        return 0.0
+    return random.uniform(0.0, max_seconds)
+
+
+def _safe_account_alias(account: Account) -> str:
+    alias = (account.alias or "").strip()
+    if alias:
+        return alias[:64]
+    return _mask_email(account.email)
+
+
+def _mask_email(email: str) -> str:
+    if "@" not in email:
+        return email[:2] + "***" if email else ""
+    local, domain = email.split("@", 1)
+    if not local:
+        return f"***@{domain}"
+    if len(local) == 1:
+        masked_local = f"{local}***"
+    else:
+        masked_local = f"{local[0]}***{local[-1]}"
+    return f"{masked_local}@{domain}"

@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ printf "%s-test-connection" (include "codex-lb.fullname" . | trunc 47 | trimSuffix "-") }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "codex-lb.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  enableServiceLinks: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  {{- with (include "codex-lb.globalNodeSelector" .) }}
+  nodeSelector:
+    {{- . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: test-health
+      image: {{ include "codex-lb.testImage" . }}
+      imagePullPolicy: {{ .Values.test.image.pullPolicy }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      command:
+        - sh
+        - -c
+        - |
+          if command -v python >/dev/null 2>&1; then
+            python - <<'PY'
+          import sys
+          import urllib.request
+
+          checks = [
+              ("Health endpoint", "http://{{ include "codex-lb.fullname" . }}:{{ .Values.service.port | default 2455 }}/health"),
+              ("Startup probe", "http://{{ include "codex-lb.fullname" . }}:{{ .Values.service.port | default 2455 }}/health/ready"),
+          ]
+          for name, url in checks:
+              print(f"=== {name} ===")
+              try:
+                  with urllib.request.urlopen(url, timeout=10) as response:
+                      if response.status >= 400:
+                          raise RuntimeError(f"{url} returned HTTP {response.status}")
+              except Exception as exc:
+                  print(exc, file=sys.stderr)
+                  raise SystemExit(1) from exc
+          print("Health checks passed!")
+          PY
+          else
+            echo "=== Health endpoint ==="
+            wget --spider --timeout=10 http://{{ include "codex-lb.fullname" . }}:{{ .Values.service.port | default 2455 }}/health || exit 1
+            echo "Health check passed!"
+
+            echo "=== Startup probe ==="
+            wget -qO- --timeout=10 http://{{ include "codex-lb.fullname" . }}:{{ .Values.service.port | default 2455 }}/health/ready || exit 1
+            echo "Readiness check passed!"
+          fi

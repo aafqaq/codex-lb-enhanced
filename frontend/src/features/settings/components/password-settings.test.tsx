@@ -1,0 +1,215 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  changePassword,
+  removePassword,
+  setupPassword,
+} from "@/features/auth/api";
+import i18n from "@/i18n";
+import { useAuthStore } from "@/features/auth/hooks/use-auth";
+import { PasswordSettings } from "@/features/settings/components/password-settings";
+
+vi.mock("@/features/auth/api", () => ({
+  setupPassword: vi.fn(),
+  changePassword: vi.fn(),
+  removePassword: vi.fn(),
+}));
+
+describe("PasswordSettings", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAuthStore.setState({
+      passwordRequired: false,
+      bootstrapRequired: false,
+      bootstrapTokenConfigured: false,
+      authMode: "standard",
+      passwordManagementEnabled: true,
+      refreshSession: vi.fn().mockResolvedValue(undefined),
+    });
+  });
+
+  it("shows setup button when no password is set", () => {
+    render(<PasswordSettings />);
+    expect(screen.getByRole("button", { name: "Set password" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Change" })).not.toBeInTheDocument();
+  });
+
+  it("shows change/remove buttons when password is configured", () => {
+    useAuthStore.setState({ passwordRequired: true, passwordSessionActive: true });
+    render(<PasswordSettings />);
+    expect(screen.getByRole("button", { name: "Change" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Set password" })).not.toBeInTheDocument();
+  });
+
+  it("handles setup flow via dialog", async () => {
+    const user = userEvent.setup();
+    vi.mocked(setupPassword).mockResolvedValue({} as never);
+
+    render(<PasswordSettings />);
+
+    await user.click(screen.getByRole("button", { name: "Set password" }));
+    // Dialog opens
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Password"), "new-password-1");
+    await user.click(screen.getAllByRole("button", { name: "Set password" }).find((btn) => btn.getAttribute("type") === "submit")!);
+    expect(setupPassword).toHaveBeenCalledWith({ password: "new-password-1" });
+  });
+
+  it("requires bootstrap token in remote setup flow", async () => {
+    const user = userEvent.setup();
+    vi.mocked(setupPassword).mockResolvedValue({} as never);
+    useAuthStore.setState({ bootstrapRequired: true, bootstrapTokenConfigured: true });
+
+    render(<PasswordSettings />);
+
+    await user.click(screen.getByRole("button", { name: "Set password" }));
+    await user.type(screen.getByLabelText("Password"), "new-password-1");
+    await user.type(screen.getByLabelText("Bootstrap token"), "bootstrap-secret");
+    await user.click(screen.getAllByRole("button", { name: "Set password" }).find((btn) => btn.getAttribute("type") === "submit")!);
+
+    expect(setupPassword).toHaveBeenCalledWith({
+      password: "new-password-1",
+      bootstrapToken: "bootstrap-secret",
+    });
+  });
+
+  it("handles change flow via dialog", async () => {
+    const user = userEvent.setup();
+    useAuthStore.setState({ passwordRequired: true, passwordSessionActive: true });
+    vi.mocked(changePassword).mockResolvedValue({} as never);
+
+    render(<PasswordSettings />);
+
+    await user.click(screen.getByRole("button", { name: "Change" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Current password"), "current-password");
+    await user.type(screen.getByLabelText("New password"), "changed-password");
+    await user.click(screen.getByRole("button", { name: "Change password" }));
+    expect(changePassword).toHaveBeenCalledWith({
+      currentPassword: "current-password",
+      newPassword: "changed-password",
+    });
+  });
+
+  it("handles remove flow via dialog", async () => {
+    const user = userEvent.setup();
+    useAuthStore.setState({ passwordRequired: true, passwordSessionActive: true });
+    vi.mocked(removePassword).mockResolvedValue({} as never);
+
+    render(<PasswordSettings />);
+
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Current password"), "changed-password");
+    await user.click(screen.getByRole("button", { name: "Remove password" }));
+    expect(removePassword).toHaveBeenCalledWith({ password: "changed-password" });
+  });
+
+  it("shows error message on request failure", async () => {
+    const user = userEvent.setup();
+    vi.mocked(setupPassword).mockRejectedValue(new Error("setup failed"));
+
+    render(<PasswordSettings />);
+
+    await user.click(screen.getByRole("button", { name: "Set password" }));
+    await user.type(screen.getByLabelText("Password"), "new-password-1");
+    await user.click(screen.getAllByRole("button", { name: "Set password" }).find((btn) => btn.getAttribute("type") === "submit")!);
+
+    expect(await screen.findByText("setup failed")).toBeInTheDocument();
+  });
+
+  it("shows translated validation errors in zh-CN during setup", async () => {
+    const user = userEvent.setup();
+    await i18n.changeLanguage("zh-CN");
+    try {
+      render(<PasswordSettings />);
+
+      await user.click(screen.getByRole("button", { name: "设置密码" }));
+      await user.type(screen.getByLabelText("密码"), "short");
+      await user.click(
+        screen
+          .getAllByRole("button", { name: "设置密码" })
+          .find((btn) => btn.getAttribute("type") === "submit")!,
+      );
+
+      expect(await screen.findByText("密码至少需要 8 个字符。")).toBeInTheDocument();
+    } finally {
+      await i18n.changeLanguage("en");
+    }
+  });
+
+  it("shows translated required validation in zh-CN during remove", async () => {
+    const user = userEvent.setup();
+    await i18n.changeLanguage("zh-CN");
+    try {
+      useAuthStore.setState({ passwordRequired: true, passwordSessionActive: true });
+      render(<PasswordSettings />);
+
+      await user.click(screen.getByRole("button", { name: "移除" }));
+      await user.click(screen.getByRole("button", { name: "移除密码" }));
+
+      expect(await screen.findByText("此项不能为空。")).toBeInTheDocument();
+      expect(screen.queryByText("settings.password.validation.required")).not.toBeInTheDocument();
+    } finally {
+      await i18n.changeLanguage("en");
+    }
+  });
+
+  it("shows translated required validation in zh-CN during verify", async () => {
+    const user = userEvent.setup();
+    await i18n.changeLanguage("zh-CN");
+    try {
+      useAuthStore.setState({ passwordRequired: true, authenticated: true, passwordSessionActive: false });
+      render(<PasswordSettings />);
+
+      await user.click(screen.getByRole("button", { name: "登录以管理" }));
+      await user.click(screen.getByRole("button", { name: "验证" }));
+
+      expect(await screen.findByText("此项不能为空。")).toBeInTheDocument();
+      expect(screen.queryByText("String must contain at least 1 character(s)")).not.toBeInTheDocument();
+    } finally {
+      await i18n.changeLanguage("en");
+    }
+  });
+
+  it("describes password as fallback in trusted header mode", () => {
+    useAuthStore.setState({ authMode: "trusted_header", passwordRequired: false });
+
+    render(<PasswordSettings />);
+
+    expect(screen.getByText("No fallback password set.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Set password" })).toBeInTheDocument();
+  });
+
+  it("hides change/remove when proxy-authenticated without password session", () => {
+    useAuthStore.setState({
+      authMode: "trusted_header",
+      passwordRequired: true,
+      passwordManagementEnabled: true,
+      passwordSessionActive: false,
+    });
+    render(<PasswordSettings />);
+
+    expect(screen.getByText("Password is configured as an optional fallback.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Change" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Set password" })).not.toBeInTheDocument();
+  });
+
+  it("hides password actions when password management is disabled", () => {
+    useAuthStore.setState({ authMode: "disabled", passwordManagementEnabled: false });
+
+    render(<PasswordSettings />);
+
+    expect(screen.getByText("Password login is disabled by the current dashboard auth mode.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Set password" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Change" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+  });
+});

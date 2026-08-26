@@ -1,0 +1,584 @@
+from __future__ import annotations
+
+import contextlib
+import errno
+import logging
+import socket
+from collections.abc import Awaitable, Callable
+from datetime import datetime
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import aiohttp
+import pytest
+from aiohttp.client_reqrep import ConnectionKey
+
+import app.core.auth.refresh as refresh_module
+import app.core.clients.model_fetcher as model_fetcher_module
+import app.core.openai.model_refresh_scheduler as scheduler_module
+from app.core.openai.model_registry import ReasoningLevel, UpstreamModel
+from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
+from app.db.models import Account, AccountStatus
+
+pytestmark = pytest.mark.unit
+
+
+def _account(account_id: str = "account-1") -> Account:
+    return Account(
+        id=account_id,
+        email=f"{account_id}@example.test",
+        plan_type="team",
+        chatgpt_account_id=f"chatgpt-{account_id}",
+        access_token_encrypted=b"encrypted-access-token",
+        refresh_token_encrypted=b"encrypted-refresh-token",
+        id_token_encrypted=b"encrypted-id-token",
+        last_refresh=datetime(2026, 1, 1),
+        status=AccountStatus.ACTIVE,
+    )
+
+
+def _model(slug: str) -> UpstreamModel:
+    return UpstreamModel(
+        slug=slug,
+        display_name=slug,
+        description=f"Model {slug}",
+        context_window=128000,
+        input_modalities=("text",),
+        supported_reasoning_levels=(ReasoningLevel(effort="medium", description="balanced"),),
+        default_reasoning_level="medium",
+        supports_reasoning_summaries=False,
+        support_verbosity=False,
+        default_verbosity=None,
+        prefer_websockets=False,
+        supports_parallel_tool_calls=True,
+        supported_in_api=True,
+        minimal_client_version=None,
+        priority=0,
+        available_in_plans=frozenset(),
+        raw={},
+    )
+
+
+class _StubAuthManager:
+    def __init__(self, _repo: object) -> None:
+        pass
+
+    async def ensure_fresh(self, account: Account, *, force: bool = False) -> Account:
+        return account
+
+
+def _route() -> ResolvedUpstreamRoute:
+    return ResolvedUpstreamRoute(
+        mode="account_bound",
+        pool_id="pool_1",
+        endpoint=ResolvedProxyEndpoint("ep_1", "http", "proxy.test", 8080),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_models_for_plan_marks_transport_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = MagicMock()
+    session.get.side_effect = aiohttp.ClientError("dns failed")
+
+    monkeypatch.setattr(
+        model_fetcher_module,
+        "get_codex_version_cache",
+        lambda: SimpleNamespace(get_version=AsyncMock(return_value="1.2.3")),
+    )
+
+    @contextlib.asynccontextmanager
+    async def lease_session():
+        yield session
+
+    monkeypatch.setattr(model_fetcher_module, "lease_http_session", lease_session)
+    monkeypatch.setattr(
+        model_fetcher_module,
+        "get_settings",
+        lambda: SimpleNamespace(upstream_base_url="https://example.test/backend-api"),
+    )
+
+    with pytest.raises(model_fetcher_module.ModelFetchError) as excinfo:
+        await model_fetcher_module.fetch_models_for_plan("access-token", "account-1", allow_direct_egress=True)
+
+    exc = excinfo.value
+    assert exc.status_code == 0
+    assert exc.transport_error is True
+    assert "dns failed" in exc.message
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_marks_transport_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = MagicMock()
+    session.post.side_effect = aiohttp.ClientError("dns failed")
+
+    monkeypatch.setattr(
+        refresh_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            token_refresh_timeout_seconds=15.0,
+        ),
+    )
+
+    with pytest.raises(refresh_module.RefreshError) as excinfo:
+        await refresh_module.refresh_access_token("refresh-token", session=session, allow_direct_egress=True)
+
+    exc = excinfo.value
+    assert exc.code == "transport_error"
+    assert exc.is_permanent is False
+    assert exc.transport_error is True
+    assert "dns failed" in exc.message
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_preserves_transient_dns_classification(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = MagicMock()
+    session.post.side_effect = socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+    monkeypatch.setattr(
+        refresh_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            auth_base_url="https://auth.example.test",
+            oauth_client_id="client-id",
+            oauth_scope="openid profile",
+            token_refresh_timeout_seconds=15.0,
+        ),
+    )
+
+    with pytest.raises(refresh_module.RefreshError) as exc_info:
+        await refresh_module.refresh_access_token("refresh-token", session=session, allow_direct_egress=True)
+
+    assert exc_info.value.transport_error is True
+    assert exc_info.value.transport_error_code == "proxy_network_unavailable"
+    assert exc_info.value.retryable_same_contract is False
+    assert exc_info.value.failed_session is session
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_marks_typed_connector_dns_failure_replay_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = MagicMock()
+    key = ConnectionKey("auth.example.test", 443, True, True, None, None, None)
+    session.post.side_effect = aiohttp.ClientConnectorError(
+        key,
+        socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"),
+    )
+    monkeypatch.setattr(
+        refresh_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            auth_base_url="https://auth.example.test",
+            oauth_client_id="client-id",
+            oauth_scope="openid profile",
+            token_refresh_timeout_seconds=15.0,
+        ),
+    )
+
+    with pytest.raises(refresh_module.RefreshError) as exc_info:
+        await refresh_module.refresh_access_token("refresh-token", session=session, allow_direct_egress=True)
+
+    assert exc_info.value.transport_error_code == "proxy_network_unavailable"
+    assert exc_info.value.retryable_same_contract is True
+    assert exc_info.value.failed_session is session
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_network_body_read_failure_is_not_replay_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BodyReadFailureResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def json(self, *, content_type=None):
+            del content_type
+            raise ValueError("invalid partial JSON")
+
+        async def text(self):
+            raise OSError(errno.ENETUNREACH, "Network is unreachable")
+
+    session = MagicMock()
+    session.post.return_value = _BodyReadFailureResponse()
+    monkeypatch.setattr(
+        refresh_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            auth_base_url="https://auth.example.test",
+            oauth_client_id="client-id",
+            oauth_scope="openid profile",
+            token_refresh_timeout_seconds=15.0,
+        ),
+    )
+
+    with pytest.raises(refresh_module.RefreshError) as exc_info:
+        await refresh_module.refresh_access_token("refresh-token", session=session, allow_direct_egress=True)
+
+    assert exc_info.value.transport_error_code == "proxy_network_unavailable"
+    assert exc_info.value.retryable_same_contract is False
+    assert exc_info.value.failed_session is session
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_failover_refreshes_http_client_after_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _account()
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+    expected_models = [_model("gpt-5.4")]
+
+    fetch_models_for_plan = AsyncMock(
+        side_effect=[
+            scheduler_module.ModelFetchError(0, "temporary dns failure", transport_error=True),
+            expected_models,
+        ]
+    )
+    refresh_http_client = AsyncMock()
+
+    monkeypatch.setattr(scheduler_module, "AuthManager", _StubAuthManager)
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+    monkeypatch.setattr(scheduler_module, "refresh_http_client", refresh_http_client)
+
+    result = await scheduler_module._fetch_with_failover([account], encryptor, MagicMock())
+
+    assert result is not None
+    assert result.models == expected_models
+    assert result.account_models == {account.id: (account.plan_type, expected_models)}
+    refresh_http_client.assert_awaited_once()
+    assert fetch_models_for_plan.await_count == 2
+    assert encryptor.decrypt.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_models_with_transport_recovery_passes_resolved_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _account()
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+    route = _route()
+    expected_models = [_model("gpt-5.4")]
+    fetch_models_for_plan = AsyncMock(return_value=expected_models)
+    resolve_upstream_route = AsyncMock(return_value=route)
+
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+    monkeypatch.setattr(scheduler_module, "resolve_upstream_route", resolve_upstream_route)
+
+    result = await scheduler_module._fetch_models_with_transport_recovery(
+        account,
+        encryptor,
+        transport_recovery=scheduler_module._TransportRecoveryState(),
+    )
+
+    assert result == expected_models
+    fetch_models_for_plan.assert_awaited_once_with(
+        "access-token",
+        "chatgpt-account-1",
+        route=route,
+        allow_direct_egress=False,
+    )
+    assert resolve_upstream_route.await_args is not None
+    assert resolve_upstream_route.await_args.kwargs["account_id"] == "account-1"
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_failover_refreshes_http_client_after_token_refresh_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _account()
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+    expected_models = [_model("gpt-5.4")]
+    ensure_fresh_calls = 0
+
+    class TransportFailingAuthManager:
+        def __init__(self, _repo: object) -> None:
+            pass
+
+        async def ensure_fresh(self, account: Account, *, force: bool = False) -> Account:
+            nonlocal ensure_fresh_calls
+            ensure_fresh_calls += 1
+            if ensure_fresh_calls == 1:
+                raise scheduler_module.RefreshError(
+                    "transport_error",
+                    "Transport error during token refresh: dns failed",
+                    False,
+                    transport_error=True,
+                )
+            return account
+
+    fetch_models_for_plan = AsyncMock(return_value=expected_models)
+    refresh_http_client = AsyncMock()
+
+    monkeypatch.setattr(scheduler_module, "AuthManager", TransportFailingAuthManager)
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+    monkeypatch.setattr(scheduler_module, "refresh_http_client", refresh_http_client)
+
+    result = await scheduler_module._fetch_with_failover([account], encryptor, MagicMock())
+
+    assert result is not None
+    assert result.models == expected_models
+    assert result.account_models == {account.id: (account.plan_type, expected_models)}
+    refresh_http_client.assert_awaited_once()
+    assert ensure_fresh_calls == 2
+    fetch_models_for_plan.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_failover_attempts_transport_recovery_once_when_retry_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounts = [_account("account-1"), _account("account-2")]
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+
+    fetch_models_for_plan = AsyncMock(
+        side_effect=[
+            scheduler_module.ModelFetchError(0, "temporary dns failure", transport_error=True),
+            scheduler_module.ModelFetchError(0, "temporary dns failure", transport_error=True),
+            scheduler_module.ModelFetchError(0, "temporary dns failure", transport_error=True),
+        ]
+    )
+    refresh_http_client = AsyncMock()
+
+    monkeypatch.setattr(scheduler_module, "AuthManager", _StubAuthManager)
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+    monkeypatch.setattr(scheduler_module, "refresh_http_client", refresh_http_client)
+
+    result = await scheduler_module._fetch_with_failover(accounts, encryptor, MagicMock())
+
+    assert result is None
+    refresh_http_client.assert_awaited_once()
+    assert fetch_models_for_plan.await_count == 3
+    assert encryptor.decrypt.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_failover_preserves_successful_empty_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounts = [_account("account-1"), _account("account-2")]
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+    fetch_models_for_plan = AsyncMock(side_effect=[[], []])
+
+    monkeypatch.setattr(scheduler_module, "AuthManager", _StubAuthManager)
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+
+    result = await scheduler_module._fetch_with_failover(accounts, encryptor, MagicMock())
+
+    assert result is not None
+    assert result.models == []
+    assert result.account_models == {
+        accounts[0].id: (accounts[0].plan_type, []),
+        accounts[1].id: (accounts[1].plan_type, []),
+    }
+    assert fetch_models_for_plan.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_failover_unions_same_plan_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounts = [_account("account-1"), _account("account-2")]
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+    first_models = [_model("gpt-5.4")]
+    first_models[0].raw["service_tiers"] = [{"slug": "default"}]
+    second_models = [_model("gpt-5.4")]
+    second_models[0].raw["service_tiers"] = [{"slug": "fast"}]
+    second_models[0].raw["additional_speed_tiers"] = ["fast"]
+
+    fetch_models_for_plan = AsyncMock(side_effect=[first_models, second_models])
+
+    monkeypatch.setattr(scheduler_module, "AuthManager", _StubAuthManager)
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+
+    result = await scheduler_module._fetch_with_failover(accounts, encryptor, MagicMock())
+
+    assert result is not None
+    assert [model.slug for model in result.models] == ["gpt-5.4"]
+    assert result.account_models == {
+        accounts[0].id: (accounts[0].plan_type, first_models),
+        accounts[1].id: (accounts[1].plan_type, second_models),
+    }
+    service_tiers = result.models[0].raw["service_tiers"]
+    assert isinstance(service_tiers, list)
+    assert {tier.get("slug") for tier in service_tiers if isinstance(tier, dict)} == {"default", "fast"}
+    assert result.models[0].raw["additional_speed_tiers"] == ["fast"]
+    assert fetch_models_for_plan.await_count == 2
+    assert [call.args[1] for call in fetch_models_for_plan.await_args_list] == [
+        "chatgpt-account-1",
+        "chatgpt-account-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_failover_unions_same_plan_account_specific_model_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounts = [_account("account-1"), _account("account-2")]
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+    first_models = [_model("gpt-5.4"), _model("private-alpha")]
+    second_models = [_model("gpt-5.4")]
+
+    fetch_models_for_plan = AsyncMock(side_effect=[first_models, second_models])
+
+    monkeypatch.setattr(scheduler_module, "AuthManager", _StubAuthManager)
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+
+    result = await scheduler_module._fetch_with_failover(accounts, encryptor, MagicMock())
+
+    assert result is not None
+    assert [model.slug for model in result.models] == ["gpt-5.4", "private-alpha"]
+    assert result.account_models == {
+        accounts[0].id: (accounts[0].plan_type, first_models),
+        accounts[1].id: (accounts[1].plan_type, second_models),
+    }
+    assert fetch_models_for_plan.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_failover_does_not_warn_after_successful_auth_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    account = _account()
+    encryptor = MagicMock()
+    encryptor.decrypt.return_value = "access-token"
+    expected_models = [_model("gpt-5.4")]
+
+    fetch_models_for_plan = AsyncMock(
+        side_effect=[
+            scheduler_module.ModelFetchError(401, "expired token"),
+            expected_models,
+        ]
+    )
+
+    monkeypatch.setattr(scheduler_module, "AuthManager", _StubAuthManager)
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", fetch_models_for_plan)
+
+    with caplog.at_level(logging.WARNING, logger=scheduler_module.logger.name):
+        result = await scheduler_module._fetch_with_failover([account], encryptor, MagicMock())
+
+    assert result is not None
+    assert result.models == expected_models
+    assert result.account_models == {account.id: (account.plan_type, expected_models)}
+    assert fetch_models_for_plan.await_count == 2
+    assert "Model fetch failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_refresh_once_closes_account_read_session_before_fetch_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = _account()
+    session_closed = False
+
+    class _Leader:
+        async def run_if_leader(self, fn: Callable[[], Awaitable[object]]) -> object:
+            return await fn()
+
+    class _Session:
+        def expunge_all(self) -> None:
+            return None
+
+    @contextlib.asynccontextmanager
+    async def _background_session():
+        nonlocal session_closed
+        session_closed = False
+        try:
+            yield _Session()
+        finally:
+            session_closed = True
+
+    class _AccountsRepo:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def list_accounts(self) -> list[Account]:
+            return [account]
+
+    class _AuthManager:
+        def __init__(self, _repo: object) -> None:
+            pass
+
+        async def ensure_fresh(self, account: Account, *, force: bool = False) -> Account:
+            return account
+
+    class _Registry:
+        async def update(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def get_snapshot(self) -> SimpleNamespace:
+            return SimpleNamespace(models={"gpt-5.4": object()})
+
+    async def _fetch_models_for_plan(access_token: str, account_id: str | None, **kwargs: Any) -> list[UpstreamModel]:
+        assert session_closed is True
+        return [_model("gpt-5.4")]
+
+    monkeypatch.setattr(scheduler_module, "_get_leader_election", lambda: _Leader())
+    monkeypatch.setattr(scheduler_module, "get_background_session", _background_session)
+    monkeypatch.setattr(scheduler_module, "AccountsRepository", _AccountsRepo)
+    monkeypatch.setattr(scheduler_module, "AuthManager", _AuthManager)
+    monkeypatch.setattr(scheduler_module, "fetch_models_for_plan", _fetch_models_for_plan)
+    monkeypatch.setattr(scheduler_module, "get_model_registry", lambda: _Registry())
+    monkeypatch.setattr(
+        scheduler_module,
+        "get_account_selection_cache",
+        lambda: SimpleNamespace(invalidate=lambda: None),
+    )
+    monkeypatch.setattr(scheduler_module, "TokenEncryptor", lambda: SimpleNamespace(decrypt=lambda _value: "access"))
+    monkeypatch.setattr(scheduler_module, "_resolve_upstream_route_for_account", AsyncMock(return_value=None))
+
+    scheduler = scheduler_module.ModelRefreshScheduler(interval_seconds=60, enabled=True)
+    await scheduler._refresh_once()
+
+
+@pytest.mark.asyncio
+async def test_refresh_once_clears_registry_when_no_active_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Leader:
+        async def run_if_leader(self, fn: Callable[[], Awaitable[object]]) -> object:
+            return await fn()
+
+    class _Session:
+        def expunge_all(self) -> None:
+            return None
+
+    @contextlib.asynccontextmanager
+    async def _background_session():
+        yield _Session()
+
+    class _AccountsRepo:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def list_accounts(self) -> list[Account]:
+            return []
+
+    clear = AsyncMock()
+    invalidate = MagicMock()
+    monkeypatch.setattr(scheduler_module, "_get_leader_election", lambda: _Leader())
+    monkeypatch.setattr(scheduler_module, "get_background_session", _background_session)
+    monkeypatch.setattr(scheduler_module, "AccountsRepository", _AccountsRepo)
+    monkeypatch.setattr(scheduler_module, "get_model_registry", lambda: SimpleNamespace(clear=clear))
+    monkeypatch.setattr(
+        scheduler_module,
+        "get_account_selection_cache",
+        lambda: SimpleNamespace(invalidate=invalidate),
+    )
+
+    scheduler = scheduler_module.ModelRefreshScheduler(interval_seconds=60, enabled=True)
+    await scheduler._refresh_once()
+
+    clear.assert_awaited_once_with()
+    invalidate.assert_called_once_with()

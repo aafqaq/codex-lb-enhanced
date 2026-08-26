@@ -1,0 +1,883 @@
+from __future__ import annotations
+
+import time
+from collections.abc import AsyncIterator, Iterable, Mapping
+from dataclasses import dataclass, field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from app.core.openai.models import OpenAIError, OpenAIErrorEnvelope, ResponseUsage
+from app.core.types import JsonValue
+from app.core.utils.json_guards import is_json_mapping
+from app.core.utils.sse import format_sse_data, parse_sse_data_json
+
+
+class ChatToolCallFunction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    arguments: str | None = None
+
+
+class ChatToolCallDelta(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    id: str | None = None
+    type: str = "function"
+    function: ChatToolCallFunction | None = None
+
+
+class ChatChunkDelta(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: str | None = None
+    content: str | None = None
+    refusal: str | None = None
+    tool_calls: list[ChatToolCallDelta] | None = None
+
+
+class ChatChunkChoice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    delta: ChatChunkDelta
+    finish_reason: str | None = None
+
+
+class ChatCompletionChunk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: list[ChatChunkChoice]
+    usage: "ChatCompletionUsage | None" = None
+
+
+class ChatMessageToolCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    type: str = "function"
+    function: ChatToolCallFunction | None = None
+
+
+class ChatCompletionMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: str
+    content: str | None = None
+    refusal: str | None = None
+    tool_calls: list[ChatMessageToolCall] | None = None
+
+
+class ChatCompletionChoice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    message: ChatCompletionMessage
+    finish_reason: str | None = None
+
+
+class ChatCompletionUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    prompt_tokens_details: "ChatPromptTokensDetails | None" = None
+    completion_tokens_details: "ChatCompletionTokensDetails | None" = None
+
+
+class ChatPromptTokensDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cached_tokens: int | None = None
+
+
+class ChatCompletionTokensDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reasoning_tokens: int | None = None
+
+
+class ChatCompletion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: list[ChatCompletionChoice]
+    usage: ChatCompletionUsage | None = None
+
+
+ChatCompletionResult = ChatCompletion | OpenAIErrorEnvelope
+
+
+@dataclass
+class ToolCallIndex:
+    indexes: dict[str, int] = field(default_factory=dict)
+    next_index: int = 0
+    output_index_map: dict[int, int] = field(default_factory=dict)
+
+    def index_for(self, call_id: str | None, name: str | None) -> int:
+        key = _tool_call_key(call_id, name)
+        if key is None:
+            return 0
+        if key not in self.indexes:
+            self.indexes[key] = self.next_index
+            self.next_index += 1
+        return self.indexes[key]
+
+    def index_for_output_index(self, output_index: int | None, call_id: str | None, name: str | None) -> int:
+        """Resolve tool call index, preferring output_index mapping when available.
+
+        Always records the resolved index against every routing key that is
+        present (``output_index``, ``call_id``/``name``) so a later event for
+        the same logical tool call that only carries one of those identifiers
+        does not get assigned a new slot. Without this, a stream that first
+        routes by ``item_id`` + ``output_index`` and later emits a
+        ``call_id``-only event without ``output_index`` (e.g. legacy delta
+        formats) would split one tool call into two ``tool_calls[]`` slots and
+        reintroduce the duplication this change fixes.
+        """
+        key = _tool_call_key(call_id, name)
+        if output_index is not None and output_index in self.output_index_map:
+            idx = self.output_index_map[output_index]
+            if key is not None and key not in self.indexes:
+                self.indexes[key] = idx
+            return idx
+        if key is None:
+            if output_index is not None:
+                idx = self.output_index_map.get(output_index, self.next_index)
+                if output_index not in self.output_index_map:
+                    self.output_index_map[output_index] = idx
+                    self.next_index = max(self.next_index, idx + 1)
+                return idx
+            return 0
+        if key not in self.indexes:
+            self.indexes[key] = self.next_index
+            self.next_index += 1
+        idx = self.indexes[key]
+        if output_index is not None and output_index not in self.output_index_map:
+            self.output_index_map[output_index] = idx
+        return idx
+
+    def register_alias(self, alias_id: str, index: int) -> None:
+        """Register an additional ID that maps to the same index."""
+        key = f"id:{alias_id}"
+        if key not in self.indexes:
+            self.indexes[key] = index
+
+    def register_output_index(self, output_index: int, index: int) -> None:
+        """Map a Responses API output_index to a tool call index."""
+        if output_index not in self.output_index_map:
+            self.output_index_map[output_index] = index
+
+
+@dataclass
+class _ChatChunkState:
+    tool_index: ToolCallIndex = field(default_factory=ToolCallIndex)
+    tool_calls: list["ToolCallState"] = field(default_factory=list)
+    saw_tool_call: bool = False
+    sent_role: bool = False
+
+
+@dataclass
+class ToolCallDelta:
+    index: int
+    call_id: str | None
+    name: str | None
+    arguments: str | None
+    tool_type: str | None
+    arguments_mode: Literal["append", "replace"] = "append"
+
+    def to_chunk_call(self) -> ChatToolCallDelta:
+        function = _build_tool_call_function(self.name, self.arguments)
+        return ChatToolCallDelta(
+            index=self.index,
+            id=self.call_id,
+            type=self.tool_type or "function",
+            function=function,
+        )
+
+
+@dataclass
+class ToolCallState:
+    index: int
+    call_id: str | None = None
+    name: str | None = None
+    arguments: str = ""
+    tool_type: str = "function"
+    emitted_call_id: str | None = None
+    emitted_name: str | None = None
+    emitted_arguments: str = ""
+    emitted_tool_type: str | None = None
+
+    def apply_delta(self, delta: ToolCallDelta) -> None:
+        if delta.call_id:
+            self.call_id = delta.call_id
+        if delta.name:
+            self.name = delta.name
+        if delta.arguments is not None:
+            if delta.arguments_mode == "replace":
+                self.arguments = delta.arguments
+            elif delta.arguments:
+                self.arguments += delta.arguments
+        if delta.tool_type:
+            self.tool_type = delta.tool_type
+
+    def build_stream_delta(self) -> ToolCallDelta | None:
+        call_id = _pending_stream_value(self.emitted_call_id, self.call_id)
+        name = _pending_stream_value(self.emitted_name, self.name)
+        arguments = _pending_stream_arguments(self.emitted_arguments, self.arguments)
+        tool_type = self.tool_type or "function"
+        if call_id is None and name is None and arguments is None and self.emitted_tool_type == tool_type:
+            return None
+
+        if call_id is not None:
+            self.emitted_call_id = self.call_id
+        if name is not None:
+            self.emitted_name = self.name
+        if arguments is not None:
+            self.emitted_arguments = self.arguments
+        self.emitted_tool_type = tool_type
+        return ToolCallDelta(
+            index=self.index,
+            call_id=call_id,
+            name=name,
+            arguments=arguments,
+            tool_type=tool_type,
+        )
+
+    def to_message_tool_call(self) -> ChatMessageToolCall | None:
+        function = _build_tool_call_function(self.name, self.arguments or None)
+        if self.call_id is None and function is None:
+            return None
+        return ChatMessageToolCall(
+            id=self.call_id,
+            type=self.tool_type or "function",
+            function=function,
+        )
+
+
+def _build_tool_call_function(name: str | None, arguments: str | None) -> ChatToolCallFunction | None:
+    if name is None and arguments is None:
+        return None
+    return ChatToolCallFunction(name=name, arguments=arguments)
+
+
+def _parse_data(line: str) -> dict[str, JsonValue] | None:
+    return parse_sse_data_json(line)
+
+
+def iter_chat_chunks(
+    lines: Iterable[str],
+    model: str,
+    *,
+    created: int | None = None,
+    state: _ChatChunkState | None = None,
+    include_usage: bool = False,
+) -> Iterable[str]:
+    created = created or int(time.time())
+    state = state or _ChatChunkState()
+    for line in lines:
+        payload = _parse_data(line)
+        if not payload:
+            continue
+        event_type = payload.get("type")
+        if event_type in ("response.output_text.delta", "response.refusal.delta"):
+            delta_text = payload.get("delta")
+            role = None
+            if not state.sent_role:
+                role = "assistant"
+            if event_type == "response.refusal.delta":
+                delta_obj = ChatChunkDelta(
+                    role=role,
+                    refusal=delta_text if isinstance(delta_text, str) else None,
+                )
+            else:
+                delta_obj = ChatChunkDelta(
+                    role=role,
+                    content=delta_text if isinstance(delta_text, str) else None,
+                )
+            chunk = ChatCompletionChunk(
+                id="chatcmpl_temp",
+                created=created,
+                model=model,
+                choices=[
+                    ChatChunkChoice(
+                        index=0,
+                        delta=delta_obj,
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield _dump_chunk(chunk, include_usage=include_usage)
+            if role is not None:
+                state.sent_role = True
+        tool_delta = _tool_call_delta_from_payload(payload, state.tool_index)
+        if tool_delta is not None:
+            tool_state = _merge_tool_call_delta(state.tool_calls, tool_delta)
+            stream_delta = tool_state.build_stream_delta()
+            if stream_delta is not None:
+                state.saw_tool_call = True
+                role = None
+                if not state.sent_role:
+                    role = "assistant"
+                chunk = ChatCompletionChunk(
+                    id="chatcmpl_temp",
+                    created=created,
+                    model=model,
+                    choices=[
+                        ChatChunkChoice(
+                            index=0,
+                            delta=ChatChunkDelta(
+                                role=role,
+                                tool_calls=[stream_delta.to_chunk_call()],
+                            ),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield _dump_chunk(chunk, include_usage=include_usage)
+                if role is not None:
+                    state.sent_role = True
+        if event_type in ("response.failed", "error"):
+            error = None
+            if event_type == "response.failed":
+                response = payload.get("response")
+                if isinstance(response, dict):
+                    maybe_error = response.get("error")
+                    if isinstance(maybe_error, dict) and maybe_error:
+                        error = maybe_error
+            else:
+                maybe_error = payload.get("error")
+                if isinstance(maybe_error, dict) and maybe_error:
+                    error = maybe_error
+            if error is not None:
+                error_payload: dict[str, JsonValue] = {"error": error}
+            else:
+                error_payload = _default_error_envelope().model_dump(mode="json", exclude_none=True)
+            yield _dump_sse(error_payload)
+            yield "data: [DONE]\n\n"
+            return
+        if event_type in ("response.completed", "response.incomplete"):
+            for tool_state in state.tool_calls:
+                stream_delta = tool_state.build_stream_delta()
+                if stream_delta is None:
+                    continue
+                state.saw_tool_call = True
+                role = None
+                if not state.sent_role:
+                    role = "assistant"
+                chunk = ChatCompletionChunk(
+                    id="chatcmpl_temp",
+                    created=created,
+                    model=model,
+                    choices=[
+                        ChatChunkChoice(
+                            index=0,
+                            delta=ChatChunkDelta(
+                                role=role,
+                                tool_calls=[stream_delta.to_chunk_call()],
+                            ),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield _dump_chunk(chunk, include_usage=include_usage)
+                if role is not None:
+                    state.sent_role = True
+            usage = None
+            if include_usage:
+                response = payload.get("response")
+                if isinstance(response, dict):
+                    usage = _map_usage(_parse_usage(response.get("usage")))
+            finish_reason = "tool_calls" if state.saw_tool_call else "stop"
+            if event_type == "response.incomplete" and not state.saw_tool_call:
+                finish_reason = _finish_reason_from_incomplete(payload.get("response"))
+            done = ChatCompletionChunk(
+                id="chatcmpl_temp",
+                created=created,
+                model=model,
+                choices=[
+                    ChatChunkChoice(
+                        index=0,
+                        delta=ChatChunkDelta(),
+                        finish_reason=finish_reason,
+                    )
+                ],
+            )
+            yield _dump_chunk(done, include_usage=include_usage)
+            if include_usage:
+                usage_chunk = ChatCompletionChunk(
+                    id="chatcmpl_temp",
+                    created=created,
+                    model=model,
+                    choices=[],
+                    usage=usage,
+                )
+                yield _dump_chunk(usage_chunk, include_usage=include_usage)
+            yield "data: [DONE]\n\n"
+            return
+
+
+async def stream_chat_chunks(
+    stream: AsyncIterator[str],
+    model: str,
+    *,
+    include_usage: bool = False,
+) -> AsyncIterator[str]:
+    created = int(time.time())
+    state = _ChatChunkState()
+    terminal_chunk_sent = False
+    async for line in stream:
+        if terminal_chunk_sent:
+            continue
+        for chunk in iter_chat_chunks(
+            [line],
+            model=model,
+            created=created,
+            state=state,
+            include_usage=include_usage,
+        ):
+            yield chunk
+            if chunk.strip() == "data: [DONE]":
+                terminal_chunk_sent = True
+                break
+    if not terminal_chunk_sent:
+        yield _dump_sse(_upstream_stream_truncated_error_payload())
+        yield "data: [DONE]\n\n"
+
+
+async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> ChatCompletionResult:
+    created = int(time.time())
+    content_parts: list[str] = []
+    refusal_parts: list[str] = []
+    response_id: str | None = None
+    usage: ResponseUsage | None = None
+    incomplete_reason: str | None = None
+    tool_index = ToolCallIndex()
+    tool_calls: list[ToolCallState] = []
+    terminal_error: ChatCompletionResult | None = None
+    terminal_event_seen = False
+
+    async for line in stream:
+        payload = _parse_data(line)
+        if not payload:
+            continue
+        event_type = payload.get("type")
+        if event_type == "response.output_text.delta":
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                content_parts.append(delta)
+        if event_type == "response.refusal.delta":
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                refusal_parts.append(delta)
+        tool_delta = _tool_call_delta_from_payload(payload, tool_index)
+        if tool_delta is not None:
+            _merge_tool_call_delta(tool_calls, tool_delta)
+        if event_type in ("response.failed", "error"):
+            if terminal_error is not None:
+                continue
+            error = None
+            if event_type == "response.failed":
+                response = payload.get("response")
+                if isinstance(response, dict):
+                    maybe_error = response.get("error")
+                    if isinstance(maybe_error, dict):
+                        error = maybe_error
+            else:
+                maybe_error = payload.get("error")
+                if isinstance(maybe_error, dict):
+                    error = maybe_error
+            terminal_error = _error_envelope_from_payload(error) if error is not None else _default_error_envelope()
+            continue
+        if terminal_error is not None:
+            continue
+        if event_type in ("response.completed", "response.incomplete"):
+            terminal_event_seen = True
+            response = payload.get("response")
+            if isinstance(response, dict):
+                response_id_value = response.get("id")
+                if isinstance(response_id_value, str):
+                    response_id = response_id_value
+                usage = _parse_usage(response.get("usage"))
+                if event_type == "response.incomplete":
+                    incomplete_reason = _finish_reason_from_incomplete(response)
+
+    if terminal_error is not None:
+        return terminal_error
+    if not terminal_event_seen:
+        return _upstream_stream_truncated_error()
+
+    message_content: str | None = "".join(content_parts)
+    message_refusal = "".join(refusal_parts) or None
+    message_tool_calls = _compact_tool_calls(tool_calls)
+    has_tool_calls = bool(message_tool_calls)
+    finish_reason = "tool_calls" if has_tool_calls else (incomplete_reason or "stop")
+    if (has_tool_calls or message_refusal) and not message_content:
+        message_content = None
+    message = ChatCompletionMessage(
+        role="assistant",
+        content=message_content,
+        refusal=message_refusal,
+        tool_calls=message_tool_calls or None,
+    )
+    choice = ChatCompletionChoice(
+        index=0,
+        message=message,
+        finish_reason=finish_reason,
+    )
+    completion = ChatCompletion(
+        id=response_id or "chatcmpl_temp",
+        created=created,
+        model=model,
+        choices=[choice],
+        usage=_map_usage(usage),
+    )
+    return completion
+
+
+def _map_usage(usage: ResponseUsage | None) -> ChatCompletionUsage | None:
+    if usage is None:
+        return None
+    prompt_tokens = usage.input_tokens
+    completion_tokens = usage.output_tokens
+    total_tokens = usage.total_tokens
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    prompt_details = None
+    cached_tokens = usage.input_tokens_details.cached_tokens if usage.input_tokens_details else None
+    if cached_tokens is not None:
+        prompt_details = ChatPromptTokensDetails(cached_tokens=cached_tokens)
+
+    completion_details = None
+    reasoning_tokens = usage.output_tokens_details.reasoning_tokens if usage.output_tokens_details else None
+    if reasoning_tokens is not None:
+        completion_details = ChatCompletionTokensDetails(reasoning_tokens=reasoning_tokens)
+    return ChatCompletionUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        prompt_tokens_details=prompt_details,
+        completion_tokens_details=completion_details,
+    )
+
+
+def _parse_usage(value: JsonValue) -> ResponseUsage | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        return ResponseUsage.model_validate(value)
+    except ValidationError:
+        return None
+
+
+def _dump_chunk(chunk: ChatCompletionChunk, *, include_usage: bool = False) -> str:
+    payload = chunk.model_dump(mode="json", exclude_none=True)
+    if include_usage and "usage" not in payload:
+        payload["usage"] = None
+    return _dump_sse(payload)
+
+
+def _dump_sse(payload: dict[str, JsonValue]) -> str:
+    return format_sse_data(payload)
+
+
+def _upstream_stream_truncated_error_payload() -> dict[str, JsonValue]:
+    return {
+        "error": {
+            "message": "Responses stream ended before a terminal event",
+            "type": "server_error",
+            "code": "upstream_stream_truncated",
+        }
+    }
+
+
+def _upstream_stream_truncated_error() -> OpenAIErrorEnvelope:
+    return OpenAIErrorEnvelope.model_validate(_upstream_stream_truncated_error_payload())
+
+
+def _finish_reason_from_incomplete(response: JsonValue | None) -> str:
+    response_mapping = _as_mapping(response)
+    if response_mapping is None:
+        return "stop"
+    details = _as_mapping(response_mapping.get("incomplete_details"))
+    if details is not None:
+        reason = details.get("reason")
+        if reason in ("max_output_tokens", "max_tokens"):
+            return "length"
+        if reason == "content_filter":
+            return "content_filter"
+    return "stop"
+
+
+def _default_error_envelope() -> OpenAIErrorEnvelope:
+    return OpenAIErrorEnvelope(
+        error=OpenAIError(
+            message="Upstream error",
+            type="server_error",
+            code="upstream_error",
+        )
+    )
+
+
+def _error_envelope_from_payload(payload: Mapping[str, JsonValue]) -> OpenAIErrorEnvelope:
+    normalized = _normalize_error_payload(payload)
+    if not normalized:
+        return _default_error_envelope()
+    try:
+        error = OpenAIError.model_validate(normalized)
+    except ValidationError:
+        return _default_error_envelope()
+    return OpenAIErrorEnvelope(error=error)
+
+
+def _normalize_error_payload(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    normalized: dict[str, JsonValue] = {}
+    for key in ("message", "type", "code", "param", "plan_type"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            normalized[key] = value
+    for key in ("resets_at", "resets_in_seconds"):
+        value = payload.get(key)
+        number = _coerce_number(value)
+        if number is not None:
+            normalized[key] = number
+    return normalized
+
+
+def _coerce_number(value: JsonValue) -> int | float | None:
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _resolve_output_index(payload: Mapping[str, JsonValue]) -> int | None:
+    """Extract output_index from a Responses API event payload."""
+    val = payload.get("output_index")
+    if isinstance(val, int):
+        return val
+    return None
+
+
+def _register_item_id_alias(payload: Mapping[str, JsonValue], index: int, indexer: ToolCallIndex) -> None:
+    """Register item.id from output_item events as an index alias.
+
+    The Responses API emits output_item.added/done events with item.id
+    (e.g. "fc_01ee...") and item.call_id (e.g. "call_kI8y...").
+    Subsequent function_call_arguments.delta/done events reference the
+    tool call via item_id (= item.id), not call_id.  By registering
+    item.id as an alias when we first see the output_item event, later
+    delta/done events can resolve to the correct index.
+    """
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        return
+    item_id = item.get("id")
+    call_id = item.get("call_id")
+    if isinstance(item_id, str) and item_id:
+        if item_id != call_id:
+            indexer.register_alias(item_id, index)
+
+    output_index = _resolve_output_index(payload)
+    if output_index is not None:
+        indexer.register_output_index(output_index, index)
+
+
+def _tool_call_delta_from_payload(payload: Mapping[str, JsonValue], indexer: ToolCallIndex) -> ToolCallDelta | None:
+    if not _is_tool_call_event(payload):
+        return None
+    fields = _extract_tool_call_fields(payload)
+    if fields is None:
+        return None
+    call_id, name, arguments, tool_type = fields
+    output_index = _resolve_output_index(payload)
+    routing_id = call_id
+    if routing_id is None:
+        item = payload.get("item")
+        routing_id = _first_str(
+            payload.get("item_id"),
+            item.get("id") if isinstance(item, dict) else None,
+        )
+    index = indexer.index_for_output_index(output_index, routing_id, name)
+    _register_item_id_alias(payload, index, indexer)
+    return ToolCallDelta(
+        index=index,
+        call_id=call_id,
+        name=name,
+        arguments=arguments,
+        tool_type=tool_type,
+        arguments_mode=_tool_call_arguments_mode(payload),
+    )
+
+
+def _is_tool_call_event(payload: Mapping[str, JsonValue]) -> bool:
+    event_type = payload.get("type")
+    if isinstance(event_type, str) and ("tool_call" in event_type or "function_call" in event_type):
+        return True
+    item = _as_mapping(payload.get("item"))
+    if item is not None:
+        item_type = item.get("type")
+        if isinstance(item_type, str) and ("tool" in item_type or "function" in item_type):
+            return True
+        if any(key in item for key in ("call_id", "tool_call_id", "arguments", "function", "name")):
+            return True
+    if any(key in payload for key in ("call_id", "tool_call_id")):
+        return True
+    if "arguments" in payload and ("name" in payload or "function" in payload):
+        return True
+    return False
+
+
+def _extract_tool_call_fields(
+    payload: Mapping[str, JsonValue],
+) -> tuple[str | None, str | None, str | None, str | None] | None:
+    candidate = _select_tool_call_candidate(payload)
+    delta = candidate.get("delta")
+    delta_map = _as_mapping(delta)
+    delta_text = delta if isinstance(delta, str) else None
+
+    call_id = _first_str(
+        candidate.get("call_id"),
+        candidate.get("tool_call_id"),
+        candidate.get("id"),
+    )
+    if call_id is None and delta_map is not None:
+        call_id = _first_str(
+            delta_map.get("id"),
+            delta_map.get("call_id"),
+            delta_map.get("tool_call_id"),
+        )
+
+    name = _first_str(candidate.get("name"), candidate.get("tool_name"))
+    if name is None and delta_map is not None:
+        name = _first_str(delta_map.get("name"))
+    if name is None:
+        function = _as_mapping(candidate.get("function"))
+        if function is not None:
+            name = _first_str(function.get("name"))
+    if name is None and delta_map is not None:
+        function = _as_mapping(delta_map.get("function"))
+        if function is not None:
+            name = _first_str(function.get("name"))
+
+    arguments = None
+    candidate_arguments = candidate.get("arguments")
+    if isinstance(candidate_arguments, str):
+        arguments = candidate_arguments
+    if arguments is None and isinstance(delta_text, str):
+        arguments = delta_text
+    if arguments is None and delta_map is not None:
+        delta_arguments = delta_map.get("arguments")
+        if isinstance(delta_arguments, str):
+            arguments = delta_arguments
+        else:
+            function = _as_mapping(delta_map.get("function"))
+            if function is not None:
+                function_arguments = function.get("arguments")
+                if isinstance(function_arguments, str):
+                    arguments = function_arguments
+
+    tool_type = _first_str(candidate.get("tool_type"), candidate.get("type"))
+    if tool_type and tool_type.startswith("response."):
+        tool_type = None
+    if tool_type in ("tool_call", "function_call"):
+        tool_type = "function"
+
+    if call_id is None and name is None and arguments is None:
+        return None
+    return call_id, name, arguments, tool_type
+
+
+def _select_tool_call_candidate(payload: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    item = _as_mapping(payload.get("item"))
+    if item is not None:
+        item_type = item.get("type")
+        if isinstance(item_type, str) and ("tool" in item_type or "function" in item_type):
+            return item
+        if any(key in item for key in ("call_id", "tool_call_id", "arguments", "function", "name")):
+            return item
+    return payload
+
+
+def _tool_call_key(call_id: str | None, name: str | None) -> str | None:
+    if call_id:
+        return f"id:{call_id}"
+    if name:
+        return f"name:{name}"
+    return None
+
+
+def _tool_call_arguments_mode(payload: Mapping[str, JsonValue]) -> Literal["append", "replace"]:
+    event_type = payload.get("type")
+    if isinstance(event_type, str):
+        if event_type.endswith(".delta"):
+            return "append"
+        if event_type.endswith(".done"):
+            return "replace"
+        if event_type == "response.output_item.added":
+            return "replace"
+    return "replace"
+
+
+def _as_mapping(value: JsonValue) -> Mapping[str, JsonValue] | None:
+    if is_json_mapping(value):
+        return value
+    return None
+
+
+def _first_str(*values: JsonValue) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _merge_tool_call_delta(tool_calls: list[ToolCallState], delta: ToolCallDelta) -> ToolCallState:
+    while len(tool_calls) <= delta.index:
+        tool_calls.append(ToolCallState(index=len(tool_calls)))
+    tool_calls[delta.index].apply_delta(delta)
+    return tool_calls[delta.index]
+
+
+def _compact_tool_calls(tool_calls: list[ToolCallState]) -> list[ChatMessageToolCall]:
+    cleaned: list[ChatMessageToolCall] = []
+    for call in tool_calls:
+        tool_call = call.to_message_tool_call()
+        if tool_call is not None:
+            cleaned.append(tool_call)
+    return cleaned
+
+
+def _pending_stream_value(emitted: str | None, current: str | None) -> str | None:
+    if current is None:
+        return None
+    if emitted is None or emitted != current:
+        return current
+    return None
+
+
+def _pending_stream_arguments(emitted: str, current: str) -> str | None:
+    if not current or current == emitted:
+        return None
+    if not emitted:
+        return current
+    if current.startswith(emitted):
+        suffix = current[len(emitted) :]
+        return suffix or None
+    # Chat Completions tool-call arguments are append-only, so snapshot rewrites
+    # that change previously emitted bytes cannot be represented safely.
+    return None
