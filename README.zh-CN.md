@@ -25,6 +25,7 @@ Codex 客户端期望上游对话是长期、可恢复的。上游 websocket 意
 docker volume create codex-lb-enhanced-data
 docker run -d --name codex-lb-enhanced \
   --restart unless-stopped \
+  -e CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_AMBIGUOUS_CONTINUATION_RECOVERY_MODE=server_indefinite_recovery \
   -p 1455:1455 -p 2455:2455 \
   -v codex-lb-enhanced-data:/var/lib/codex-lb \
   ghcr.io/aafqaq/codex-lb-enhanced:latest

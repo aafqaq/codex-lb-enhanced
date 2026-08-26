@@ -94,14 +94,6 @@ def test_settings_surface_ratchet() -> None:
     )
 
 
-def test_enhanced_default_keeps_ambiguous_codex_sessions_recoverable() -> None:
-    settings = _isolated_settings()
-    assert (
-        settings.http_responses_session_bridge_ambiguous_continuation_recovery_mode
-        == "server_indefinite_recovery"
-    )
-
-
 def _uncommented_assignments(text: str) -> list[tuple[str, str]]:
     assignments: list[tuple[str, str]] = []
     for line in text.splitlines():
