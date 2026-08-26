@@ -19,7 +19,6 @@ const ALL_CHART_LABELS = [
   "Cost by Day",
   "Tokens by Day",
   "Time to First Token",
-  "Tokens per Second",
   "Queue Wait",
 ];
 
@@ -261,7 +260,7 @@ describe("ReportsFilters", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: "Charts (5)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Charts (4)" })).toBeInTheDocument();
   });
 
   it("places the chart selector before the start date", () => {
@@ -280,7 +279,7 @@ describe("ReportsFilters", () => {
       />,
     );
 
-    const chartButton = screen.getByRole("button", { name: "Charts (5)" });
+    const chartButton = screen.getByRole("button", { name: "Charts (4)" });
     const startDate = container.querySelector('input[name="report-start-date"]');
 
     expect(startDate).not.toBeNull();
@@ -306,14 +305,14 @@ describe("ReportsFilters", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+    await user.click(screen.getByRole("button", { name: "Charts (4)" }));
 
     expect(screen.getAllByRole("menuitemcheckbox").map((item) => item.textContent)).toEqual(
       ALL_CHART_LABELS,
     );
   });
 
-  it("returns the other four chart IDs when Queue Wait is toggled off", async () => {
+  it("returns the other three chart IDs when Queue Wait is toggled off", async () => {
     const user = userEvent.setup();
     const onVisibleChartIdsChange = vi.fn();
     render(
@@ -331,7 +330,7 @@ describe("ReportsFilters", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "Charts (5)" }));
+    await user.click(screen.getByRole("button", { name: "Charts (4)" }));
     await user.click(screen.getByRole("menuitemcheckbox", { name: "Queue Wait" }));
 
     expect(onVisibleChartIdsChange).toHaveBeenCalledWith(
