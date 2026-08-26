@@ -783,10 +783,10 @@ The `/reports` page SHALL expose visible filter controls for `7d`, `30d`, and `9
 The `/reports` page MUST expose a visible multi-select immediately before the
 date controls. Its options MUST use the localized existing chart-header keys
 `reports.charts.costByDay`, `reports.charts.tokensByDay`,
-`reports.charts.timeToFirstToken`, `reports.charts.tokensPerSecond`, and
-`reports.charts.queueWait`. The multi-select filter label MUST use the
+`reports.charts.timeToFirstToken`, and `reports.charts.queueWait`. The
+multi-select filter label MUST use the
 `reports.filters.charts` key, and that key MUST be provided in each of
-`en.json`, `ko.json`, and `zh-CN.json`. All five options MUST be selected by
+`en.json`, `ko.json`, and `zh-CN.json`. All four options MUST be selected by
 default.
 Selected line-chart cards MUST render, deselected line-chart cards MUST NOT
 render, and an empty selection MUST be valid. Summary, donut, and table
@@ -795,8 +795,8 @@ sections MUST remain visible regardless of line-chart selection.
 #### Scenario: Reports selects all line charts by default
 
 - **WHEN** the `/reports` page loads without a saved visibility preference
-- **THEN** the multi-select has all five chart options selected
-- **AND** all five line-chart cards render
+- **THEN** the multi-select has all four chart options selected
+- **AND** all four line-chart cards render
 - **AND** the summary, donut, and table sections remain visible
 
 #### Scenario: Reports renders a partial selection
@@ -804,12 +804,12 @@ sections MUST remain visible regardless of line-chart selection.
 - **GIVEN** the operator selects only Cost by Day and Queue Wait
 - **WHEN** the Reports page renders
 - **THEN** only those two line-chart cards render
-- **AND** the other three line-chart cards do not render
+- **AND** the other two line-chart cards do not render
 - **AND** the summary, donut, and table sections remain visible
 
 #### Scenario: Reports permits an empty selection
 
-- **GIVEN** the operator deselects all five chart options
+- **GIVEN** the operator deselects all four chart options
 - **WHEN** the Reports page renders
 - **THEN** no line-chart cards render
 - **AND** the summary, donut, and table sections remain visible
@@ -825,14 +825,14 @@ sections MUST remain visible regardless of line-chart selection.
 
 Reports MUST store the selected chart IDs as a JSON array under the exact
 localStorage key `codex-lb-reports-visible-charts`. The only known chart IDs
-MUST be the following five, in this canonical order: `costByDay`,
-`tokensByDay`, `timeToFirstToken`, `tokensPerSecond`, `queueWait`. This
+MUST be the following four, in this canonical order: `costByDay`,
+`tokensByDay`, `timeToFirstToken`, `queueWait`. This
 canonical order MUST be used for normalization, persistence, and rendering.
-Missing storage MUST default to all five known chart IDs. A valid array MUST
+Missing storage MUST default to all four known chart IDs. A valid array MUST
 be filtered to known IDs, deduplicated, and normalized to canonical chart
 order; an empty array MUST remain empty. Malformed JSON, non-array values,
 arrays containing any non-string values, and localStorage access failures MUST
-default to all five known chart IDs. Storage failures MUST NOT disable
+default to all four known chart IDs. Storage failures MUST NOT disable
 current-session in-memory visibility changes.
 
 #### Scenario: Reports restores a persisted subset
@@ -842,7 +842,7 @@ current-session in-memory visibility changes.
 - **WHEN** the `/reports` page initializes
 - **THEN** those two chart options are selected
 - **AND** their line-chart cards render
-- **AND** the other three line-chart cards do not render
+- **AND** the other two line-chart cards do not render
 
 #### Scenario: Reports ignores unknown IDs and normalizes persisted values
 
