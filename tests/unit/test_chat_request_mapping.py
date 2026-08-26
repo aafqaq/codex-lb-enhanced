@@ -1,0 +1,1001 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import cast
+
+import pytest
+from pydantic import ValidationError
+
+from app.core.openai.chat_requests import ChatCompletionsRequest
+from app.core.types import JsonValue
+
+
+def test_chat_to_responses_omits_unset_tools() -> None:
+    req = ChatCompletionsRequest.model_validate(
+        {
+            "model": "gpt-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+
+    responses = req.to_responses_request()
+
+    assert "tools" not in req.model_fields_set
+    assert "tools" not in responses.model_fields_set
+    assert "tools" not in responses.to_payload()
+
+
+def test_chat_to_responses_preserves_explicit_empty_tools() -> None:
+    req = ChatCompletionsRequest.model_validate(
+        {
+            "model": "gpt-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [],
+        }
+    )
+
+    responses = req.to_responses_request()
+
+    assert responses.to_payload()["tools"] == []
+
+
+def test_chat_responses_shaped_payload_omits_unset_tools() -> None:
+    req = ChatCompletionsRequest.model_validate(
+        {
+            "model": "gpt-5.2",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        }
+    )
+
+    responses = req.to_responses_request()
+
+    assert "tools" not in req.model_fields_set
+    assert "tools" not in responses.model_fields_set
+    assert "tools" not in responses.to_payload()
+
+
+def test_chat_messages_to_responses_mapping():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    assert responses.instructions == "sys"
+    assert responses.input == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+
+
+def test_chat_endpoint_accepts_responses_style_input_payload():
+    payload = {
+        "model": "gpt-5.2",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "metadata": {"client": "cursor"},
+        "user": "cursor-user",
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+
+    assert responses.instructions == ""
+    assert responses.input == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    assert "metadata" not in dumped
+    assert "user" not in dumped
+
+
+def test_chat_endpoint_preserves_responses_input_when_messages_is_empty():
+    input_items = [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [],
+        "input": input_items,
+        "instructions": "keep it short",
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+
+    assert responses.instructions == "keep it short"
+    assert responses.input == input_items
+
+
+def test_chat_endpoint_preserves_responses_shaped_tools():
+    input_items = [{"role": "user", "content": [{"type": "input_text", "text": "Run tool."}]}]
+    tool = {
+        "type": "mcp",
+        "server_label": "filesystem",
+        "server_url": "https://example.com/mcp",
+        "require_approval": "never",
+    }
+    payload = {
+        "model": "gpt-5.2",
+        "input": input_items,
+        "tools": [tool],
+        "tool_choice": {"type": "mcp", "server_label": "filesystem"},
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+
+    assert responses.input == input_items
+    assert responses.tools == [tool]
+    assert responses.tool_choice == {"type": "mcp", "server_label": "filesystem"}
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        {"type": "file_search", "vector_store_ids": ["vs_dummy"]},
+        {"type": "image_generation", "output_format": "png"},
+    ],
+)
+def test_chat_endpoint_preserves_responses_shaped_builtin_tools(tool):
+    input_items = [{"role": "user", "content": [{"type": "input_text", "text": "Run tool."}]}]
+    payload = {
+        "model": "gpt-5.2",
+        "input": input_items,
+        "tools": [tool],
+        "tool_choice": {"type": tool["type"]},
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+
+    assert responses.input == input_items
+    assert responses.tools == [tool]
+    assert responses.tool_choice == {"type": tool["type"]}
+
+
+def test_chat_messages_accept_responses_style_text_parts():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "system", "content": [{"type": "input_text", "text": "sys"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+
+    assert responses.instructions == "sys"
+    assert responses.input == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+
+
+def test_chat_messages_require_objects():
+    payload = {"model": "gpt-5.2", "messages": ["hi"]}
+    with pytest.raises(ValidationError):
+        ChatCompletionsRequest.model_validate(payload)
+
+
+def test_chat_unknown_message_keys_are_dropped():
+    """Unknown keys on a message object must not reach the Responses input.
+
+    OpenAI's own /v1/chat/completions parses the known chat-message fields
+    and ignores everything else on the message object — it never forwards
+    arbitrary client-supplied keys. codex-lb must match that: a Responses
+    API input message item only has `role` + `content`, and forwarding any
+    other key makes the upstream Responses API reject the whole request
+    with an `unknown_parameter` error (which then poisons every later
+    request that replays the same message history).
+    """
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi", "_client_marker": True, "extra": 1},
+            {"role": "assistant", "content": "(empty)", "_client_marker": True},
+            {"role": "user", "content": "continue", "_client_marker": True},
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    assert responses.input == [
+        {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "(empty)"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+    ]
+    items = responses.input
+    assert isinstance(items, list)
+    for item in items:
+        assert isinstance(item, dict)
+        assert set(item.keys()) == {"role", "content"}
+
+
+def test_chat_message_name_field_is_dropped():
+    """The standard chat `name` field has no Responses input-item equivalent.
+
+    `name` is a documented optional field on OpenAI chat messages, but the
+    Responses API input message item does not accept it. It must be dropped
+    during coercion rather than forwarded (forwarding it triggers an
+    upstream `unknown_parameter` rejection).
+    """
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi", "name": "alice"},
+            {"role": "assistant", "content": "hello", "name": "bot"},
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    assert responses.input == [
+        {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+    ]
+
+
+def test_chat_assistant_tool_call_message_drops_unknown_keys():
+    """The message item emitted alongside decomposed tool calls is also clean.
+
+    When an assistant message carries both content and tool_calls, the
+    content half is emitted as a separate input message item. That item
+    must carry only `role` + `content`, same as any other message item.
+    """
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "Let me check",
+                "name": "bot",
+                "_client_marker": True,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    items = responses.input
+    assert isinstance(items, list)
+    assert items[1] == {
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Let me check"}],
+    }
+    assert items[2] == {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "get_weather",
+        "arguments": "{}",
+    }
+
+
+def test_chat_system_message_rejects_non_text_content():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "system", "content": [{"type": "image_url", "image_url": {"url": "https://example.com"}}]},
+            {"role": "user", "content": "hi"},
+        ],
+    }
+    with pytest.raises(ValidationError):
+        ChatCompletionsRequest.model_validate(payload)
+
+
+def test_chat_user_audio_rejects_invalid_format():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": [{"type": "input_audio", "input_audio": {"format": "flac", "data": "..."}}]},
+        ],
+    }
+    with pytest.raises(ValidationError):
+        ChatCompletionsRequest.model_validate(payload)
+
+
+def test_chat_store_true_is_ignored():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "store": True,
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    assert responses.store is False
+
+
+def test_chat_max_tokens_are_stripped():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 128,
+        "max_completion_tokens": 256,
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    assert "max_tokens" not in dumped
+    assert "max_completion_tokens" not in dumped
+
+
+def test_temperature_and_top_p_are_stripped_for_upstream_compat():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "safety_identifier": "safe_123",
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    assert "temperature" not in dumped
+    assert "top_p" not in dumped
+    assert "safety_identifier" not in dumped
+
+
+def test_chat_prompt_cache_controls_are_preserved():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "prompt_cache_key": "thread_123",
+        "prompt_cache_retention": "4h",
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+
+    assert dumped["prompt_cache_key"] == "thread_123"
+    assert "prompt_cache_retention" not in dumped
+
+
+def test_chat_reasoning_effort_maps_to_responses_reasoning():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    assert "reasoning_effort" not in dumped
+    reasoning = dumped.get("reasoning")
+    assert isinstance(reasoning, Mapping)
+    reasoning_map = cast(Mapping[str, JsonValue], reasoning)
+    assert reasoning_map.get("effort") == "high"
+
+
+def test_chat_reasoning_effort_merges_with_reasoning_metadata():
+    request = ChatCompletionsRequest.model_validate(
+        {
+            "model": "gpt-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "max",
+            "reasoning": {"summary": "auto"},
+        }
+    )
+
+    responses = request.to_responses_request()
+
+    assert responses.reasoning is not None
+    assert responses.reasoning.effort == "max"
+    assert responses.reasoning.summary == "auto"
+
+
+def test_chat_enable_thinking_maps_to_default_reasoning_effort():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "enable_thinking": True,
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    assert "enable_thinking" not in dumped
+    reasoning = dumped.get("reasoning")
+    assert isinstance(reasoning, Mapping)
+    reasoning_map = cast(Mapping[str, JsonValue], reasoning)
+    assert reasoning_map.get("effort") == "medium"
+
+
+def test_chat_anthropic_thinking_alias_maps_to_default_reasoning_effort():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    assert "thinking" not in dumped
+    reasoning = dumped.get("reasoning")
+    assert isinstance(reasoning, Mapping)
+    reasoning_map = cast(Mapping[str, JsonValue], reasoning)
+    assert reasoning_map.get("effort") == "medium"
+
+
+def test_chat_service_tier_is_preserved_in_responses_payload():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "service_tier": "priority",
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+
+    assert dumped["service_tier"] == "priority"
+
+
+def test_chat_tools_are_normalized():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "do_thing",
+                    "description": "desc",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    tools = dumped.get("tools")
+    assert isinstance(tools, list)
+    assert tools
+    first_tool = cast(Mapping[str, JsonValue], tools[0])
+    assert first_tool.get("name") == "do_thing"
+    assert first_tool.get("type") == "function"
+    assert "function" not in first_tool
+
+
+def test_chat_tool_choice_object_passes_through():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": {"type": "function", "function": {"name": "do_thing"}},
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    tool_choice = dumped.get("tool_choice")
+    assert tool_choice == {"type": "function", "name": "do_thing"}
+
+
+def test_chat_response_format_json_object_maps_to_text_format():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {"type": "json_object"},
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    text = dumped.get("text")
+    assert isinstance(text, dict)
+    assert text.get("format") == {"type": "json_object"}
+
+
+def test_chat_response_format_json_object_preserves_instruction_roles_in_input():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "system", "content": "Return JSON."},
+            {"role": "developer", "content": "Keep it short."},
+            {"role": "user", "content": "Say hello."},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+
+    assert dumped["instructions"] == "Return JSON.\nKeep it short."
+    assert dumped["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "Say hello."}]},
+    ]
+    assert dumped["text"] == {"format": {"type": "json_object"}}
+
+
+def test_chat_response_format_json_schema_maps_schema_fields():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "output",
+                "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+                "strict": True,
+            },
+        },
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    text = dumped.get("text")
+    assert isinstance(text, dict)
+    fmt = text.get("format")
+    assert isinstance(fmt, dict)
+    assert fmt.get("type") == "json_schema"
+    assert fmt.get("name") == "output"
+    assert fmt.get("schema") == {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    assert fmt.get("strict") is True
+
+
+def test_chat_response_format_json_schema_keeps_system_in_instructions():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "system", "content": "Return JSON."},
+            {"role": "user", "content": "hi"},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "output",
+                "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+                "strict": True,
+            },
+        },
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+
+    assert responses.instructions == "Return JSON."
+    assert responses.input == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+
+
+def test_chat_stream_options_include_obfuscation_passthrough():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream_options": {"include_obfuscation": True, "include_usage": True},
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    assert dumped.get("stream_options") == {"include_obfuscation": True}
+
+
+def test_chat_oversized_image_is_dropped():
+    oversized_data = "A" * (11 * 1024 * 1024)
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{oversized_data}"}},
+                    {"type": "text", "text": "hi"},
+                ],
+            }
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    assert responses.input == [
+        {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+
+def test_chat_assistant_tool_calls_decomposed():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "Let me check",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"loc":"NYC"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "72F"},
+            {"role": "user", "content": "thanks"},
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    items = responses.input
+    assert isinstance(items, list)
+    assert items[0] == {"role": "user", "content": [{"type": "input_text", "text": "weather?"}]}
+    assert items[1] == {"role": "assistant", "content": [{"type": "output_text", "text": "Let me check"}]}
+    assert items[2] == {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "get_weather",
+        "arguments": '{"loc":"NYC"}',
+    }
+    assert items[3] == {"type": "function_call_output", "call_id": "call_1", "output": "72F"}
+    assert items[4] == {"role": "user", "content": [{"type": "input_text", "text": "thanks"}]}
+
+
+def test_chat_assistant_tool_calls_no_content():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    items = responses.input
+    assert isinstance(items, list)
+    assert len(items) == 2
+    assert items[0] == {"role": "user", "content": [{"type": "input_text", "text": "weather?"}]}
+    assert items[1] == {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{}"}
+
+
+def test_chat_tool_message_to_function_call_output():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result data"},
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    items = responses.input
+    assert isinstance(items, list)
+    assert items[1] == {"type": "function_call_output", "call_id": "call_1", "output": "result data"}
+
+
+def test_chat_tool_message_array_content():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [{"type": "text", "text": "result"}],
+            },
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    items = responses.input
+    assert isinstance(items, list)
+    assert items[1] == {"type": "function_call_output", "call_id": "call_1", "output": "result"}
+
+
+def test_chat_tool_message_missing_tool_call_id():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "content": "result"},
+        ],
+    }
+    with pytest.raises(ValueError):
+        ChatCompletionsRequest.model_validate(payload).to_responses_request()
+
+
+def test_chat_tool_message_invalid_content_type_rejected():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_1", "content": 42},
+        ],
+    }
+    with pytest.raises(ValueError, match="must be a string or array"):
+        ChatCompletionsRequest.model_validate(payload).to_responses_request()
+
+
+def test_chat_tool_message_null_content_rejected():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_1", "content": None},
+        ],
+    }
+    with pytest.raises(ValueError, match="content is required"):
+        ChatCompletionsRequest.model_validate(payload).to_responses_request()
+
+
+def test_chat_tool_message_malformed_text_parts_rejected():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [{"type": "text"}],
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="no valid text parts"):
+        ChatCompletionsRequest.model_validate(payload).to_responses_request()
+
+
+def test_chat_assistant_non_string_tool_call_arguments_rejected():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "fn", "arguments": {"a": 1}},
+                    }
+                ],
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="arguments must be a string"):
+        ChatCompletionsRequest.model_validate(payload).to_responses_request()
+
+
+@pytest.mark.parametrize(
+    ("field", "tool_call"),
+    [
+        ("id", {"type": "function", "function": {"name": "fn", "arguments": "{}"}}),
+        ("function", {"id": "call_1", "type": "function"}),
+        ("function.name", {"id": "call_1", "type": "function", "function": {"arguments": "{}"}}),
+    ],
+)
+def test_chat_assistant_malformed_tool_call_rejected(field: str, tool_call: dict):
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+        ],
+    }
+    with pytest.raises(ValueError):
+        ChatCompletionsRequest.model_validate(payload).to_responses_request()
+
+
+def test_chat_tool_message_multi_part_content_concatenated():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [
+                    {"type": "text", "text": '{"a":1'},
+                    {"type": "text", "text": "}"},
+                ],
+            },
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    items = responses.input
+    assert isinstance(items, list)
+    assert items[1] == {"type": "function_call_output", "call_id": "call_1", "output": '{"a":1}'}
+
+
+@pytest.mark.parametrize("n", [0, -1, 2])
+def test_chat_n_not_1_rejected(n: int):
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "n": n,
+    }
+    with pytest.raises(ValidationError):
+        ChatCompletionsRequest.model_validate(payload)
+
+
+def test_chat_n_equals_1_accepted():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "n": 1,
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    dumped = responses.to_payload()
+    assert "n" not in dumped
+
+
+def test_chat_image_detail_is_preserved_when_mapping_to_input_image():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/a.png", "detail": "high"},
+                    }
+                ],
+            }
+        ],
+    }
+
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+
+    assert responses.input == [
+        {
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "https://example.com/a.png", "detail": "high"}],
+        }
+    ]
+
+
+def test_chat_assistant_refusal_converts_to_content_part():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "do something bad"},
+            {"role": "assistant", "content": None, "refusal": "I can't help with that"},
+            {"role": "user", "content": "ok"},
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    items = responses.input
+    assert isinstance(items, list)
+    assert items[1] == {
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "I can't help with that"}],
+    }
+
+
+def test_chat_assistant_content_and_refusal_both_converted():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "partial", "refusal": "but I must refuse"},
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    items = responses.input
+    assert isinstance(items, list)
+    assert items[1] == {
+        "role": "assistant",
+        "content": [
+            {"type": "output_text", "text": "partial"},
+            {"type": "output_text", "text": "but I must refuse"},
+        ],
+    }
+
+
+def test_chat_assistant_tool_calls_with_refusal():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "refusal": "nope",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "fn", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+    items = responses.input
+    assert isinstance(items, list)
+    assert items[1] == {
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "nope"}],
+    }
+    assert items[2] == {"type": "function_call", "call_id": "call_1", "name": "fn", "arguments": "{}"}
+
+
+def test_chat_tool_message_maps_to_function_call_output():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "assistant", "content": "Running tool."},
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"ok":true}'},
+            {"role": "user", "content": "continue"},
+        ],
+    }
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+
+    assert responses.input == [
+        {"role": "assistant", "content": [{"type": "output_text", "text": "Running tool."}]},
+        {"type": "function_call_output", "call_id": "call_1", "output": '{"ok":true}'},
+        {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+    ]
+
+
+def test_chat_tool_calls_history_maps_to_function_call_and_output():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"q":"abc"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"ok":true}'},
+            {"role": "user", "content": "continue"},
+        ],
+    }
+
+    req = ChatCompletionsRequest.model_validate(payload)
+    responses = req.to_responses_request()
+
+    assert responses.input == [
+        {"role": "assistant", "content": [{"type": "output_text", "text": ""}]},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": '{"q":"abc"}'},
+        {"type": "function_call_output", "call_id": "call_1", "output": '{"ok":true}'},
+        {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+    ]
+
+
+def test_chat_assistant_tool_calls_require_function_name():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"arguments": "{}"}}],
+            },
+            {"role": "user", "content": "continue"},
+        ],
+    }
+    with pytest.raises(ValidationError, match=r"assistant tool_calls\[0\]\.function must include a non-empty 'name'"):
+        ChatCompletionsRequest.model_validate(payload)
+
+
+def test_chat_tool_message_requires_tool_call_id():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "tool", "content": '{"ok":true}'},
+            {"role": "user", "content": "continue"},
+        ],
+    }
+    with pytest.raises(ValidationError, match="tool messages must include 'tool_call_id'"):
+        ChatCompletionsRequest.model_validate(payload)
+
+
+def test_chat_rejects_unknown_message_role():
+    payload = {
+        "model": "gpt-5.2",
+        "messages": [
+            {"role": "moderator", "content": "blocked"},
+            {"role": "user", "content": "continue"},
+        ],
+    }
+    with pytest.raises(ValidationError, match="Unsupported message role"):
+        ChatCompletionsRequest.model_validate(payload)

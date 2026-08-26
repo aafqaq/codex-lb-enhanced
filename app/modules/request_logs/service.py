@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from app.modules.request_logs.mappers import (
+    QUOTA_CODES,
+    RATE_LIMIT_CODES,
+    normalize_log_status,
+    to_request_log_entry,
+)
+from app.modules.request_logs.repository import (
+    ConversationDetailsResult,
+    ConversationFacet,
+    ConversationListResult,
+    RequestLogsRepository,
+)
+from app.modules.request_logs.schemas import (
+    ConversationEntry,
+    ConversationModelEffort,
+    ConversationModelStat,
+    RequestLogConversation,
+    RequestLogEntry,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RequestLogModelOption:
+    model: str
+    reasoning_effort: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestLogApiKeyOption:
+    id: str
+    name: str
+    key_prefix: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestLogStatusFilter:
+    include_success: bool
+    include_cancelled: bool
+    include_error_other: bool
+    error_codes_in: list[str] | None
+    error_codes_excluding: list[str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestLogFilterOptions:
+    account_ids: list[str]
+    model_options: list[RequestLogModelOption]
+    api_keys: list[RequestLogApiKeyOption]
+    statuses: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class RequestLogsPage:
+    requests: list[RequestLogEntry]
+    total: int
+    has_more: bool
+    conversation: RequestLogConversation | None
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationsPage:
+    conversations: list[ConversationEntry]
+    total: int
+    has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationDetails:
+    conversation_id: str
+    start: datetime
+    latest: datetime
+    account_count: int
+    total_elapsed_time: int
+    dominant_useragent_group: str | None
+    model_stats: list[ConversationModelStat]
+
+
+class RequestLogsService:
+    def __init__(self, repo: RequestLogsRepository) -> None:
+        self._repo = repo
+
+    async def list_recent(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        search: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        conversation_id: str | None = None,
+        account_ids: list[str] | None = None,
+        api_key_ids: list[str] | None = None,
+        model_options: list[RequestLogModelOption] | None = None,
+        models: list[str] | None = None,
+        reasoning_efforts: list[str] | None = None,
+        status: list[str] | None = None,
+        *,
+        include_sensitive_metadata: bool,
+    ) -> RequestLogsPage:
+        status_filter = _map_status_filter(status)
+        normalized_model_options = (
+            [(option.model, option.reasoning_effort) for option in model_options] if model_options else None
+        )
+        result = await self._repo.list_recent(
+            limit=limit,
+            offset=offset,
+            search=search,
+            since=since,
+            until=until,
+            conversation_id=conversation_id,
+            account_ids=account_ids,
+            api_key_ids=api_key_ids,
+            model_options=normalized_model_options,
+            models=models,
+            reasoning_efforts=reasoning_efforts,
+            include_success=status_filter.include_success,
+            include_cancelled=status_filter.include_cancelled,
+            include_error_other=status_filter.include_error_other,
+            error_codes_in=status_filter.error_codes_in,
+            error_codes_excluding=status_filter.error_codes_excluding,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
+        logs = result.logs
+        total = result.total
+        conversation = None
+        if conversation_id is not None:
+            assert result.aggregated_cost_usd is not None
+            conversation = RequestLogConversation(
+                request_count=total,
+                aggregated_cost_usd=result.aggregated_cost_usd,
+            )
+        api_key_ids = [log.api_key_id for log in logs if log.api_key_id]
+        api_key_name_by_id = await self._repo.get_api_key_names_by_ids(api_key_ids)
+        requests = [
+            to_request_log_entry(
+                log,
+                api_key_name=api_key_name_by_id.get(log.api_key_id or ""),
+                include_sensitive_metadata=include_sensitive_metadata,
+            )
+            for log in logs
+        ]
+        return RequestLogsPage(
+            requests=requests,
+            total=total,
+            has_more=offset + limit < total,
+            conversation=conversation,
+        )
+
+    async def list_filter_options(
+        self,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        account_ids: list[str] | None = None,
+        api_key_ids: list[str] | None = None,
+        model_options: list[RequestLogModelOption] | None = None,
+        models: list[str] | None = None,
+        reasoning_efforts: list[str] | None = None,
+    ) -> RequestLogFilterOptions:
+        normalized_model_options = (
+            [(option.model, option.reasoning_effort) for option in model_options] if model_options else None
+        )
+        (
+            option_account_ids,
+            option_model_options,
+            option_api_key_ids,
+            status_values,
+        ) = await self._repo.list_filter_options(
+            since=since,
+            until=until,
+            account_ids=account_ids,
+            api_key_ids=api_key_ids,
+            model_options=normalized_model_options,
+            models=models,
+            reasoning_efforts=reasoning_efforts,
+        )
+        api_key_details = await self._repo.get_api_key_details_by_ids(option_api_key_ids)
+        option_api_keys = [
+            RequestLogApiKeyOption(
+                id=key_id,
+                name=api_key_details.get(key_id, (key_id, None))[0],
+                key_prefix=api_key_details.get(key_id, (key_id, None))[1],
+            )
+            for key_id in option_api_key_ids
+        ]
+        option_api_keys.sort(key=lambda option: (option.name.lower(), (option.key_prefix or "").lower(), option.id))
+        return RequestLogFilterOptions(
+            account_ids=option_account_ids,
+            model_options=[
+                RequestLogModelOption(model=model, reasoning_effort=reasoning_effort)
+                for model, reasoning_effort in option_model_options
+            ],
+            api_keys=option_api_keys,
+            statuses=_normalize_status_values(status_values),
+        )
+
+    async def list_conversations(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        search: str | None = None,
+        since: datetime | None = None,
+        cache_mode: str = "since",
+        timeframe: str | None = None,
+    ) -> ConversationsPage:
+        result = await self._repo.list_conversations(
+            limit=limit,
+            offset=offset,
+            search=search,
+            since=since,
+            cache_mode=cache_mode,
+            timeframe=timeframe,
+        )
+        api_key_ids = [facet.value for facet in result.api_key_facets]
+        api_key_names = await self._repo.get_api_key_names_by_ids(api_key_ids)
+        return ConversationsPage(
+            conversations=_to_conversations(result, api_key_names),
+            total=result.total,
+            has_more=offset + limit < result.total,
+        )
+
+    async def get_conversation_details(self, conversation_id: str) -> ConversationDetails | None:
+        result = await self._repo.get_conversation_details(conversation_id)
+        return _to_conversation_details(result) if result is not None else None
+
+
+def _map_status_filter(status: list[str] | None) -> RequestLogStatusFilter:
+    if not status:
+        return RequestLogStatusFilter(
+            include_success=True,
+            include_cancelled=True,
+            include_error_other=True,
+            error_codes_in=None,
+            error_codes_excluding=None,
+        )
+    normalized = {value.lower() for value in status if value}
+    if not normalized or "all" in normalized:
+        return RequestLogStatusFilter(
+            include_success=True,
+            include_cancelled=True,
+            include_error_other=True,
+            error_codes_in=None,
+            error_codes_excluding=None,
+        )
+
+    include_success = "ok" in normalized
+    include_cancelled = "cancelled" in normalized
+    include_rate_limit = "rate_limit" in normalized
+    include_quota = "quota" in normalized
+    include_error_other = "error" in normalized
+
+    error_codes_in: set[str] = set()
+    if include_rate_limit:
+        error_codes_in |= RATE_LIMIT_CODES
+    if include_quota:
+        error_codes_in |= QUOTA_CODES
+
+    return RequestLogStatusFilter(
+        include_success=include_success,
+        include_cancelled=include_cancelled,
+        include_error_other=include_error_other,
+        error_codes_in=sorted(error_codes_in) if error_codes_in else None,
+        error_codes_excluding=sorted(RATE_LIMIT_CODES | QUOTA_CODES) if include_error_other else None,
+    )
+
+
+def _normalize_status_values(values: list[tuple[str, str | None]]) -> list[str]:
+    normalized = {normalize_log_status(status, error_code) for status, error_code in values}
+    ordered = ["ok", "cancelled", "rate_limit", "quota", "error"]
+    return [status for status in ordered if status in normalized]
+
+
+def _first_facets(facets: list[ConversationFacet]) -> dict[str, ConversationFacet]:
+    first: dict[str, ConversationFacet] = {}
+    for facet in facets:
+        first.setdefault(facet.conversation_id, facet)
+    return first
+
+
+def _to_conversations(result: ConversationListResult, api_key_names: dict[str, str]) -> list[ConversationEntry]:
+    accounts = _first_facets(result.account_facets)
+    api_keys = _first_facets(result.api_key_facets)
+    models = _first_facets(result.model_facets)
+    account_counts = {summary.conversation_id: summary.account_count for summary in result.summaries}
+    model_counts: dict[str, int] = {}
+    for facet in result.model_facets:
+        model_counts[facet.conversation_id] = model_counts.get(facet.conversation_id, 0) + 1
+
+    entries: list[ConversationEntry] = []
+    for summary in result.summaries:
+        account = accounts.get(summary.conversation_id)
+        api_key = api_keys.get(summary.conversation_id)
+        model = models.get(summary.conversation_id)
+        api_key_name = api_key_names.get(api_key.value) if api_key is not None else None
+        entries.append(
+            ConversationEntry(
+                conversation_id=summary.conversation_id,
+                first_request=summary.first_requested_at,
+                last_request=summary.last_requested_at,
+                request_count=summary.request_count,
+                representative_account=account.value if account else None,
+                remaining_account_count=max(0, account_counts[summary.conversation_id] - 1),
+                api_key_id=api_key.value if api_key is not None and api_key_name is not None else None,
+                api_key_name=api_key_name,
+                representative_model=model.value if model else None,
+                remaining_model_count=max(0, model_counts.get(summary.conversation_id, 0) - 1),
+                total_tokens=summary.total_tokens,
+                cached_input_tokens=summary.cached_input_tokens,
+                total_cost_usd=summary.cost_usd,
+            )
+        )
+    return entries
+
+
+def _to_conversation_details(result: ConversationDetailsResult) -> ConversationDetails:
+    return ConversationDetails(
+        conversation_id=result.conversation_id,
+        start=result.started_at,
+        latest=result.last_requested_at,
+        account_count=result.account_count,
+        total_elapsed_time=result.total_elapsed_ms,
+        dominant_useragent_group=result.useragent_group,
+        model_stats=[
+            ConversationModelStat(
+                model_effort=ConversationModelEffort(model=row.model, reasoning_effort=row.reasoning_effort),
+                reqs=row.request_count,
+                total_elapsed_time=row.total_elapsed_ms,
+                total_input_tokens=row.input_tokens,
+                cached_input_tokens=row.cached_input_tokens,
+                total_output_tokens=row.output_tokens,
+                total_cost_usd=row.cost_usd,
+            )
+            for row in result.model_stats
+        ],
+    )

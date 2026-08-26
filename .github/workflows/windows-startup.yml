@@ -1,0 +1,34 @@
+name: Windows Startup Regression
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-windows-startup:
+    name: Windows startup regression
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          prune-cache: true
+
+      - name: Install dependencies
+        run: uv sync --dev --frozen
+
+      - name: Run memory monitor regression tests
+        run: uv run pytest tests/unit/test_memory_monitor.py
+
+      - name: Smoke import application startup path
+        run: uv run python -c "from app.main import create_app; app = create_app(); assert app is not None"

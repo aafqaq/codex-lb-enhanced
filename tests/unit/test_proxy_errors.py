@@ -1,0 +1,402 @@
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator
+from types import SimpleNamespace
+
+import pytest
+from starlette.requests import Request
+
+from app.core.clients.proxy import ProxyResponseError, _error_event_from_response, _error_payload_from_response
+from app.core.exceptions import ProxyRateLimitError
+from app.core.openai.requests import ResponsesRequest
+from app.modules.proxy import api as proxy_api
+from app.modules.proxy.api import _logged_error_json_response, _stream_response_error_events
+
+pytestmark = pytest.mark.unit
+
+
+def test_http_bridge_recovery_eligibility_accepts_turn_state_anchor_without_previous_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        proxy_api.proxy_service_module,
+        "get_settings",
+        lambda: SimpleNamespace(http_responses_session_bridge_operation_ledger_enabled=True),
+    )
+    payload = ResponsesRequest(model="gpt-5.6", instructions="", input="retry")
+
+    assert (
+        proxy_api._http_bridge_recovery_request_eligible(
+            payload,
+            bridge_active=True,
+            headers={"x-codex-turn-state": "turn-1"},
+        )
+        is True
+    )
+    assert (
+        proxy_api._http_bridge_recovery_request_eligible(
+            payload,
+            bridge_active=True,
+            headers={},
+        )
+        is False
+    )
+
+
+def test_http_bridge_indefinite_recovery_defers_predecessor_proof_to_submit_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        proxy_api.proxy_service_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            http_responses_session_bridge_operation_ledger_enabled=True,
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery",
+        ),
+    )
+    fresh_turn = ResponsesRequest(model="gpt-5.6", instructions="", input="retry")
+    anchored_turn = ResponsesRequest(
+        model="gpt-5.6",
+        instructions="",
+        input="retry",
+        previous_response_id="resp_parent",
+    )
+
+    assert (
+        proxy_api._http_bridge_recovery_request_eligible(
+            fresh_turn,
+            bridge_active=True,
+            headers={"x-codex-turn-state": "turn-1"},
+        )
+        is True
+    )
+    assert (
+        proxy_api._http_bridge_recovery_request_eligible(
+            anchored_turn,
+            bridge_active=True,
+            headers={"x-codex-turn-state": "turn-1"},
+        )
+        is True
+    )
+
+
+def test_logged_error_json_response_preserves_upstream_diagnostic_markers():
+    message = "Provider Exception: failed while reading /tmp/upstream-cache"
+    request = Request({"type": "http", "method": "POST", "path": "/v1/responses", "headers": []})
+    payload = {"error": {"code": "upstream_error", "message": message}}
+
+    response = _logged_error_json_response(request, 502, payload)
+
+    assert json.loads(bytes(response.body))["error"]["message"] == message
+
+
+@pytest.mark.asyncio
+async def test_stream_proxy_error_preserves_upstream_diagnostic_markers():
+    message = "Provider Exception: failed while reading /tmp/upstream-cache"
+
+    async def stream():
+        if False:
+            yield ""
+        raise ProxyResponseError(
+            502,
+            {"error": {"code": "upstream_error", "message": message, "type": "server_error"}},
+        )
+
+    events = [
+        event
+        async for event in _stream_response_error_events(
+            stream(),
+            owns_reservation=False,
+            reservation=None,
+        )
+    ]
+
+    assert len(events) == 1
+    assert message in events[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_proxy_error_preserves_retry_after_as_sse_retry_hint():
+    async def stream():
+        if False:
+            yield ""
+        raise ProxyResponseError(
+            503,
+            {
+                "error": {
+                    "code": "upstream_request_timeout",
+                    "message": "Retry shortly.",
+                    "type": "server_error",
+                }
+            },
+            retry_after_seconds=2,
+        )
+
+    events = [
+        event
+        async for event in _stream_response_error_events(
+            stream(),
+            owns_reservation=False,
+            reservation=None,
+        )
+    ]
+
+    assert len(events) == 1
+    assert events[0].startswith("retry: 2000\n")
+
+
+@pytest.mark.asyncio
+async def test_indefinite_recovery_does_not_retry_after_downstream_event(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        proxy_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+        ),
+    )
+
+    async def recovery() -> AsyncIterator[str]:
+        raise AssertionError("recovery must not run after a downstream event")
+        yield ""
+
+    async def stream():
+        yield 'data: {"type":"response.created"}\n\n'
+        raise ProxyResponseError(
+            502,
+            {"error": {"code": "stream_incomplete", "message": "closed", "type": "server_error"}},
+        )
+
+    events = [
+        event
+        async for event in _stream_response_error_events(
+            stream(),
+            owns_reservation=False,
+            reservation=None,
+            recovery_stream_factory=recovery,
+        )
+    ]
+
+    assert len(events) == 2
+    assert "response.created" in events[0]
+    assert "response.failed" in events[1]
+
+
+@pytest.mark.asyncio
+async def test_indefinite_recovery_converts_retry_reservation_failure_to_sse(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        proxy_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+        ),
+    )
+    monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
+
+    async def stream():
+        if False:
+            yield ""
+        raise ProxyResponseError(
+            502,
+            {"error": {"code": "stream_incomplete", "message": "closed", "type": "server_error"}},
+        )
+
+    async def recovery_stream():
+        raise ProxyRateLimitError("quota exhausted")
+        yield ""
+
+    events = [
+        event
+        async for event in _stream_response_error_events(
+            stream(),
+            owns_reservation=False,
+            reservation=None,
+            recovery_stream_factory=lambda: recovery_stream(),
+        )
+    ]
+
+    assert any("rate_limit_exceeded" in event and "response.failed" in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_indefinite_recovery_converts_unexpected_admission_failure_to_sse(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        proxy_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+        ),
+    )
+    monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
+
+    async def stream():
+        if False:
+            yield ""
+        raise ProxyResponseError(
+            502,
+            {"error": {"code": "stream_incomplete", "message": "closed", "type": "server_error"}},
+        )
+
+    async def recovery_stream():
+        raise RuntimeError("durable admission database unavailable")
+        yield ""
+
+    events = [
+        event
+        async for event in _stream_response_error_events(
+            stream(),
+            owns_reservation=False,
+            reservation=None,
+            recovery_stream_factory=lambda: recovery_stream(),
+        )
+    ]
+
+    assert any("bridge_recovery_admission_failed" in event and "response.failed" in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_indefinite_recovery_stops_after_retry_output_then_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        proxy_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+        ),
+    )
+    monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
+    attempts = 0
+
+    async def stream():
+        if False:
+            yield ""
+        raise ProxyResponseError(
+            502,
+            {"error": {"code": "stream_incomplete", "message": "closed", "type": "server_error"}},
+        )
+
+    async def recovery_stream():
+        nonlocal attempts
+        attempts += 1
+        yield 'data: {"type":"response.created"}\n\n'
+        raise ProxyResponseError(
+            502,
+            {"error": {"code": "upstream_request_timeout", "message": "stalled", "type": "server_error"}},
+        )
+
+    events = [
+        event
+        async for event in _stream_response_error_events(
+            stream(),
+            owns_reservation=False,
+            reservation=None,
+            recovery_stream_factory=lambda: recovery_stream(),
+        )
+    ]
+
+    assert attempts == 1
+    assert any('"type":"response.created"' in event for event in events)
+
+
+async def _completed_asyncio_sleep(_delay: float = 0.0) -> None:
+    return None
+
+
+def _payload_error_code(payload) -> str | None:
+    return payload["error"].get("code")
+
+
+def _payload_error_message(payload) -> str | None:
+    return payload["error"].get("message")
+
+
+class MockResponse:
+    def __init__(self, status, reason=None, json_data=None, text_data=""):
+        self.status = status
+        self.reason = reason
+        self._json = json_data
+        self._text = text_data
+
+    async def json(self, *, content_type=None):
+        if self._json is None:
+            raise Exception("No JSON")
+        return self._json
+
+    async def text(self, *, encoding=None, errors="strict"):
+        return self._text
+
+
+@pytest.mark.asyncio
+async def test_error_event_includes_reason_in_fallback():
+    resp = MockResponse(402, reason="Payment Required", json_data=None, text_data="")
+    event = await _error_event_from_response(resp)
+
+    assert event["response"]["error"].get("code") == "upstream_error"
+    message = event["response"]["error"].get("message")
+    assert "Upstream error: HTTP 402 Payment Required" == message
+
+
+@pytest.mark.asyncio
+async def test_error_payload_includes_reason_in_fallback():
+    resp = MockResponse(402, reason="Payment Required", json_data=None, text_data="")
+    payload = await _error_payload_from_response(resp)
+
+    assert _payload_error_code(payload) == "upstream_error"
+    message = _payload_error_message(payload)
+    assert "Upstream error: HTTP 402 Payment Required" == message
+
+
+@pytest.mark.asyncio
+async def test_error_event_uses_text_if_present():
+    resp = MockResponse(502, reason="Bad Gateway", json_data=None, text_data="My Custom Error")
+    event = await _error_event_from_response(resp)
+
+    assert event["response"]["error"].get("message") == "My Custom Error"
+
+
+@pytest.mark.asyncio
+async def test_error_payload_uses_json_if_valid():
+    json_data = {"error": {"message": "OpenAI says no", "type": "server_error", "code": "oops"}}
+    resp = MockResponse(400, reason="Bad Request", json_data=json_data, text_data="")
+    payload = await _error_payload_from_response(resp)
+
+    assert _payload_error_message(payload) == "OpenAI says no"
+    assert _payload_error_code(payload) == "oops"
+
+
+@pytest.mark.asyncio
+async def test_error_payload_uses_message_field():
+    json_data = {"message": "Plain message"}
+    resp = MockResponse(400, reason="Bad Request", json_data=json_data, text_data="")
+    payload = await _error_payload_from_response(resp)
+
+    assert _payload_error_message(payload) == "Plain message"
+
+
+@pytest.mark.asyncio
+async def test_error_payload_uses_detail_field():
+    json_data = {"detail": "Bad request"}
+    resp = MockResponse(400, reason="Bad Request", json_data=json_data, text_data="")
+    payload = await _error_payload_from_response(resp)
+
+    assert _payload_error_message(payload) == "Bad request"
+
+
+@pytest.mark.asyncio
+async def test_error_event_uses_detail_field():
+    json_data = {"detail": "Bad request"}
+    resp = MockResponse(400, reason="Bad Request", json_data=json_data, text_data="")
+    event = await _error_event_from_response(resp)
+
+    assert event["response"]["error"].get("message") == "Bad request"
+
+
+@pytest.mark.asyncio
+async def test_error_event_fallback_no_reason():
+    resp = MockResponse(500, reason=None, json_data=None, text_data="")
+    event = await _error_event_from_response(resp)
+
+    assert event["response"]["error"].get("message") == "Upstream error: HTTP 500"

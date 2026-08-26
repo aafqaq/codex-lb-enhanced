@@ -1,0 +1,82 @@
+import { get, post, put } from "@/lib/api-client";
+import {
+  AccountProxyBindingRequestSchema,
+  AccountProxyBindingSchema,
+  DashboardSettingsSchema,
+  SettingsUpdateRequestSchema,
+  TelemetryConsentSchema,
+  TelemetryConsentUpdateRequestSchema,
+  UpstreamProxyAdminSchema,
+  UpstreamProxyEndpointCreateRequestSchema,
+  UpstreamProxyEndpointSchema,
+  UpstreamProxyEndpointTestResponseSchema,
+  UpstreamProxyPoolCreateRequestSchema,
+  UpstreamProxyPoolMemberRequestSchema,
+  UpstreamProxyPoolSchema,
+} from "@/features/settings/schemas";
+
+const SETTINGS_PATH = "/api/settings";
+const UPSTREAM_PROXY_PATH = `${SETTINGS_PATH}/upstream-proxy`;
+const TELEMETRY_PATH = `${SETTINGS_PATH}/telemetry`;
+
+export function getSettings() {
+  return get(SETTINGS_PATH, DashboardSettingsSchema);
+}
+
+export function updateSettings(payload: unknown) {
+  const validated = SettingsUpdateRequestSchema.parse(payload);
+  return put(SETTINGS_PATH, DashboardSettingsSchema, {
+    body: validated,
+  });
+}
+
+export function getTelemetryConsent(options: { includePreview?: boolean } = {}) {
+  const path = options.includePreview ? `${TELEMETRY_PATH}?include_preview=true` : TELEMETRY_PATH;
+  return get(path, TelemetryConsentSchema);
+}
+
+export function updateTelemetryConsent(payload: unknown) {
+  const validated = TelemetryConsentUpdateRequestSchema.parse(payload);
+  return put(TELEMETRY_PATH, TelemetryConsentSchema, {
+    body: validated,
+  });
+}
+
+export function getUpstreamProxyAdmin() {
+  return get(UPSTREAM_PROXY_PATH, UpstreamProxyAdminSchema);
+}
+
+export function createUpstreamProxyEndpoint(payload: unknown) {
+  const validated = UpstreamProxyEndpointCreateRequestSchema.parse(payload);
+  return post(`${UPSTREAM_PROXY_PATH}/endpoints`, UpstreamProxyEndpointSchema, {
+    body: validated,
+  });
+}
+
+export function testUpstreamProxyEndpoint(endpointId: string) {
+  return post(
+    `${UPSTREAM_PROXY_PATH}/endpoints/${encodeURIComponent(endpointId)}/test`,
+    UpstreamProxyEndpointTestResponseSchema,
+  );
+}
+
+export function createUpstreamProxyPool(payload: unknown) {
+  const validated = UpstreamProxyPoolCreateRequestSchema.parse(payload);
+  return post(`${UPSTREAM_PROXY_PATH}/pools`, UpstreamProxyPoolSchema, {
+    body: validated,
+  });
+}
+
+export function addUpstreamProxyPoolMember(poolId: string, payload: unknown) {
+  const validated = UpstreamProxyPoolMemberRequestSchema.parse(payload);
+  return post(`${UPSTREAM_PROXY_PATH}/pools/${encodeURIComponent(poolId)}/members`, UpstreamProxyPoolSchema, {
+    body: validated,
+  });
+}
+
+export function putAccountProxyBinding(accountId: string, payload: unknown) {
+  const validated = AccountProxyBindingRequestSchema.parse(payload);
+  return put(`${UPSTREAM_PROXY_PATH}/accounts/${encodeURIComponent(accountId)}/binding`, AccountProxyBindingSchema, {
+    body: validated,
+  });
+}

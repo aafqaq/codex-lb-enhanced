@@ -1,0 +1,24 @@
+# Bundled install mode — self-contained setup with the PostgreSQL sub-chart.
+replicaCount: 1
+
+autoscaling:
+  enabled: false
+
+postgresql:
+  enabled: true
+
+metrics:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+config:
+  databaseMigrateOnStartup: true
+  sessionBridgeCodexPrewarmEnabled: false
+  logFormat: text
+
+migration:
+  enabled: true
+  schemaGate:
+    enabled: false

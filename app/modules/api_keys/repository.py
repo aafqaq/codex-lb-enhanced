@@ -1,0 +1,1147 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from sqlalchemy import BigInteger, Integer, cast, delete, func, insert, literal, or_, select, true, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only, raiseload, selectinload
+
+from app.core.utils.time import utcnow
+from app.db.models import (
+    Account,
+    AccountStatus,
+    ApiKey,
+    ApiKeyAccountAssignment,
+    ApiKeyLimit,
+    ApiKeyModelSourceAssignment,
+    ApiKeyUsageReservation,
+    ApiKeyUsageReservationItem,
+    ApiKeyUsageRollup,
+    LimitType,
+    LimitWindow,
+    ModelSource,
+    RequestLog,
+    RequestUsageHourlyRollup,
+)
+from app.db.session import sqlite_writer_section
+from app.modules.accounts.usage_rollup import api_key_usage_aggregate_stmt, read_api_key_rollup_state
+from app.modules.accounts.usage_time_rollup import HOURLY_BUCKET_SECONDS, WARMUP_REQUEST_KINDS, to_dimension
+from app.modules.accounts.usage_time_rollup_read import RawWindow, raw_windows_clause, read_hourly_window
+from app.modules.api_keys.limit_windows import advance_limit_reset
+
+
+@dataclass(frozen=True, slots=True)
+class ReservationResult:
+    success: bool
+    limit_id: int
+    current_value: int | None
+    max_value: int | None
+    reset_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class UsageReservationItemData:
+    limit_id: int
+    limit_type: LimitType
+    reserved_delta: int
+    expected_reset_at: datetime
+    actual_delta: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UsageReservationData:
+    reservation_id: str
+    api_key_id: str
+    model: str
+    status: str
+    items: list[UsageReservationItemData]
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeyUsageSummary:
+    request_count: int
+    total_tokens: int
+    cached_input_tokens: int
+    total_cost_usd: float
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeyTrendBucket:
+    bucket_epoch: int
+    total_tokens: int
+    total_cost_usd: float
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeyUsageTotals:
+    total_requests: int
+    total_tokens: int
+    cached_input_tokens: int
+    total_cost_usd: float
+    account_costs: list["ApiKeyAccountCost"] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class ApiKeyAccountCost:
+    account_id: str | None
+    email: str | None
+    cost_usd: float
+    is_deleted: bool = False
+
+
+class _Unset(Enum):
+    UNSET = "UNSET"
+
+
+_UNSET = _Unset.UNSET
+_EXPIRED_LIMIT_RESET_BATCH_SIZE = 500
+_STALE_USAGE_RESERVATION_RELEASE_BATCH_SIZE = 500
+
+
+class ApiKeysRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    @staticmethod
+    def _build_account_costs(rows: Sequence[object]) -> list[ApiKeyAccountCost]:
+        account_costs: list[ApiKeyAccountCost] = []
+        deleted_cost = 0.0
+
+        for row in rows:
+            cost = round(float(getattr(row, "cost_usd", 0.0) or 0.0), 6)
+            if cost <= 0:
+                continue
+            is_deleted = bool(getattr(row, "is_deleted", False))
+            if is_deleted:
+                deleted_cost += cost
+                continue
+            account_costs.append(
+                ApiKeyAccountCost(
+                    account_id=getattr(row, "account_id", None),
+                    email=getattr(row, "email", None),
+                    cost_usd=cost,
+                    is_deleted=False,
+                )
+            )
+
+        if deleted_cost > 0:
+            account_costs.append(
+                ApiKeyAccountCost(
+                    account_id=None,
+                    email=None,
+                    cost_usd=round(deleted_cost, 6),
+                    is_deleted=True,
+                )
+            )
+
+        account_costs.sort(key=lambda item: item.cost_usd, reverse=True)
+        return account_costs
+
+    @staticmethod
+    def _exclude_warmup_clause():
+        return RequestLog.request_kind.not_in(("warmup", "limit_warmup"))
+
+    def _select_api_key(self):
+        return (
+            select(ApiKey)
+            .execution_options(populate_existing=True)
+            .options(
+                selectinload(ApiKey.limits),
+                selectinload(ApiKey.account_assignments),
+                selectinload(ApiKey.source_assignments),
+            )
+        )
+
+    async def create(self, row: ApiKey, *, commit: bool = True) -> ApiKey:
+        self._session.add(row)
+        if commit:
+            await self._session.commit()
+        created = await self.get_by_id(row.id)
+        assert created is not None
+        return created
+
+    async def get_by_id(self, key_id: str) -> ApiKey | None:
+        result = await self._session.execute(self._select_api_key().where(ApiKey.id == key_id))
+        return result.scalar_one_or_none()
+
+    async def get_for_limit_enforcement(self, key_id: str) -> ApiKey | None:
+        """Admission-path load for ``enforce_limits_for_request``.
+
+        The enforcement transaction reads only ``is_active``/``expires_at``
+        plus the ``limits`` collection, so this skips the
+        ``account_assignments``/``source_assignments`` selectin round trips
+        that ``get_by_id`` pays on every proxied request. ``raiseload`` keeps
+        the narrowing fail-loud: any future enforcement code that touches an
+        unlisted column or relationship raises instead of silently lazy
+        loading. ``populate_existing`` stays required because the lazy limit
+        reset commits mid-enforcement and the refetch must re-hydrate rows
+        already in the identity map (sessions use ``expire_on_commit=False``).
+
+        Session-isolation invariant: ``populate_existing`` + ``raiseload``
+        would poison a *fully loaded* ``ApiKey`` already in this session's
+        identity map — re-populating it flips its unlisted columns and
+        relationships into raise-on-access state for every other holder of
+        that instance. That is unreachable today because every caller runs
+        this query in a dedicated short-lived session that never full-loads
+        an ``ApiKey`` first (``_enforce_request_limits`` and the websocket
+        reservation path open fresh background sessions/repo bundles; the
+        quota-planner warmup session never loads ``ApiKey`` rows), and the
+        only prior instance this query can re-populate is the one it loaded
+        itself with these same options. Do not call this on a session that
+        may already hold a fully loaded ``ApiKey`` (e.g. via ``get_by_id`` /
+        ``get_by_hash``) without dropping the narrowing first.
+        """
+        result = await self._session.execute(
+            select(ApiKey)
+            .execution_options(populate_existing=True)
+            .options(
+                load_only(ApiKey.is_active, ApiKey.expires_at, raiseload=True),
+                selectinload(ApiKey.limits),
+                raiseload(ApiKey.account_assignments),
+                raiseload(ApiKey.source_assignments),
+            )
+            .where(ApiKey.id == key_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_hash(self, key_hash: str) -> ApiKey | None:
+        result = await self._session.execute(self._select_api_key().where(ApiKey.key_hash == key_hash))
+        return result.scalar_one_or_none()
+
+    async def list_all(self) -> list[ApiKey]:
+        result = await self._session.execute(self._select_api_key().order_by(ApiKey.created_at.desc()))
+        return list(result.scalars().unique().all())
+
+    async def list_accounts_by_ids(self, account_ids: list[str]) -> list[Account]:
+        if not account_ids:
+            return []
+        result = await self._session.execute(
+            select(Account)
+            .options(load_only(Account.id, Account.plan_type, Account.status))
+            .where(Account.id.in_(account_ids))
+            # An account marked for background deletion is already deleted
+            # from the operator's point of view: assignment validation must
+            # reject it (the synchronous delete removed the row outright) and
+            # pooled-usage projections must not count it while its rows drain.
+            .where(Account.delete_requested_at.is_(None))
+        )
+        return list(result.scalars().all())
+
+    async def list_model_sources_by_ids(self, source_ids: list[str]) -> list[ModelSource]:
+        if not source_ids:
+            return []
+        result = await self._session.execute(select(ModelSource).where(ModelSource.id.in_(source_ids)))
+        return list(result.scalars().all())
+
+    async def list_all_accounts(self) -> list[Account]:
+        result = await self._session.execute(
+            select(Account)
+            .options(load_only(Account.id, Account.plan_type, Account.status))
+            .where(
+                ~Account.status.in_((AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED, AccountStatus.PAUSED))
+            )
+            # Status alone is not enough: an unfenced pre-upgrade replica can
+            # briefly replace a marked account's terminal status during a
+            # rolling deploy, and a deleted account must never re-enter the
+            # unscoped pooled-usage projections.
+            .where(Account.delete_requested_at.is_(None))
+        )
+        return list(result.scalars().all())
+
+    async def list_usage_summary_by_key(self, api_key_ids: list[str] | None = None) -> dict[str, ApiKeyUsageSummary]:
+        folded, watermark = await read_api_key_rollup_state(self._session, api_key_ids)
+        merged: dict[str, list[float]] = {
+            key_id: [
+                sums.request_count,
+                sums.input_tokens,
+                sums.output_tokens,
+                sums.cached_input_tokens,
+                sums.total_cost_usd,
+            ]
+            for key_id, sums in folded.items()
+        }
+        tail_stmt = api_key_usage_aggregate_stmt(api_key_ids=api_key_ids, after_exclusive=watermark)
+        result = await self._session.execute(tail_stmt)
+        for (
+            api_key_id,
+            request_count,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            total_cost_usd,
+        ) in result.all():
+            if not api_key_id:
+                continue
+            totals = merged.setdefault(api_key_id, [0, 0, 0, 0, 0.0])
+            totals[0] += int(request_count or 0)
+            totals[1] += int(input_tokens or 0)
+            totals[2] += int(output_tokens or 0)
+            totals[3] += int(cached_input_tokens or 0)
+            totals[4] += float(total_cost_usd or 0.0)
+
+        summaries: dict[str, ApiKeyUsageSummary] = {}
+        for api_key_id, (request_count, input_sum, output_sum, cached_sum, total_cost_usd) in merged.items():
+            input_total = int(input_sum)
+            output_total = int(output_sum)
+            cached_total = max(0, min(int(cached_sum), input_total))
+            summaries[api_key_id] = ApiKeyUsageSummary(
+                request_count=int(request_count),
+                total_tokens=input_total + output_total,
+                cached_input_tokens=cached_total,
+                total_cost_usd=round(float(total_cost_usd), 6),
+            )
+        return summaries
+
+    async def get_usage_summary_by_key_id(self, key_id: str) -> ApiKeyUsageSummary:
+        """Return aggregate usage totals for a single API key (zeroes if no logs)."""
+        summaries = await self.list_usage_summary_by_key([key_id])
+        return summaries.get(
+            key_id,
+            ApiKeyUsageSummary(request_count=0, total_tokens=0, cached_input_tokens=0, total_cost_usd=0.0),
+        )
+
+    async def get_limit_usage_value(
+        self,
+        key_id: str,
+        *,
+        limit_type: LimitType,
+        since: datetime,
+        until: datetime,
+        model_filter: str | None,
+    ) -> int:
+        if limit_type == LimitType.CREDITS:
+            return 0
+
+        if limit_type == LimitType.TOTAL_TOKENS:
+            value_expr = func.coalesce(RequestLog.input_tokens, 0) + func.coalesce(
+                RequestLog.output_tokens,
+                RequestLog.reasoning_tokens,
+                0,
+            )
+        elif limit_type == LimitType.INPUT_TOKENS:
+            value_expr = func.coalesce(RequestLog.input_tokens, 0)
+        elif limit_type == LimitType.OUTPUT_TOKENS:
+            value_expr = func.coalesce(RequestLog.output_tokens, RequestLog.reasoning_tokens, 0)
+        elif limit_type == LimitType.COST_USD:
+            value_expr = cast(func.floor(func.coalesce(RequestLog.cost_usd, 0.0) * 1_000_000), BigInteger)
+        else:
+            return 0
+
+        stmt = select(func.coalesce(func.sum(value_expr), 0)).where(
+            RequestLog.api_key_id == key_id,
+            RequestLog.status == "success",
+            self._exclude_warmup_clause(),
+            RequestLog.requested_at >= since,
+            RequestLog.requested_at < until,
+        )
+        if model_filter is not None:
+            stmt = stmt.where(RequestLog.model == model_filter)
+
+        result = await self._session.execute(stmt)
+        value = result.scalar_one()
+        return int(value or 0)
+
+    async def update(
+        self,
+        key_id: str,
+        *,
+        name: str | _Unset = _UNSET,
+        allowed_models: str | None | _Unset = _UNSET,
+        apply_to_codex_model: bool | _Unset = _UNSET,
+        enforced_model: str | None | _Unset = _UNSET,
+        enforced_reasoning_effort: str | None | _Unset = _UNSET,
+        allowed_reasoning_efforts: str | None | _Unset = _UNSET,
+        enforced_service_tier: str | None | _Unset = _UNSET,
+        traffic_class: str | _Unset = _UNSET,
+        transport_policy_override: str | None | _Unset = _UNSET,
+        usage_sections: str | _Unset = _UNSET,
+        account_assignment_scope_enabled: bool | _Unset = _UNSET,
+        source_assignment_scope_enabled: bool | _Unset = _UNSET,
+        expires_at: datetime | None | _Unset = _UNSET,
+        is_active: bool | _Unset = _UNSET,
+        key_hash: str | _Unset = _UNSET,
+        key_prefix: str | _Unset = _UNSET,
+        commit: bool = True,
+    ) -> ApiKey | None:
+        row = await self.get_by_id(key_id)
+        if row is None:
+            return None
+        if name is not _UNSET:
+            assert isinstance(name, str)
+            row.name = name
+        if allowed_models is not _UNSET:
+            assert allowed_models is None or isinstance(allowed_models, str)
+            row.allowed_models = allowed_models
+        if apply_to_codex_model is not _UNSET:
+            assert isinstance(apply_to_codex_model, bool)
+            row.apply_to_codex_model = apply_to_codex_model
+        if enforced_model is not _UNSET:
+            assert enforced_model is None or isinstance(enforced_model, str)
+            row.enforced_model = enforced_model
+        if enforced_reasoning_effort is not _UNSET:
+            assert enforced_reasoning_effort is None or isinstance(enforced_reasoning_effort, str)
+            row.enforced_reasoning_effort = enforced_reasoning_effort
+        if allowed_reasoning_efforts is not _UNSET:
+            assert allowed_reasoning_efforts is None or isinstance(allowed_reasoning_efforts, str)
+            row.allowed_reasoning_efforts = allowed_reasoning_efforts
+        if enforced_service_tier is not _UNSET:
+            assert enforced_service_tier is None or isinstance(enforced_service_tier, str)
+            row.enforced_service_tier = enforced_service_tier
+        if traffic_class is not _UNSET:
+            assert isinstance(traffic_class, str)
+            row.traffic_class = traffic_class
+        if transport_policy_override is not _UNSET:
+            assert transport_policy_override is None or isinstance(transport_policy_override, str)
+            row.transport_policy_override = transport_policy_override
+        if usage_sections is not _UNSET:
+            assert isinstance(usage_sections, str)
+            row.usage_sections = usage_sections
+        if account_assignment_scope_enabled is not _UNSET:
+            assert isinstance(account_assignment_scope_enabled, bool)
+            row.account_assignment_scope_enabled = account_assignment_scope_enabled
+        if source_assignment_scope_enabled is not _UNSET:
+            assert isinstance(source_assignment_scope_enabled, bool)
+            row.source_assignment_scope_enabled = source_assignment_scope_enabled
+        if expires_at is not _UNSET:
+            assert expires_at is None or isinstance(expires_at, datetime)
+            row.expires_at = expires_at
+        if is_active is not _UNSET:
+            assert isinstance(is_active, bool)
+            row.is_active = is_active
+        if key_hash is not _UNSET:
+            assert isinstance(key_hash, str)
+            row.key_hash = key_hash
+        if key_prefix is not _UNSET:
+            assert isinstance(key_prefix, str)
+            row.key_prefix = key_prefix
+        if commit:
+            await self._session.commit()
+        return await self.get_by_id(key_id)
+
+    async def delete(self, key_id: str) -> bool:
+        row = await self.get_by_id(key_id)
+        if row is None:
+            return False
+        await self._session.execute(delete(ApiKeyUsageRollup).where(ApiKeyUsageRollup.api_key_id == key_id))
+        await self._session.delete(row)
+        await self._session.commit()
+        return True
+
+    async def commit(self) -> None:
+        await self._session.commit()
+
+    async def update_last_used(self, key_id: str, *, commit: bool = True) -> None:
+        """Compatibility touch for maintenance and durability checks."""
+        await self._session.execute(update(ApiKey).where(ApiKey.id == key_id).values(last_used_at=utcnow()))
+        if commit:
+            await self._session.commit()
+
+    async def rollback(self) -> None:
+        await self._session.rollback()
+
+    # ── Limit operations ──
+
+    async def get_limits_by_key(self, key_id: str) -> list[ApiKeyLimit]:
+        result = await self._session.execute(select(ApiKeyLimit).where(ApiKeyLimit.api_key_id == key_id))
+        return list(result.scalars().all())
+
+    async def replace_limits(self, key_id: str, limits: list[ApiKeyLimit]) -> list[ApiKeyLimit]:
+        existing = await self.get_limits_by_key(key_id)
+        for limit in existing:
+            await self._session.delete(limit)
+        for limit in limits:
+            limit.api_key_id = key_id
+            self._session.add(limit)
+        await self._session.commit()
+        parent = await self._session.get(ApiKey, key_id)
+        if parent is not None:
+            await self._session.refresh(parent, attribute_names=["limits"])
+        return await self.get_limits_by_key(key_id)
+
+    async def upsert_limits(self, key_id: str, limits: list[ApiKeyLimit], *, commit: bool = True) -> list[ApiKeyLimit]:
+        existing = await self.get_limits_by_key(key_id)
+        existing_by_key = {_limit_key(limit): limit for limit in existing}
+        incoming_keys = {_limit_key(limit) for limit in limits}
+
+        for incoming in limits:
+            key = _limit_key(incoming)
+            matched = existing_by_key.get(key)
+            if matched is None:
+                incoming.api_key_id = key_id
+                self._session.add(incoming)
+                continue
+            matched.max_value = incoming.max_value
+            matched.current_value = incoming.current_value
+            matched.reset_at = incoming.reset_at
+
+        for old_limit in existing:
+            if _limit_key(old_limit) not in incoming_keys:
+                await self._session.delete(old_limit)
+
+        if commit:
+            await self._session.commit()
+        parent = await self._session.get(ApiKey, key_id)
+        if parent is not None:
+            await self._session.refresh(parent, attribute_names=["limits"])
+        return await self.get_limits_by_key(key_id)
+
+    async def replace_account_assignments(self, key_id: str, account_ids: list[str], *, commit: bool = True) -> None:
+        # Re-check the pending-deletion marker atomically with the write:
+        # validation ran in an earlier transaction, and an account DELETE can
+        # commit in between — the marked row still exists (background drain),
+        # so a plain FK insert would succeed and resurrect an assignment
+        # begin_delete just removed. The FOR SHARE lock (PostgreSQL)
+        # conflicts with begin_delete's row update, so either this
+        # transaction commits first (and begin_delete's assignment cleanup
+        # removes its rows) or the marker is visible below and the account is
+        # skipped. The account locks are taken BEFORE the assignment-row
+        # delete to match begin_delete's order (account row, then assignment
+        # rows) — taking them after would form a lock cycle with a
+        # concurrent begin_delete and deadlock. SQLite serializes writers,
+        # so the marker predicate alone is race-free there.
+        if account_ids and self._session.get_bind().dialect.name == "postgresql":
+            await self._session.execute(
+                select(Account.id).where(Account.id.in_(account_ids)).with_for_update(read=True)
+            )
+        await self._session.execute(delete(ApiKeyAccountAssignment).where(ApiKeyAccountAssignment.api_key_id == key_id))
+        if account_ids:
+            assignment_source = (
+                select(literal(key_id), Account.id)
+                .where(Account.id.in_(account_ids))
+                .where(Account.delete_requested_at.is_(None))
+            )
+            await self._session.execute(
+                insert(ApiKeyAccountAssignment).from_select(["api_key_id", "account_id"], assignment_source)
+            )
+        if commit:
+            await self._session.commit()
+        parent = await self._session.get(ApiKey, key_id)
+        if parent is not None:
+            await self._session.refresh(parent, attribute_names=["account_assignments"])
+
+    async def replace_source_assignments(self, key_id: str, source_ids: list[str], *, commit: bool = True) -> None:
+        await self._session.execute(
+            delete(ApiKeyModelSourceAssignment).where(ApiKeyModelSourceAssignment.api_key_id == key_id)
+        )
+        for source_id in source_ids:
+            self._session.add(ApiKeyModelSourceAssignment(api_key_id=key_id, source_id=source_id))
+        if commit:
+            await self._session.commit()
+        parent = await self._session.get(ApiKey, key_id)
+        if parent is not None:
+            await self._session.refresh(parent, attribute_names=["source_assignments"])
+
+    async def increment_limit_usage(
+        self,
+        key_id: str,
+        *,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_microdollars: int,
+    ) -> None:
+        limits = await self.get_limits_by_key(key_id)
+        for limit in limits:
+            if limit.model_filter is not None and limit.model_filter != model:
+                continue
+            increment = _compute_increment(limit, input_tokens, output_tokens, cost_microdollars)
+            if increment > 0:
+                await self._session.execute(
+                    update(ApiKeyLimit)
+                    .where(ApiKeyLimit.id == limit.id)
+                    .values(current_value=ApiKeyLimit.current_value + increment)
+                )
+        await self._session.commit()
+
+    async def reset_limit(self, limit_id: int, *, expected_reset_at: datetime, new_reset_at: datetime) -> bool:
+        result = await self._session.execute(
+            update(ApiKeyLimit)
+            .where(ApiKeyLimit.id == limit_id)
+            .where(ApiKeyLimit.reset_at == expected_reset_at)
+            .values(current_value=0, reset_at=new_reset_at)
+            .returning(ApiKeyLimit.id)
+        )
+        await self._session.commit()
+        return result.scalar_one_or_none() is not None
+
+    async def reset_expired_limits(self, *, now: datetime) -> int:
+        reset_count = 0
+        while True:
+            result = await self._session.execute(
+                select(
+                    ApiKeyLimit.id,
+                    ApiKeyLimit.reset_at,
+                    ApiKeyLimit.limit_window,
+                )
+                .where(ApiKeyLimit.reset_at < now)
+                .order_by(ApiKeyLimit.reset_at.asc(), ApiKeyLimit.id.asc())
+                .limit(_EXPIRED_LIMIT_RESET_BATCH_SIZE)
+            )
+            expired_limits = result.all()
+            if not expired_limits:
+                return reset_count
+
+            for limit in expired_limits:
+                update_result = await self._session.execute(
+                    update(ApiKeyLimit)
+                    .where(ApiKeyLimit.id == limit.id)
+                    .where(ApiKeyLimit.reset_at == limit.reset_at)
+                    .values(
+                        current_value=0,
+                        reset_at=advance_limit_reset(limit.reset_at, now, limit.limit_window),
+                    )
+                    .returning(ApiKeyLimit.id)
+                )
+                if update_result.scalar_one_or_none() is not None:
+                    reset_count += 1
+            await self._session.commit()
+
+    async def try_reserve_usage(
+        self,
+        limit_id: int,
+        *,
+        delta: int,
+        expected_reset_at: datetime,
+    ) -> ReservationResult:
+        if delta <= 0:
+            snapshot = await self._session.get(ApiKeyLimit, limit_id)
+            return ReservationResult(
+                success=True,
+                limit_id=limit_id,
+                current_value=snapshot.current_value if snapshot is not None else None,
+                max_value=snapshot.max_value if snapshot is not None else None,
+                reset_at=snapshot.reset_at if snapshot is not None else None,
+            )
+
+        result = await self._session.execute(
+            update(ApiKeyLimit)
+            .where(ApiKeyLimit.id == limit_id)
+            .where(ApiKeyLimit.reset_at == expected_reset_at)
+            .where(ApiKeyLimit.current_value + delta <= ApiKeyLimit.max_value)
+            .values(current_value=ApiKeyLimit.current_value + delta)
+            .returning(
+                ApiKeyLimit.id,
+                ApiKeyLimit.current_value,
+                ApiKeyLimit.max_value,
+                ApiKeyLimit.reset_at,
+            )
+        )
+        row = result.first()
+        if row is not None:
+            return ReservationResult(
+                success=True,
+                limit_id=int(row.id),
+                current_value=int(row.current_value),
+                max_value=int(row.max_value),
+                reset_at=row.reset_at,
+            )
+
+        snapshot_result = await self._session.execute(
+            select(
+                ApiKeyLimit.current_value,
+                ApiKeyLimit.max_value,
+                ApiKeyLimit.reset_at,
+            ).where(ApiKeyLimit.id == limit_id)
+        )
+        snapshot = snapshot_result.first()
+        return ReservationResult(
+            success=False,
+            limit_id=limit_id,
+            current_value=int(snapshot.current_value) if snapshot is not None else None,
+            max_value=int(snapshot.max_value) if snapshot is not None else None,
+            reset_at=snapshot.reset_at if snapshot is not None else None,
+        )
+
+    async def adjust_reserved_usage(
+        self,
+        limit_id: int,
+        *,
+        delta: int,
+        expected_reset_at: datetime,
+    ) -> bool:
+        stmt = update(ApiKeyLimit).where(ApiKeyLimit.id == limit_id).where(ApiKeyLimit.reset_at == expected_reset_at)
+        if delta < 0:
+            stmt = stmt.where(ApiKeyLimit.current_value >= -delta)
+        result = await self._session.execute(
+            stmt.values(current_value=ApiKeyLimit.current_value + delta).returning(ApiKeyLimit.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def create_usage_reservation(
+        self,
+        reservation_id: str,
+        *,
+        key_id: str,
+        model: str,
+        items: list[UsageReservationItemData],
+    ) -> None:
+        # Reservation accounting keeps full commit durability. On external/HA
+        # PostgreSQL a server failover does not kill in-flight application
+        # requests, so an acked-but-lost commit here would desynchronize the
+        # reservation ledger from requests that still complete (settlement
+        # invariant).
+        reservation = ApiKeyUsageReservation(
+            id=reservation_id,
+            api_key_id=key_id,
+            model=model,
+            status="reserved",
+        )
+        self._session.add(reservation)
+        for item in items:
+            self._session.add(
+                ApiKeyUsageReservationItem(
+                    reservation_id=reservation_id,
+                    limit_id=item.limit_id,
+                    limit_type=item.limit_type.value,
+                    reserved_delta=item.reserved_delta,
+                    expected_reset_at=item.expected_reset_at,
+                )
+            )
+
+    async def get_usage_reservation(self, reservation_id: str) -> UsageReservationData | None:
+        result = await self._session.execute(
+            select(ApiKeyUsageReservation)
+            .options(selectinload(ApiKeyUsageReservation.items))
+            .where(ApiKeyUsageReservation.id == reservation_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return UsageReservationData(
+            reservation_id=row.id,
+            api_key_id=row.api_key_id,
+            model=row.model,
+            status=row.status,
+            items=[
+                UsageReservationItemData(
+                    limit_id=item.limit_id,
+                    limit_type=LimitType(item.limit_type),
+                    reserved_delta=item.reserved_delta,
+                    expected_reset_at=item.expected_reset_at,
+                    actual_delta=item.actual_delta,
+                )
+                for item in row.items
+            ],
+        )
+
+    async def transition_usage_reservation_status(
+        self,
+        reservation_id: str,
+        *,
+        expected_status: str,
+        new_status: str,
+    ) -> bool:
+        result = await self._session.execute(
+            update(ApiKeyUsageReservation)
+            .where(ApiKeyUsageReservation.id == reservation_id)
+            .where(ApiKeyUsageReservation.status == expected_status)
+            .values(status=new_status)
+            .returning(ApiKeyUsageReservation.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def upsert_reservation_item_actual(
+        self,
+        reservation_id: str,
+        *,
+        item: UsageReservationItemData,
+        actual_delta: int,
+    ) -> None:
+        bind = self._session.get_bind()
+        dialect_name = bind.dialect.name if bind is not None else "sqlite"
+        if dialect_name == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = sqlite_insert(ApiKeyUsageReservationItem).values(
+                reservation_id=reservation_id,
+                limit_id=item.limit_id,
+                limit_type=item.limit_type.value,
+                reserved_delta=item.reserved_delta,
+                expected_reset_at=item.expected_reset_at,
+                actual_delta=actual_delta,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[
+                    ApiKeyUsageReservationItem.reservation_id,
+                    ApiKeyUsageReservationItem.limit_id,
+                ],
+                set_={
+                    "actual_delta": actual_delta,
+                    "updated_at": utcnow(),
+                },
+            )
+            await self._session.execute(stmt)
+            return
+        if dialect_name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+
+            stmt = postgresql_insert(ApiKeyUsageReservationItem).values(
+                reservation_id=reservation_id,
+                limit_id=item.limit_id,
+                limit_type=item.limit_type.value,
+                reserved_delta=item.reserved_delta,
+                expected_reset_at=item.expected_reset_at,
+                actual_delta=actual_delta,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[
+                    ApiKeyUsageReservationItem.reservation_id,
+                    ApiKeyUsageReservationItem.limit_id,
+                ],
+                set_={
+                    "actual_delta": actual_delta,
+                    "updated_at": utcnow(),
+                },
+            )
+            await self._session.execute(stmt)
+            return
+        await self._session.execute(
+            update(ApiKeyUsageReservationItem)
+            .where(ApiKeyUsageReservationItem.reservation_id == reservation_id)
+            .where(ApiKeyUsageReservationItem.limit_id == item.limit_id)
+            .values(actual_delta=actual_delta)
+        )
+
+    async def settle_usage_reservation(
+        self,
+        reservation_id: str,
+        *,
+        status: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        cached_input_tokens: int | None,
+        cost_microdollars: int | None,
+    ) -> None:
+        # Reservation accounting keeps full commit durability. Settlement
+        # (finalize/fail/release) is what puts completed-request usage on the
+        # books: on external/HA PostgreSQL a failover does not kill the
+        # application request, so an acked-but-lost settlement commit would
+        # leave the reservation "reserved" until the stale-release scheduler
+        # reverses the counters and records zero actual usage — dropping a
+        # completed request from token/cost/rate-limit accounting.
+        await self._session.execute(
+            update(ApiKeyUsageReservation)
+            .where(ApiKeyUsageReservation.id == reservation_id)
+            .values(
+                status=status,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+                cost_microdollars=cost_microdollars,
+            )
+        )
+
+    async def touch_usage_reservation(self, reservation_id: str) -> bool:
+        result = await self._session.execute(
+            update(ApiKeyUsageReservation)
+            .where(ApiKeyUsageReservation.id == reservation_id)
+            .where(ApiKeyUsageReservation.status == "reserved")
+            .values(updated_at=utcnow())
+            .returning(ApiKeyUsageReservation.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def release_stale_usage_reservations(
+        self,
+        *,
+        cutoff: datetime,
+        max_age_cutoff: datetime | None = None,
+        batch_size: int = _STALE_USAGE_RESERVATION_RELEASE_BATCH_SIZE,
+    ) -> int:
+        released_count = 0
+
+        # ``cutoff`` reclaims reservations whose heartbeat stopped refreshing
+        # ``updated_at``. ``max_age_cutoff`` is the backstop for orphaned
+        # heartbeats (issue #1594): a leaked heartbeat task keeps touching
+        # ``updated_at`` forever, so reservations older than this hard ceiling
+        # on ``created_at`` are reclaimed regardless of heartbeat activity.
+        def _stale_clause(query: Any) -> Any:
+            stale = ApiKeyUsageReservation.updated_at < cutoff
+            if max_age_cutoff is not None:
+                stale = or_(stale, ApiKeyUsageReservation.created_at < max_age_cutoff)
+            return query.where(stale)
+
+        try:
+            while True:
+                async with sqlite_writer_section():
+                    result = await self._session.execute(
+                        _stale_clause(
+                            select(ApiKeyUsageReservation.id).where(ApiKeyUsageReservation.status == "reserved")
+                        )
+                        .order_by(ApiKeyUsageReservation.updated_at.asc())
+                        .limit(batch_size)
+                    )
+                    reservation_ids = list(result.scalars().all())
+                    if not reservation_ids:
+                        break
+
+                    # Reservation accounting keeps full commit durability:
+                    # each batch flips reservation status and reverses limit
+                    # counters, mutating the same ledger as the request-path
+                    # settlement, so its durability must not depend on which
+                    # path settles the row. On external/HA PostgreSQL an
+                    # acked-but-lost batch commit silently reverts rows the
+                    # scheduler already reported as released.
+                    item_result = await self._session.execute(
+                        select(
+                            ApiKeyUsageReservationItem.reservation_id,
+                            ApiKeyUsageReservationItem.limit_id,
+                            ApiKeyUsageReservationItem.limit_type,
+                            ApiKeyUsageReservationItem.reserved_delta,
+                            ApiKeyUsageReservationItem.expected_reset_at,
+                            ApiKeyUsageReservationItem.actual_delta,
+                        ).where(ApiKeyUsageReservationItem.reservation_id.in_(reservation_ids))
+                    )
+                    items_by_reservation_id: dict[str, list[UsageReservationItemData]] = {
+                        reservation_id: [] for reservation_id in reservation_ids
+                    }
+                    for item in item_result.all():
+                        items_by_reservation_id[item.reservation_id].append(
+                            UsageReservationItemData(
+                                limit_id=item.limit_id,
+                                limit_type=LimitType(item.limit_type),
+                                reserved_delta=item.reserved_delta,
+                                expected_reset_at=item.expected_reset_at,
+                                actual_delta=item.actual_delta,
+                            )
+                        )
+
+                    for reservation_id in reservation_ids:
+                        claimed = await self._session.execute(
+                            _stale_clause(
+                                update(ApiKeyUsageReservation)
+                                .where(ApiKeyUsageReservation.id == reservation_id)
+                                .where(ApiKeyUsageReservation.status == "reserved")
+                            )
+                            .values(
+                                status="released",
+                                input_tokens=None,
+                                output_tokens=None,
+                                cached_input_tokens=None,
+                                cost_microdollars=None,
+                            )
+                            .returning(ApiKeyUsageReservation.id)
+                        )
+                        if claimed.scalar_one_or_none() is None:
+                            continue
+
+                        for item in items_by_reservation_id[reservation_id]:
+                            await self.adjust_reserved_usage(
+                                item.limit_id,
+                                delta=-item.reserved_delta,
+                                expected_reset_at=item.expected_reset_at,
+                            )
+                            await self.upsert_reservation_item_actual(
+                                reservation_id,
+                                item=UsageReservationItemData(
+                                    limit_id=item.limit_id,
+                                    limit_type=item.limit_type,
+                                    reserved_delta=item.reserved_delta,
+                                    expected_reset_at=item.expected_reset_at,
+                                    actual_delta=item.actual_delta,
+                                ),
+                                actual_delta=0,
+                            )
+                        released_count += 1
+                    await self._session.commit()
+        except Exception:
+            await self._session.rollback()
+            raise
+
+        return released_count
+
+    async def usage_7d_by_account(
+        self,
+        key_id: str,
+        since: datetime,
+        until: datetime,
+    ) -> list[ApiKeyAccountCost]:
+        deleted_expr = func.coalesce(RequestLog.deleted_at.is_not(None), False)
+        stmt = (
+            select(
+                RequestLog.account_id,
+                Account.email,
+                deleted_expr.label("is_deleted"),
+                func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
+            )
+            .outerjoin(Account, Account.id == RequestLog.account_id)
+            .where(
+                RequestLog.api_key_id == key_id,
+                RequestLog.requested_at >= since,
+                RequestLog.requested_at < until,
+                self._exclude_warmup_clause(),
+            )
+            .group_by(RequestLog.account_id, Account.email, deleted_expr)
+        )
+        result = await self._session.execute(stmt)
+        return self._build_account_costs(result.all())
+
+    async def trends_by_key(
+        self,
+        key_id: str,
+        since: datetime,
+        until: datetime,
+        bucket_seconds: int = 3600,
+    ) -> list[ApiKeyTrendBucket]:
+        # Folded history from the hourly rollups (the api_key_id dimension
+        # and the output-or-reasoning measure were folded for exactly this
+        # read); raw only covers the un-folded complement. Non-hour-multiple
+        # bucket sizes degrade to the full raw scan.
+        merged: dict[int, list[float]] = {}
+
+        def _add(bucket_epoch: int, input_tokens: int, output_tokens: int, cost_usd: float) -> None:
+            entry = merged.setdefault(bucket_epoch, [0, 0, 0.0])
+            entry[0] += input_tokens
+            entry[1] += output_tokens
+            entry[2] += cost_usd
+
+        raw_windows: list[RawWindow] = [(since, until)]
+        if bucket_seconds > 0 and bucket_seconds % HOURLY_BUCKET_SECONDS == 0:
+            rollup_rows, raw_windows = await read_hourly_window(
+                self._session,
+                since,
+                until,
+                filters=(
+                    RequestUsageHourlyRollup.api_key_id == to_dimension(key_id),
+                    RequestUsageHourlyRollup.request_kind.not_in(WARMUP_REQUEST_KINDS),
+                ),
+            )
+            for rollup in rollup_rows:
+                _add(
+                    rollup.bucket_epoch // bucket_seconds * bucket_seconds,
+                    rollup.input_tokens,
+                    rollup.output_or_reasoning_tokens,
+                    rollup.cost_usd,
+                )
+        if raw_windows:
+            bind = self._session.get_bind()
+            dialect = bind.dialect.name if bind else "sqlite"
+            if dialect == "postgresql":
+                bucket_expr = (
+                    func.floor(func.extract("epoch", RequestLog.requested_at) / bucket_seconds) * bucket_seconds
+                )
+            else:
+                epoch_col = cast(func.strftime("%s", RequestLog.requested_at), Integer)
+                bucket_expr = cast(epoch_col / bucket_seconds, Integer) * bucket_seconds
+            bucket_col = bucket_expr.label("bucket_epoch")
+
+            stmt = (
+                select(
+                    bucket_col,
+                    func.coalesce(func.sum(RequestLog.input_tokens), 0).label("total_input_tokens"),
+                    func.coalesce(
+                        func.sum(func.coalesce(RequestLog.output_tokens, RequestLog.reasoning_tokens, 0)),
+                        0,
+                    ).label("total_output_tokens"),
+                    func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("total_cost_usd"),
+                )
+                .where(
+                    RequestLog.api_key_id == key_id,
+                    raw_windows_clause(raw_windows),
+                    self._exclude_warmup_clause(),
+                )
+                .group_by(bucket_col)
+            )
+            for row in (await self._session.execute(stmt)).all():
+                _add(
+                    int(row.bucket_epoch),
+                    int(row.total_input_tokens or 0),
+                    int(row.total_output_tokens or 0),
+                    float(row.total_cost_usd or 0.0),
+                )
+        return [
+            ApiKeyTrendBucket(
+                bucket_epoch=bucket_epoch,
+                total_tokens=int(entry[0] + entry[1]),
+                total_cost_usd=round(float(entry[2]), 6),
+            )
+            for bucket_epoch, entry in sorted(merged.items())
+        ]
+
+    async def usage_7d(self, key_id: str, since: datetime, until: datetime) -> ApiKeyUsageTotals:
+        filtered_logs = (
+            select(
+                RequestLog.id.label("id"),
+                RequestLog.account_id.label("account_id"),
+                RequestLog.deleted_at.label("deleted_at"),
+                RequestLog.input_tokens.label("input_tokens"),
+                RequestLog.output_tokens.label("output_tokens"),
+                RequestLog.reasoning_tokens.label("reasoning_tokens"),
+                RequestLog.cached_input_tokens.label("cached_input_tokens"),
+                RequestLog.cost_usd.label("cost_usd"),
+            )
+            .where(
+                RequestLog.api_key_id == key_id,
+                RequestLog.requested_at >= since,
+                RequestLog.requested_at < until,
+                self._exclude_warmup_clause(),
+            )
+            .cte("filtered_logs")
+        )
+        usage_totals = select(
+            func.count(filtered_logs.c.id).label("total_requests"),
+            func.coalesce(func.sum(filtered_logs.c.input_tokens), 0).label("total_input_tokens"),
+            func.coalesce(
+                func.sum(func.coalesce(filtered_logs.c.output_tokens, filtered_logs.c.reasoning_tokens, 0)),
+                0,
+            ).label("total_output_tokens"),
+            func.coalesce(func.sum(filtered_logs.c.cached_input_tokens), 0).label("cached_input_tokens"),
+            func.coalesce(func.sum(filtered_logs.c.cost_usd), 0.0).label("total_cost_usd"),
+        ).cte("usage_totals")
+        deleted_expr = func.coalesce(filtered_logs.c.deleted_at.is_not(None), False)
+        usage_grouped = (
+            select(
+                filtered_logs.c.account_id.label("account_id"),
+                Account.email.label("email"),
+                deleted_expr.label("is_deleted"),
+                func.coalesce(func.sum(filtered_logs.c.cost_usd), 0.0).label("cost_usd"),
+            )
+            .select_from(filtered_logs.outerjoin(Account, Account.id == filtered_logs.c.account_id))
+            .group_by(filtered_logs.c.account_id, Account.email, deleted_expr)
+            .cte("usage_grouped")
+        )
+        stmt = select(
+            usage_totals.c.total_requests,
+            usage_totals.c.total_input_tokens,
+            usage_totals.c.total_output_tokens,
+            usage_totals.c.cached_input_tokens,
+            usage_totals.c.total_cost_usd,
+            usage_grouped.c.account_id,
+            usage_grouped.c.email,
+            usage_grouped.c.is_deleted,
+            usage_grouped.c.cost_usd,
+        ).select_from(usage_totals.outerjoin(usage_grouped, true()))
+        result = await self._session.execute(stmt)
+        rows = result.all()
+        row = rows[0]
+        input_sum = int(row.total_input_tokens or 0)
+        output_sum = int(row.total_output_tokens or 0)
+        cached_sum = int(row.cached_input_tokens or 0)
+        cached_sum = max(0, min(cached_sum, input_sum))
+        return ApiKeyUsageTotals(
+            total_requests=int(row.total_requests),
+            total_tokens=input_sum + output_sum,
+            cached_input_tokens=cached_sum,
+            total_cost_usd=round(float(row.total_cost_usd or 0.0), 6),
+            account_costs=self._build_account_costs(rows),
+        )
+
+
+def _compute_increment(limit: ApiKeyLimit, input_tokens: int, output_tokens: int, cost_microdollars: int) -> int:
+    if limit.limit_type == LimitType.TOTAL_TOKENS:
+        return input_tokens + output_tokens
+    if limit.limit_type == LimitType.INPUT_TOKENS:
+        return input_tokens
+    if limit.limit_type == LimitType.OUTPUT_TOKENS:
+        return output_tokens
+    if limit.limit_type == LimitType.COST_USD:
+        return cost_microdollars
+    return 0
+
+
+def _limit_key(limit: ApiKeyLimit) -> tuple[LimitType, LimitWindow, str | None]:
+    return (limit.limit_type, limit.limit_window, limit.model_filter)

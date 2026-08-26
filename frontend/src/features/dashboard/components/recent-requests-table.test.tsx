@@ -1,0 +1,1585 @@
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { useAuthStore } from "@/features/auth/hooks/use-auth";
+import { RecentRequestsTable } from "@/features/dashboard/components/recent-requests-table";
+import {
+  ALL_REQUEST_LOG_COLUMNS,
+  MAX_REQUEST_LOG_COLUMN_WIDTH,
+  MIN_REQUEST_LOG_COLUMN_WIDTH,
+  REQUEST_LOG_COLUMN_WIDTH_STEP,
+} from "@/features/dashboard/request-log-columns";
+import type { RequestLog } from "@/features/dashboard/schemas";
+
+const ISO = "2026-01-01T12:00:00+00:00";
+const NULL_FAILURE_METADATA = {
+  failurePhase: null,
+  failureDetail: null,
+  failureExceptionType: null,
+  upstreamStatusCode: null,
+  upstreamErrorCode: null,
+  bridgeStage: null,
+};
+const NULL_USERAGENT_METADATA = {
+  useragent: null,
+  useragentGroup: null,
+  clientIp: null,
+};
+
+const { toastSuccess, toastError } = vi.hoisted(() => ({
+  toastSuccess: vi.fn(),
+  toastError: vi.fn(),
+}));
+const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+const originalIsSecureContext = Object.getOwnPropertyDescriptor(window, "isSecureContext");
+
+vi.mock("sonner", () => ({
+  toast: {
+    success: toastSuccess,
+    error: toastError,
+  },
+}));
+
+vi.mock("@/features/conversation-archive/components/request-archive-panel", () => ({
+  RequestArchivePanel: ({ requestId }: { requestId: string }) => (
+    <div data-testid="request-archive-panel">Archive for {requestId}</div>
+  ),
+}));
+
+const PAGINATION_PROPS = {
+  total: 1,
+  limit: 25,
+  offset: 0,
+  hasMore: false,
+  onLimitChange: vi.fn(),
+  onOffsetChange: vi.fn(),
+};
+
+const LAYOUT_REQUEST = {
+  requestedAt: ISO,
+  accountId: "acc-layout",
+  planType: "plus",
+  apiKeyName: "Layout Key",
+  apiKeyId: "key-layout",
+  requestId: "req-layout",
+  conversationId: null,
+  requestKind: "normal",
+  model: "gpt-5.1",
+  source: null,
+  serviceTier: null,
+  requestedServiceTier: null,
+  actualServiceTier: null,
+  transport: "http",
+  upstreamTransport: "http",
+  status: "ok",
+  errorCode: null,
+  errorMessage: null,
+  ...NULL_FAILURE_METADATA,
+  ...NULL_USERAGENT_METADATA,
+  tokens: 1200,
+  inputTokens: 1000,
+  outputTokens: 200,
+  outputTokensRaw: 200,
+  reasoningTokens: 0,
+  latencyFirstTokenMs: 200,
+  latencyQueueMs: null,
+  cachedInputTokens: 0,
+  reasoningEffort: null,
+  costUsd: 0.01,
+  costBreakdown: null,
+  latencyMs: 1000,
+} satisfies RequestLog;
+
+function openRequestDetails() {
+  fireEvent.click(screen.getByRole("button", { name: "View Details" }));
+  return screen.getByRole("dialog");
+}
+
+describe("RecentRequestsTable", () => {
+  beforeEach(() => {
+    toastSuccess.mockReset();
+    toastError.mockReset();
+    useAuthStore.setState({
+      role: "admin",
+      permissions: ["read", "write"],
+      canWrite: true,
+    });
+  });
+
+  afterEach(() => {
+    if (originalClipboard) {
+      Object.defineProperty(navigator, "clipboard", originalClipboard);
+    }
+
+    if (originalIsSecureContext) {
+      Object.defineProperty(window, "isSecureContext", originalIsSecureContext);
+    }
+  });
+
+  it("renders every existing column when layout props are omitted", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[LAYOUT_REQUEST]}
+      />,
+    );
+
+    expect(screen.getAllByRole("columnheader")).toHaveLength(ALL_REQUEST_LOG_COLUMNS.length);
+    expect(screen.getByText("Layout Key")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View Details" })).toBeInTheDocument();
+  });
+
+  it("renders only selected headers and matching row cells", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[LAYOUT_REQUEST]}
+        visibleColumns={["time", "model"]}
+      />,
+    );
+
+    expect(screen.getAllByRole("columnheader")).toHaveLength(2);
+    expect(screen.getByRole("columnheader", { name: "Time" })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Model" })).toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: "API Key" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Layout Key")).not.toBeInTheDocument();
+    expect(screen.getByText("gpt-5.1")).toBeInTheDocument();
+  });
+
+  it("resizes only the selected column by pointer and clamps it to bounds", () => {
+    const onColumnWidthChange = vi.fn();
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[LAYOUT_REQUEST]}
+        visibleColumns={["time", "account"]}
+        columnWidths={{ time: 112, account: 160 }}
+        onColumnWidthChange={onColumnWidthChange}
+      />,
+    );
+
+    const accountSeparator = screen.getByRole("separator", {
+      name: "Resize Account column",
+    });
+    fireEvent.pointerDown(accountSeparator, { pointerId: 7, clientX: 100 });
+    fireEvent.pointerMove(accountSeparator, { pointerId: 7, clientX: 164 });
+    fireEvent.pointerUp(accountSeparator, { pointerId: 7, clientX: 164 });
+
+    expect(onColumnWidthChange).toHaveBeenCalledWith("account", 224);
+    expect(onColumnWidthChange).not.toHaveBeenCalledWith("time", expect.any(Number));
+
+    onColumnWidthChange.mockClear();
+    fireEvent.pointerDown(accountSeparator, { pointerId: 8, clientX: 100 });
+    fireEvent.pointerMove(accountSeparator, { pointerId: 8, clientX: 10_000 });
+    expect(onColumnWidthChange).toHaveBeenLastCalledWith(
+      "account",
+      MAX_REQUEST_LOG_COLUMN_WIDTH,
+    );
+  });
+
+  it("resizes with arrow keys within bounds and sums visible widths", () => {
+    const onColumnWidthChange = vi.fn();
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[LAYOUT_REQUEST]}
+        visibleColumns={["time", "account"]}
+        columnWidths={{ time: MIN_REQUEST_LOG_COLUMN_WIDTH, account: 200 }}
+        onColumnWidthChange={onColumnWidthChange}
+      />,
+    );
+
+    expect(screen.getByRole("table")).toHaveStyle({
+      width: `${MIN_REQUEST_LOG_COLUMN_WIDTH + 200}px`,
+      minWidth: `${MIN_REQUEST_LOG_COLUMN_WIDTH + 200}px`,
+    });
+
+    const timeSeparator = screen.getByRole("separator", {
+      name: "Resize Time column",
+    });
+    fireEvent.keyDown(timeSeparator, { key: "ArrowLeft" });
+    expect(onColumnWidthChange).toHaveBeenLastCalledWith(
+      "time",
+      MIN_REQUEST_LOG_COLUMN_WIDTH,
+    );
+
+    const accountSeparator = screen.getByRole("separator", {
+      name: "Resize Account column",
+    });
+    fireEvent.keyDown(accountSeparator, { key: "ArrowRight" });
+    expect(onColumnWidthChange).toHaveBeenLastCalledWith(
+      "account",
+      200 + REQUEST_LOG_COLUMN_WIDTH_STEP,
+    );
+  });
+
+  it("pins the table to the configured width sum so surplus space is not redistributed", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[LAYOUT_REQUEST]}
+        visibleColumns={["time", "account"]}
+        columnWidths={{ time: 112, account: 160 }}
+        onColumnWidthChange={vi.fn()}
+      />,
+    );
+
+    // An explicit width (not merely a minimum) keeps configured column widths
+    // independent when their sum is smaller than the container.
+    expect(screen.getByRole("table")).toHaveStyle({
+      width: "272px",
+      minWidth: "272px",
+    });
+  });
+
+  it("renders rows with status badges and supports request details and copy actions", async () => {
+    const longError = "Rate limit reached while processing this request ".repeat(3);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+
+    Object.defineProperty(window, "isSecureContext", {
+      configurable: true,
+      value: true,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+         accounts={[
+           {
+             accountId: "acc-primary",
+             email: "primary@example.com",
+             displayName: "Primary Account",
+             planType: "plus",
+             status: "active",
+             limitWarmupEnabled: false,
+             additionalQuotas: [],
+           },
+         ]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-primary",
+            planType: "plus",
+            apiKeyName: "Key Alpha",
+            apiKeyId: "key-alpha",
+            requestId: "req-1",
+            conversationId: null,
+            archiveRequestId: "archive-req-1",
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: "default",
+            requestedServiceTier: "priority",
+            actualServiceTier: "default",
+            transport: "websocket",
+             status: "rate_limit",
+             errorCode: "rate_limit_exceeded",
+             errorMessage: longError,
+            ...NULL_FAILURE_METADATA,
+            ...NULL_USERAGENT_METADATA,
+            upstreamTransport: "auto",
+            upstreamProxyRouteMode: "account_bound",
+            upstreamProxyPoolId: "pool-1",
+            upstreamProxyEndpointId: "endpoint-1",
+            upstreamProxyFallbackUsed: true,
+            upstreamProxyFailClosedReason: "no_healthy_endpoint",
+             tokens: 1200,
+             inputTokens: 1000,
+             outputTokens: 200,
+             outputTokensRaw: null,
+             latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+             cachedInputTokens: 200,
+             reasoningEffort: "high",
+             costUsd: 0.01,
+             costBreakdown: {
+               inputUsd: 0.004,
+               cachedInputUsd: 0.001,
+               outputUsd: 0.005,
+               totalUsd: 0.01,
+             },
+             latencyMs: 1000,
+           },
+         ]}
+       />,
+    );
+
+    expect(screen.getByText("Primary Account")).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "Plus" })).toBeInTheDocument();
+    expect(screen.getByText("Key Alpha")).toBeInTheDocument();
+    expect(screen.getByText("gpt-5.1 (high, default)")).toBeInTheDocument();
+    expect(screen.getByText("Requested priority")).toBeInTheDocument();
+    expect(screen.getByText("WS")).toBeInTheDocument();
+    expect(screen.getByText("Up Auto")).toBeInTheDocument();
+    expect(screen.getByText("Rate limit")).toBeInTheDocument();
+    expect(screen.getByText("rate_limit_exceeded")).toBeInTheDocument();
+
+    const dialog = openRequestDetails();
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByText("Request Details")).toBeInTheDocument();
+    expect(within(dialog).getByText("req-1")).toBeInTheDocument();
+    expect(within(dialog).getByTestId("request-archive-panel")).toHaveTextContent("Archive for archive-req-1");
+    expect(within(dialog).getByText("rate_limit_exceeded")).toBeInTheDocument();
+    expect(dialog.textContent).toContain("Rate limit reached while processing this request");
+    expect(within(dialog).getByText("1.0 s")).toBeInTheDocument();
+    expect(within(dialog).getByText("Route mode")).toBeInTheDocument();
+    expect(within(dialog).getByText("account_bound")).toBeInTheDocument();
+    expect(within(dialog).getByText("Proxy pool")).toBeInTheDocument();
+    expect(within(dialog).getByText("pool-1")).toBeInTheDocument();
+    expect(within(dialog).getByText("Proxy endpoint")).toBeInTheDocument();
+    expect(within(dialog).getByText("endpoint-1")).toBeInTheDocument();
+    expect(within(dialog).getByText("Same-pool fallback")).toBeInTheDocument();
+    expect(within(dialog).getByText("Used")).toBeInTheDocument();
+    expect(within(dialog).getByText("Fail-closed reason")).toBeInTheDocument();
+    expect(within(dialog).getByText("no_healthy_endpoint")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Copy Request ID" }));
+      await Promise.resolve();
+    });
+
+    expect(writeText).toHaveBeenCalledWith("req-1");
+    expect(toastSuccess).toHaveBeenCalledWith("Copied to clipboard");
+    expect(screen.getByRole("button", { name: "Copy Request ID Copied" })).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Copy Error" }));
+      await Promise.resolve();
+    });
+
+    expect(writeText).toHaveBeenCalledWith(longError);
+  });
+
+  it("renders cancelled requests with a distinct non-error badge", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-cancelled",
+            planType: "plus",
+            apiKeyName: "Key Cancelled",
+            apiKeyId: "key-cancelled",
+            requestId: "req-cancelled",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "cancelled",
+            errorCode: "client_disconnected",
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: 0,
+            reasoningTokens: null,
+            cachedInputTokens: 0,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 10,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+          },
+        ]}
+      />,
+    );
+
+    const badge = screen.getByText("Cancelled");
+
+    expect(badge).toHaveClass("bg-sky-500/15");
+    expect(badge).not.toHaveClass("bg-zinc-500/15");
+  });
+
+  it("shows TTFT and output-token TPS beside tokens", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-speed",
+            planType: "plus",
+            apiKeyName: "Key Speed",
+            apiKeyId: "key-speed",
+            requestId: "req-speed",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1200,
+            inputTokens: 1000,
+            outputTokens: 200,
+            outputTokensRaw: 200,
+            reasoningTokens: 40,
+            cachedInputTokens: 0,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1000,
+            latencyFirstTokenMs: 200,
+            latencyQueueMs: null,
+          },
+        ]}
+      />,
+    );
+
+    const row = screen.getByText("gpt-5.1").closest("tr");
+
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByText("200ms")).toBeInTheDocument();
+    expect(within(row as HTMLElement).getByText("200.0")).toBeInTheDocument();
+  });
+
+  it("shows reasoning as secondary token metadata and an included-output detail", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            ...LAYOUT_REQUEST,
+            requestId: "req-reasoning",
+            reasoningTokens: 80,
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("1.2K")).toBeInTheDocument();
+    expect(screen.getByText("80 reasoning")).toBeInTheDocument();
+
+    const dialog = openRequestDetails();
+    const reasoningLabel = within(dialog).getByText(
+      "Reasoning tokens (included in output)",
+    );
+    expect(reasoningLabel.parentElement?.parentElement).toHaveTextContent("80");
+  });
+
+  it("renders a known zero reasoning count", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            ...LAYOUT_REQUEST,
+            requestId: "req-zero-reasoning",
+            reasoningTokens: 0,
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("0 reasoning")).toBeInTheDocument();
+    const dialog = openRequestDetails();
+    const reasoningLabel = within(dialog).getByText(
+      "Reasoning tokens (included in output)",
+    );
+    expect(reasoningLabel.parentElement?.parentElement).toHaveTextContent("0");
+  });
+
+  it("omits unknown reasoning usage instead of estimating it", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            ...LAYOUT_REQUEST,
+            requestId: "req-unknown-reasoning",
+            reasoningTokens: null,
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.queryByText(/reasoning/i)).not.toBeInTheDocument();
+    const dialog = openRequestDetails();
+    expect(
+      within(dialog).queryByText("Reasoning tokens (included in output)"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not calculate TPS from fallback output tokens", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-reasoning",
+            planType: "plus",
+            apiKeyName: "Key Reasoning",
+            apiKeyId: "key-reasoning",
+            requestId: "req-reasoning",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1200,
+            inputTokens: 1000,
+            outputTokens: 200,
+            outputTokensRaw: null,
+            cachedInputTokens: 0,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1000,
+            latencyFirstTokenMs: 200,
+            latencyQueueMs: null,
+          },
+        ]}
+      />,
+    );
+
+    const row = screen.getByText("gpt-5.1").closest("tr");
+
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByText("200ms")).toBeInTheDocument();
+    expect(within(row as HTMLElement).getByText("--")).toBeInTheDocument();
+    expect(within(row as HTMLElement).queryByText("250.0")).not.toBeInTheDocument();
+  });
+
+  it("renders first-run empty copy when no filters are applied", () => {
+    render(<RecentRequestsTable {...PAGINATION_PROPS} total={0} accounts={[]} requests={[]} />);
+    expect(screen.getByText("No requests yet")).toBeInTheDocument();
+    expect(
+      screen.getByText("Requests will appear here after clients start using the proxy."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("No request logs match the current filters.")).not.toBeInTheDocument();
+  });
+
+  it("renders filter-empty copy when a later page has no rows but logs exist", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        total={40}
+        offset={25}
+        accounts={[]}
+        requests={[]}
+      />,
+    );
+    expect(screen.getByText("No matching requests")).toBeInTheDocument();
+    expect(screen.getByText("No request logs match the current filters.")).toBeInTheDocument();
+    expect(screen.queryByText("No requests yet")).not.toBeInTheDocument();
+  });
+
+  it("renders filter-empty copy when filters are applied", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        total={0}
+        accounts={[]}
+        requests={[]}
+        filtersApplied
+      />,
+    );
+    expect(screen.getByText("No matching requests")).toBeInTheDocument();
+    expect(screen.getByText("No request logs match the current filters.")).toBeInTheDocument();
+  });
+
+  it("hides identifying metadata and archive controls from guests", () => {
+    useAuthStore.setState({
+      role: "guest",
+      permissions: ["read"],
+      canWrite: false,
+    });
+
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: null,
+            planType: null,
+            apiKeyName: null,
+            apiKeyId: null,
+            requestId: "req-guest",
+            archiveRequestId: null,
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: null,
+            useragentGroup: "codex-cli",
+            clientIp: null,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 120,
+            inputTokens: 100,
+            outputTokens: 20,
+            outputTokensRaw: 20,
+            latencyFirstTokenMs: 50,
+            latencyQueueMs: null,
+            cachedInputTokens: 0,
+            reasoningEffort: null,
+            costUsd: 0.01,
+            costBreakdown: null,
+            latencyMs: 250,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+
+    expect(within(dialog).getByText("req-guest")).toBeInTheDocument();
+    expect(within(dialog).getByText("gpt-5.1")).toBeInTheDocument();
+    expect(within(dialog).queryByText("User Agent")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Client IP")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Conversation ID")).not.toBeInTheDocument();
+    expect(within(dialog).queryByTestId("request-archive-panel")).not.toBeInTheDocument();
+  });
+
+  it("shows warmup marker only for warmup rows", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        total={2}
+        hasMore
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-normal",
+            planType: null,
+            apiKeyName: null,
+            apiKeyId: null,
+            requestId: "req-normal",
+            conversationId: null,
+            requestKind: "normal",
+            source: null,
+            ...NULL_FAILURE_METADATA,
+            model: "gpt-5.1",
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+          {
+            requestedAt: ISO,
+            accountId: "acc-warmup",
+            planType: null,
+            apiKeyName: null,
+            apiKeyId: null,
+            requestId: "req-warmup",
+            conversationId: null,
+            requestKind: "warmup",
+            source: null,
+            ...NULL_FAILURE_METADATA,
+            model: "gpt-5.1",
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+             status: "ok",
+             errorCode: null,
+             errorMessage: null,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Warmup")).toBeInTheDocument();
+    expect(screen.queryByText("Normal")).not.toBeInTheDocument();
+  });
+
+  it("renders placeholder transport for legacy rows", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-legacy",
+            planType: null,
+            apiKeyName: null,
+            apiKeyId: null,
+            requestId: "req-legacy",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: null,
+            ...NULL_USERAGENT_METADATA,
+             status: "ok",
+             errorCode: null,
+             errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+             tokens: 1,
+             inputTokens: 1,
+             outputTokens: 0,
+             outputTokensRaw: null,
+             latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+             cachedInputTokens: null,
+             reasoningEffort: null,
+             costUsd: 0,
+             costBreakdown: null,
+             latencyMs: 1,
+           },
+         ]}
+       />,
+    );
+
+    const row = screen.getByText("gpt-5.1").closest("tr");
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getAllByText("--").length).toBeGreaterThan(0);
+  });
+
+  it("shows details action for error-code-only rows", async () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-legacy",
+            planType: null,
+            apiKeyName: null,
+            apiKeyId: null,
+            requestId: "req-error-code",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+             status: "error",
+             errorCode: "upstream_error",
+             errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+             tokens: 1,
+             inputTokens: 1,
+             outputTokens: 0,
+             outputTokensRaw: null,
+             latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+             cachedInputTokens: null,
+             reasoningEffort: null,
+             costUsd: 0,
+             costBreakdown: null,
+             latencyMs: 1,
+           },
+         ]}
+       />,
+    );
+
+    const dialog = openRequestDetails();
+
+    expect(dialog).toHaveTextContent("upstream_error");
+    expect(dialog).toHaveTextContent("Full Error");
+  });
+
+  it("shows a cost section for ok rows", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-cost",
+            planType: "plus",
+            apiKeyName: "Key Cost",
+            apiKeyId: "key-cost",
+            requestId: "req-cost",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1400,
+            inputTokens: 1000,
+            outputTokens: 400,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: 200,
+            reasoningEffort: null,
+            costUsd: 0.01,
+            costBreakdown: {
+              inputUsd: 0.004,
+              cachedInputUsd: 0.002,
+              outputUsd: 0.004,
+              totalUsd: 0.01,
+            },
+            latencyMs: 100,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const costSection = within(dialog).getByText("Cost").closest("div.space-y-2");
+
+    expect(within(dialog).getByText("Cost")).toBeInTheDocument();
+    expect(costSection).toHaveTextContent("$0.01 =");
+    expect(costSection).toHaveTextContent("800 Input ($0.00)");
+    expect(costSection).toHaveTextContent("200 Cached ($0.00)");
+    expect(costSection).toHaveTextContent("400 Output ($0.00)");
+  });
+
+  it("shows the full user agent in request details when present", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-useragent",
+            planType: "plus",
+            apiKeyName: "Key Agent",
+            apiKeyId: "key-agent",
+            requestId: "req-useragent",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36",
+            useragentGroup: "Mozilla",
+            clientIp: "203.0.113.7",
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const dialogText = dialog.textContent ?? "";
+    const errorCodeIndex = dialogText.indexOf("Error Code");
+    const userAgentIndex = dialogText.indexOf("User Agent");
+    const clientIpIndex = dialogText.indexOf("Client IP");
+
+    expect(within(dialog).getByText("User Agent")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Client IP")).toBeInTheDocument();
+    expect(within(dialog).getByText("203.0.113.7")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Copy User Agent" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Copy Client IP" })).toBeInTheDocument();
+    expect(errorCodeIndex).toBeGreaterThanOrEqual(0);
+    expect(userAgentIndex).toBeGreaterThan(errorCodeIndex);
+    expect(clientIpIndex).toBeGreaterThan(userAgentIndex);
+  });
+
+  it("shows an em dash for missing user agent in request details", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-no-useragent",
+            planType: null,
+            apiKeyName: null,
+            apiKeyId: null,
+            requestId: "req-no-useragent",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: null,
+            useragentGroup: null,
+            clientIp: null,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const userAgentField = within(dialog).getByText("User Agent").closest("div.space-y-1");
+    const clientIpField = within(dialog).getByText("Client IP").closest("div.space-y-1");
+
+    expect(userAgentField).not.toBeNull();
+    expect(userAgentField).toHaveTextContent("User Agent");
+    expect(userAgentField).toHaveTextContent("—");
+    expect(clientIpField).not.toBeNull();
+    expect(clientIpField).toHaveTextContent("Client IP");
+    expect(clientIpField).toHaveTextContent("—");
+    expect(within(dialog).queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
+  });
+
+  it("hides the cost section for non-ok rows", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-no-cost",
+            planType: null,
+            apiKeyName: null,
+            apiKeyId: null,
+            requestId: "req-no-cost",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "error",
+            errorCode: "upstream_error",
+            errorMessage: "boom",
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: 0,
+            reasoningEffort: null,
+            costUsd: 0.01,
+            costBreakdown: {
+              inputUsd: 0.01,
+              cachedInputUsd: null,
+              outputUsd: null,
+              totalUsd: 0.01,
+            },
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+
+    expect(within(dialog).queryByText("Cost")).not.toBeInTheDocument();
+  });
+
+  it("renders only available cost segments for partial data", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-partial-cost",
+            planType: "plus",
+            apiKeyName: "Key Partial",
+            apiKeyId: "key-partial",
+            requestId: "req-partial-cost",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 700,
+            inputTokens: 700,
+            outputTokens: null,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: 200,
+            reasoningEffort: null,
+            costUsd: 0.01,
+            costBreakdown: {
+              inputUsd: 0.006,
+              cachedInputUsd: 0.004,
+              outputUsd: null,
+              totalUsd: 0.01,
+            },
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const costSection = within(dialog).getByText("Cost").closest("div.space-y-2");
+
+    expect(within(dialog).getByText("Cost")).toBeInTheDocument();
+    expect(costSection).toHaveTextContent("$0.01 =");
+    expect(costSection).toHaveTextContent("500 Input ($0.01)");
+    expect(costSection).toHaveTextContent("200 Cached ($0.00)");
+    expect(costSection).not.toHaveTextContent("Output");
+  });
+
+  it("renders available cost segments when total cost is unavailable", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-partial-no-total",
+            planType: "plus",
+            apiKeyName: "Key Partial No Total",
+            apiKeyId: "key-partial-no-total",
+            requestId: "req-partial-no-total",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: null,
+            inputTokens: 1000,
+            outputTokens: null,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: 200,
+            reasoningEffort: null,
+            costUsd: null,
+            costBreakdown: {
+              inputUsd: 0.006,
+              cachedInputUsd: 0.004,
+              outputUsd: null,
+              totalUsd: null,
+            },
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const costSection = within(dialog).getByText("Cost").closest("div.space-y-2");
+
+    expect(within(dialog).getByText("Cost")).toBeInTheDocument();
+    expect(costSection).not.toHaveTextContent("=");
+    expect(costSection).toHaveTextContent("800 Input ($0.01)");
+    expect(costSection).toHaveTextContent("200 Cached ($0.00)");
+    expect(costSection).not.toHaveTextContent("Output");
+  });
+
+  it("shows the full user agent in request details when present", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-useragent",
+            planType: "plus",
+            apiKeyName: "Key Agent",
+            apiKeyId: "key-agent",
+            requestId: "req-useragent",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36",
+            useragentGroup: "Mozilla",
+            clientIp: "203.0.113.7",
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const dialogText = dialog.textContent ?? "";
+    const errorCodeIndex = dialogText.indexOf("Error Code");
+    const userAgentIndex = dialogText.indexOf("User Agent");
+    const clientIpIndex = dialogText.indexOf("Client IP");
+
+    expect(within(dialog).getByText("User Agent")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Client IP")).toBeInTheDocument();
+    expect(within(dialog).getByText("203.0.113.7")).toBeInTheDocument();
+    expect(errorCodeIndex).toBeGreaterThanOrEqual(0);
+    expect(userAgentIndex).toBeGreaterThan(errorCodeIndex);
+    expect(clientIpIndex).toBeGreaterThan(userAgentIndex);
+  });
+
+  it("shows an em dash for missing user agent in request details", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-no-useragent",
+            planType: null,
+            apiKeyName: null,
+            apiKeyId: null,
+            requestId: "req-no-useragent",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: null,
+            useragentGroup: null,
+            clientIp: null,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const userAgentField = within(dialog).getByText("User Agent").closest("div.space-y-1");
+    const clientIpField = within(dialog).getByText("Client IP").closest("div.space-y-1");
+
+    expect(userAgentField).not.toBeNull();
+    expect(userAgentField).toHaveTextContent("User Agent");
+    expect(userAgentField).toHaveTextContent("—");
+    expect(clientIpField).not.toBeNull();
+    expect(clientIpField).toHaveTextContent("Client IP");
+    expect(clientIpField).toHaveTextContent("—");
+    expect(within(dialog).getByText("1 ms")).toBeInTheDocument();
+  });
+
+  it("hides the cost section for total-only cost breakdown rows", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-total-only-cost",
+            planType: "plus",
+            apiKeyName: "Key Total Only",
+            apiKeyId: "key-total-only",
+            requestId: "req-total-only-cost",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: null,
+            useragentGroup: null,
+            clientIp: null,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1500,
+            inputTokens: 1000,
+            outputTokens: 500,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 4.321234,
+            costBreakdown: {
+              inputUsd: null,
+              cachedInputUsd: null,
+              outputUsd: null,
+              totalUsd: 4.321234,
+            },
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+
+    expect(within(dialog).queryByText("Cost")).not.toBeInTheDocument();
+  });
+
+  it("closes the dialog when conversation ID button is clicked and fires handler", () => {
+    const onConversationClick = vi.fn();
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        onConversationClick={onConversationClick}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-conv-click",
+            planType: "plus",
+            apiKeyName: "Key Conv",
+            apiKeyId: "key-conv",
+            requestId: "req-conv-click",
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: null,
+            useragentGroup: null,
+            clientIp: "10.0.0.1",
+            conversationId: "conv_dialog_close_test",
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    expect(within(dialog).getByText("conv_dialog_close_test")).toBeInTheDocument();
+
+    const convButton = within(dialog).getByRole("button", { name: /Filter by conversation/i });
+    fireEvent.click(convButton);
+
+    expect(onConversationClick).toHaveBeenCalledWith("conv_dialog_close_test");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("renders conversation ID as plain text when no handler is provided", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-conv-text",
+            planType: "plus",
+            apiKeyName: "Key Text",
+            apiKeyId: "key-text",
+            requestId: "req-conv-text",
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: null,
+            useragentGroup: null,
+            clientIp: null,
+            conversationId: "conv_plain_text_render",
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const textEl = within(dialog).getByText("conv_plain_text_render");
+    expect(textEl).toBeInTheDocument();
+    // Must be a <p>, not a button
+    expect(textEl.tagName).toBe("P");
+    expect(textEl).toHaveClass("truncate");
+    expect(
+      within(dialog).queryByRole("button", { name: /Filter by conversation/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("truncates long conversation IDs with title attribute in dialog", () => {
+    const longId = "conv_this_is_a_very_very_very_very_long_conversation_id_that_would_overflow_a_half_width_column";
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        onConversationClick={vi.fn()}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-long-cid",
+            planType: "plus",
+            apiKeyName: "Key Long",
+            apiKeyId: "key-long",
+            requestId: "req-long-cid",
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: null,
+            useragentGroup: null,
+            clientIp: null,
+            conversationId: longId,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const convButton = within(dialog).getByRole("button", { name: /Filter by conversation/i });
+    expect(convButton).toHaveAttribute("title", longId);
+    expect(convButton).toHaveClass("truncate");
+    expect(convButton.className).toMatch(/max-w-\[200px\]/);
+  });
+
+  it("truncates long no-handler conversation IDs with title attribute", () => {
+    const longId = "conv_this_is_a_very_very_long_id_with_no_handler_that_would_overflow";
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: "acc-long-cid-nh",
+            planType: "plus",
+            apiKeyName: "Key Long NH",
+            apiKeyId: "key-long-nh",
+            requestId: "req-long-cid-nh",
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            useragent: null,
+            useragentGroup: null,
+            clientIp: null,
+            conversationId: longId,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const dialog = openRequestDetails();
+    const textEl = within(dialog).getByText(longId);
+    expect(textEl.tagName).toBe("P");
+    expect(textEl).toHaveClass("truncate");
+    expect(textEl).toHaveAttribute("title", longId);
+  });
+});

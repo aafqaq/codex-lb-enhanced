@@ -1,0 +1,54 @@
+# Production environment — based on the external secrets install mode with HA, observability, and hardened defaults.
+replicaCount: 3
+
+postgresql:
+  enabled: false
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600  # 10 min cooldown for bridge session stability
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+affinity:
+  podAntiAffinity: hard
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels: {}
+networkPolicy:
+  enabled: true
+  # Allow ingress-controller traffic to the HTTP port. Without this allowlist the
+  # fail-closed NetworkPolicy denies all external traffic while probes stay green.
+  # Adjust the label to the namespace your ingress controller runs in
+  # (this default matches ingress-nginx installed in the "ingress-nginx" namespace).
+  ingressNSMatchLabels:
+    kubernetes.io/metadata.name: ingress-nginx
+metrics:
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+  grafanaDashboard:
+    enabled: true
+ingress:
+  enabled: true
+  # Render the full nginx annotation set (streaming safety + sticky hashing).
+  nginx:
+    enabled: true
+  certManager:
+    enabled: true
+config:
+  # Each supported replica has one worker with two pools. For maxReplicas=20:
+  # (databasePoolSize + databaseMaxOverflow) × 2 × 1 × 20 = (1+1)×2×20 = 80.
+  # This fits PG's default max_connections=100 and reserves 20 connections for DB operations.
+  databasePoolSize: 1
+  databaseMaxOverflow: 1
+externalSecrets:
+  enabled: true

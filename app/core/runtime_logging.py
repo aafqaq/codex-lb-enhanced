@@ -1,0 +1,232 @@
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import re
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import cast
+
+from fastapi import Request
+from uvicorn.config import LOGGING_CONFIG
+from uvicorn.logging import AccessFormatter, DefaultFormatter
+
+from app.core.types import JsonValue
+from app.core.utils.request_id import get_request_id
+
+_SENSITIVE_LOG_VALUE_PATTERNS = (
+    re.compile(r"(?i)(password|passwd|pwd|token|secret|api[_-]?key)(\s*[=:]\s*)([^\s,&]+)"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)(authorization\s*[=:]\s*)(?!\s*bearer\b)([^,&]+)"),
+)
+_JSON_SENSITIVE_LOG_VALUE_PATTERN = re.compile(
+    r'(?i)("(?:password|passwd|pwd|token|secret|api[_-]?key|authorization)"\s*:\s*")'
+    r'(?:\\.|[^"\\])*(")'
+)
+_LOG_REDACTION = "[REDACTED]"
+
+
+def _redact_log_value(value: str | None) -> str | None:
+    collapsed = _collapse_log_value(value)
+    if collapsed is None:
+        return None
+    redacted = collapsed
+    redacted = _JSON_SENSITIVE_LOG_VALUE_PATTERN.sub(_redact_json_secret, redacted)
+    redacted = _SENSITIVE_LOG_VALUE_PATTERNS[0].sub(_redact_keyed_secret, redacted)
+    redacted = _SENSITIVE_LOG_VALUE_PATTERNS[1].sub(_redact_bearer_token, redacted)
+    return _SENSITIVE_LOG_VALUE_PATTERNS[2].sub(_redact_authorization_value, redacted)
+
+
+def _redact_keyed_secret(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{match.group(2)}{_LOG_REDACTION}"
+
+
+def _redact_json_secret(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{_LOG_REDACTION}{match.group(2)}"
+
+
+def _redact_bearer_token(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{_LOG_REDACTION}"
+
+
+def _redact_authorization_value(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{_LOG_REDACTION}"
+
+
+def _utc_converter(seconds: float | None) -> time.struct_time:
+    return time.gmtime(seconds)
+
+
+class UtcDefaultFormatter(DefaultFormatter):
+    converter: Callable[[float | None], time.struct_time] = staticmethod(_utc_converter)
+
+
+class UtcAccessFormatter(AccessFormatter):
+    converter: Callable[[float | None], time.struct_time] = staticmethod(_utc_converter)
+
+
+class JsonFormatter(logging.Formatter):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+
+        try:
+            from app.core.tracing.otel import get_current_span_id, get_current_trace_id
+
+            trace_id = get_current_trace_id()
+            span_id = get_current_span_id()
+            if trace_id:
+                log_entry["trace_id"] = trace_id
+            if span_id:
+                log_entry["span_id"] = span_id
+        except Exception:
+            pass
+
+        excluded_keys = {
+            "name",
+            "msg",
+            "args",
+            "levelname",
+            "levelno",
+            "pathname",
+            "filename",
+            "module",
+            "exc_info",
+            "exc_text",
+            "stack_info",
+            "lineno",
+            "funcName",
+            "created",
+            "msecs",
+            "relativeCreated",
+            "thread",
+            "threadName",
+            "processName",
+            "process",
+            "message",
+            "taskName",
+        }
+
+        for key, value in record.__dict__.items():
+            if key not in excluded_keys:
+                try:
+                    json.dumps(value)
+                    log_entry[key] = value
+                except (TypeError, ValueError):
+                    log_entry[key] = str(value)
+
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_entry, default=str)
+
+
+class JsonAccessFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry: dict[str, JsonValue] = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "level": record.levelname,
+            "logger": record.name,
+            "type": "access",
+            "client": getattr(record, "client_addr", None),
+            "request": getattr(record, "request_line", None),
+            "status": getattr(record, "status_code", None),
+        }
+        return json.dumps(log_entry, default=str)
+
+
+type LogConfigValue = str | bool | None | dict[str, "LogConfigValue"]
+type LogConfig = dict[str, LogConfigValue]
+
+
+def build_log_config() -> LogConfig:
+    from app.core.config.settings import get_settings
+
+    config = copy.deepcopy(LOGGING_CONFIG)
+    formatters = config.setdefault("formatters", {})
+    handlers = config.setdefault("handlers", {})
+    settings = get_settings()
+
+    if settings.log_format == "json":
+        formatters["default"] = {
+            "()": "app.core.runtime_logging.JsonFormatter",
+        }
+    else:
+        formatters["default"] = {
+            "()": "app.core.runtime_logging.UtcDefaultFormatter",
+            "fmt": "%(asctime)s %(levelprefix)s %(name)s %(message)s",
+            "datefmt": "%Y-%m-%dT%H:%M:%SZ",
+            "use_colors": None,
+        }
+
+    if settings.log_format == "json":
+        formatters["access"] = {
+            "()": "app.core.runtime_logging.JsonAccessFormatter",
+        }
+    else:
+        formatters["access"] = {
+            "()": "app.core.runtime_logging.UtcAccessFormatter",
+            "fmt": '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+            "datefmt": "%Y-%m-%dT%H:%M:%SZ",
+            "use_colors": None,
+        }
+
+    # Uvicorn's stock config only wires uvicorn.* loggers. Attach the same
+    # default handler to the root logger so application loggers such as
+    # app.core.balancer.logic surface in docker logs at INFO.
+    handlers.setdefault(
+        "default", {"class": "logging.StreamHandler", "formatter": "default", "stream": "ext://sys.stderr"}
+    )
+    config["root"] = {
+        "handlers": ["default"],
+        "level": "INFO",
+    }
+    return cast(LogConfig, config)
+
+
+def log_error_response(
+    logger: logging.Logger,
+    request: Request,
+    status_code: int,
+    code: str | None,
+    message: str | None,
+    *,
+    category: str,
+    exc_info: bool = False,
+) -> None:
+    level = logging.ERROR if status_code >= 500 else logging.WARNING
+    logger.log(
+        level,
+        "%s request_id=%s method=%s path=%s status=%s code=%s message=%s",
+        category,
+        get_request_id(),
+        request.method,
+        request.url.path,
+        status_code,
+        _error_log_field(code),
+        _error_log_field(message),
+        exc_info=exc_info,
+    )
+
+
+def _error_log_field(value: str | None) -> str:
+    redacted = _redact_log_value(value)
+    if redacted is None:
+        return "-"
+    return json.dumps(redacted)
+
+
+def _collapse_log_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    collapsed = " ".join(value.split())
+    return collapsed or None

@@ -1,0 +1,43 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.0
+    hooks:
+      - id: ruff-format
+        args: ["."]
+        pass_filenames: false
+      - id: ruff
+        args: ["--fix", "."]
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty
+        entry: .venv/bin/python -m ty check
+        language: system
+        pass_filenames: false
+      - id: frontend-lint
+        name: frontend lint
+        entry: make frontend-lint
+        language: system
+        pass_filenames: false
+        files: ^frontend/
+      - id: frontend-typecheck
+        name: frontend typecheck
+        entry: make frontend-typecheck
+        language: system
+        pass_filenames: false
+        files: ^frontend/
+      - id: frontend-test
+        name: frontend test
+        entry: make frontend-test
+        language: system
+        pass_filenames: false
+        files: ^frontend/
+        stages: [pre-push]
+      - id: local-ci
+        name: local CI parity check
+        entry: make ci
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [manual]

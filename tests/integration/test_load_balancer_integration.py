@@ -1,0 +1,659 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import timedelta, timezone
+
+import pytest
+
+from app.core.balancer import HEALTH_TIER_DRAINING
+from app.core.crypto import TokenEncryptor
+from app.core.utils.time import utcnow
+from app.db.models import Account, AccountStatus
+from app.db.session import SessionLocal
+from app.modules.accounts.repository import AccountsRepository
+from app.modules.api_keys.repository import ApiKeysRepository
+from app.modules.proxy.account_cache import get_account_selection_cache
+from app.modules.proxy.load_balancer import LoadBalancer
+from app.modules.proxy.repo_bundle import ProxyRepositories
+from app.modules.proxy.sticky_repository import StickySessionsRepository
+from app.modules.request_logs.repository import RequestLogsRepository
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
+
+pytestmark = pytest.mark.integration
+
+
+@asynccontextmanager
+async def _repo_factory() -> AsyncIterator[ProxyRepositories]:
+    async with SessionLocal() as session:
+        yield ProxyRepositories(
+            accounts=AccountsRepository(session),
+            usage=UsageRepository(session),
+            request_logs=RequestLogsRepository(session),
+            sticky_sessions=StickySessionsRepository(session),
+            api_keys=ApiKeysRepository(session),
+            additional_usage=AdditionalUsageRepository(session),
+        )
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_deprioritizes_secondary_usage_without_persisting_quota_exceeded(db_setup):
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary_reset = now_epoch + 3600
+    secondary_reset = now_epoch + 7200
+
+    account_a = Account(
+        id="acc_secondary_full",
+        email="secondary_full@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-a"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-a"),
+        id_token_encrypted=encryptor.encrypt("id-a"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    account_b = Account(
+        id="acc_secondary_ok",
+        email="secondary_ok@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-b"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-b"),
+        id_token_encrypted=encryptor.encrypt("id-b"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        await accounts_repo.upsert(account_a)
+        await accounts_repo.upsert(account_b)
+
+        await usage_repo.add_entry(
+            account_id=account_a.id,
+            used_percent=10.0,
+            window="primary",
+            reset_at=primary_reset,
+            window_minutes=300,
+        )
+        await usage_repo.add_entry(
+            account_id=account_a.id,
+            used_percent=100.0,
+            window="secondary",
+            reset_at=secondary_reset,
+            window_minutes=10080,
+        )
+        await usage_repo.add_entry(
+            account_id=account_b.id,
+            used_percent=20.0,
+            window="primary",
+            reset_at=primary_reset,
+            window_minutes=300,
+        )
+        await usage_repo.add_entry(
+            account_id=account_b.id,
+            used_percent=50.0,
+            window="secondary",
+            reset_at=secondary_reset,
+            window_minutes=10080,
+        )
+
+        balancer = LoadBalancer(_repo_factory)
+        selection = await balancer.select_account()
+
+        assert selection.account is not None
+        assert selection.account.id == account_b.id
+
+        refreshed = await session.get(Account, account_a.id)
+        assert refreshed is not None
+        await session.refresh(refreshed)
+        assert refreshed.status == AccountStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_reactivates_after_secondary_reset(db_setup):
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary_reset = now_epoch + 3600
+    secondary_reset = now_epoch + 7200
+
+    account = Account(
+        id="acc_secondary_reset",
+        email="secondary_reset@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-reset"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-reset"),
+        id_token_encrypted=encryptor.encrypt("id-reset"),
+        last_refresh=now,
+        status=AccountStatus.QUOTA_EXCEEDED,
+        deactivation_reason=None,
+    )
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        await accounts_repo.upsert(account)
+
+        await usage_repo.add_entry(
+            account_id=account.id,
+            used_percent=5.0,
+            window="primary",
+            reset_at=primary_reset,
+            window_minutes=300,
+        )
+        await usage_repo.add_entry(
+            account_id=account.id,
+            used_percent=0.0,
+            window="secondary",
+            reset_at=secondary_reset,
+            window_minutes=10080,
+        )
+
+        balancer = LoadBalancer(_repo_factory)
+        selection = await balancer.select_account()
+
+        assert selection.account is not None
+        assert selection.account.id == account.id
+
+        refreshed = await session.get(Account, account.id)
+        assert refreshed is not None
+        await session.refresh(refreshed)
+        assert refreshed.status == AccountStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_treats_weekly_only_primary_as_advisory_quota_window(db_setup):
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    weekly_reset = now_epoch + 7200
+    plus_primary_reset = now_epoch + 3600
+    plus_secondary_reset = now_epoch + 7200
+
+    free_account = Account(
+        id="acc_free_weekly_full",
+        email="free_weekly_full@example.com",
+        plan_type="free",
+        access_token_encrypted=encryptor.encrypt("free-access"),
+        refresh_token_encrypted=encryptor.encrypt("free-refresh"),
+        id_token_encrypted=encryptor.encrypt("free-id"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    plus_account = Account(
+        id="acc_plus_available",
+        email="plus_available@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("plus-access"),
+        refresh_token_encrypted=encryptor.encrypt("plus-refresh"),
+        id_token_encrypted=encryptor.encrypt("plus-id"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        await accounts_repo.upsert(free_account)
+        await accounts_repo.upsert(plus_account)
+
+        await usage_repo.add_entry(
+            account_id=free_account.id,
+            used_percent=100.0,
+            window="primary",
+            reset_at=weekly_reset,
+            window_minutes=10080,
+        )
+        await usage_repo.add_entry(
+            account_id=plus_account.id,
+            used_percent=20.0,
+            window="primary",
+            reset_at=plus_primary_reset,
+            window_minutes=300,
+        )
+        await usage_repo.add_entry(
+            account_id=plus_account.id,
+            used_percent=20.0,
+            window="secondary",
+            reset_at=plus_secondary_reset,
+            window_minutes=10080,
+        )
+
+        balancer = LoadBalancer(_repo_factory)
+        selection = await balancer.select_account()
+
+        assert selection.account is not None
+        assert selection.account.id == plus_account.id
+
+        refreshed_free = await session.get(Account, free_account.id)
+        assert refreshed_free is not None
+        await session.refresh(refreshed_free)
+        assert refreshed_free.status == AccountStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_select_account_uses_cached_rows_for_detached_accounts(db_setup):
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    account = Account(
+        id="acc_detached_refresh",
+        email="detached-refresh@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-detached"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-detached"),
+        id_token_encrypted=encryptor.encrypt("id-detached"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        await accounts_repo.upsert(account)
+        await usage_repo.add_entry(
+            account_id=account.id,
+            used_percent=10.0,
+            window="primary",
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+        )
+
+    balancer = LoadBalancer(_repo_factory)
+    selection = await balancer.select_account()
+
+    assert selection.account is not None
+    assert selection.account.id == account.id
+    assert selection.account.plan_type == "plus"
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_prefers_newer_weekly_primary_over_stale_secondary(db_setup):
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    stale_reset = now_epoch + 1800
+    weekly_reset = now_epoch + 7200
+    plus_primary_reset = now_epoch + 3600
+    plus_secondary_reset = now_epoch + 7200
+
+    free_account = Account(
+        id="acc_free_weekly_stale_secondary",
+        email="free_weekly_stale_secondary@example.com",
+        plan_type="free",
+        access_token_encrypted=encryptor.encrypt("free-stale-access"),
+        refresh_token_encrypted=encryptor.encrypt("free-stale-refresh"),
+        id_token_encrypted=encryptor.encrypt("free-stale-id"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    plus_account = Account(
+        id="acc_plus_weekly_control",
+        email="plus_weekly_control@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("plus-control-access"),
+        refresh_token_encrypted=encryptor.encrypt("plus-control-refresh"),
+        id_token_encrypted=encryptor.encrypt("plus-control-id"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        await accounts_repo.upsert(free_account)
+        await accounts_repo.upsert(plus_account)
+
+        await usage_repo.add_entry(
+            account_id=free_account.id,
+            used_percent=15.0,
+            window="secondary",
+            reset_at=stale_reset,
+            window_minutes=10080,
+            recorded_at=now - timedelta(days=2),
+        )
+        await usage_repo.add_entry(
+            account_id=free_account.id,
+            used_percent=100.0,
+            window="primary",
+            reset_at=weekly_reset,
+            window_minutes=10080,
+            recorded_at=now,
+        )
+        await usage_repo.add_entry(
+            account_id=plus_account.id,
+            used_percent=20.0,
+            window="primary",
+            reset_at=plus_primary_reset,
+            window_minutes=300,
+        )
+        await usage_repo.add_entry(
+            account_id=plus_account.id,
+            used_percent=20.0,
+            window="secondary",
+            reset_at=plus_secondary_reset,
+            window_minutes=10080,
+        )
+
+        balancer = LoadBalancer(_repo_factory)
+        selection = await balancer.select_account()
+
+        assert selection.account is not None
+        assert selection.account.id == plus_account.id
+
+        refreshed_free = await session.get(Account, free_account.id)
+        assert refreshed_free is not None
+        await session.refresh(refreshed_free)
+        assert refreshed_free.status == AccountStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_filters_accounts_by_persisted_additional_usage(db_setup):
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    exhausted_account = Account(
+        id="acc_additional_full",
+        email="additional_full@example.com",
+        plan_type="pro",
+        access_token_encrypted=encryptor.encrypt("access-full"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-full"),
+        id_token_encrypted=encryptor.encrypt("id-full"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    eligible_account = Account(
+        id="acc_additional_ok",
+        email="additional_ok@example.com",
+        plan_type="pro",
+        access_token_encrypted=encryptor.encrypt("access-ok"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-ok"),
+        id_token_encrypted=encryptor.encrypt("id-ok"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        additional_repo = AdditionalUsageRepository(session)
+        await accounts_repo.upsert(exhausted_account)
+        await accounts_repo.upsert(eligible_account)
+
+        for account, used_percent in ((exhausted_account, 40.0), (eligible_account, 20.0)):
+            await usage_repo.add_entry(
+                account_id=account.id,
+                used_percent=used_percent,
+                window="primary",
+                reset_at=now_epoch + 300,
+                window_minutes=5,
+                recorded_at=now,
+            )
+
+        await additional_repo.add_entry(
+            account_id=exhausted_account.id,
+            limit_name="codex_other",
+            metered_feature="codex_bengalfox",
+            window="primary",
+            used_percent=100.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+            recorded_at=now,
+        )
+        await additional_repo.add_entry(
+            account_id=eligible_account.id,
+            limit_name="codex_other",
+            metered_feature="codex_bengalfox",
+            window="primary",
+            used_percent=25.0,
+            reset_at=now_epoch + 300,
+            window_minutes=5,
+            recorded_at=now,
+        )
+
+    balancer = LoadBalancer(_repo_factory)
+    selection = await balancer.select_account(additional_limit_name="codex_spark")
+
+    assert selection.account is not None
+    assert selection.account.id == eligible_account.id
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_burn_first_additional_quota_ignores_standard_quota_exhaustion(db_setup):
+    get_account_selection_cache().invalidate()
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+
+    spark_account = Account(
+        id="acc_spark_standard_full",
+        email="spark_standard_full@example.com",
+        plan_type="pro",
+        access_token_encrypted=encryptor.encrypt("access-spark"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-spark"),
+        id_token_encrypted=encryptor.encrypt("id-spark"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        additional_repo = AdditionalUsageRepository(session)
+        await accounts_repo.upsert(spark_account)
+
+        for window, window_minutes in (("primary", 300), ("secondary", 10080)):
+            await usage_repo.add_entry(
+                account_id=spark_account.id,
+                used_percent=100.0,
+                window=window,
+                reset_at=now_epoch + 3600,
+                window_minutes=window_minutes,
+                recorded_at=now,
+            )
+            await additional_repo.add_entry(
+                account_id=spark_account.id,
+                limit_name="codex_other",
+                metered_feature="codex_bengalfox",
+                window=window,
+                used_percent=20.0,
+                reset_at=now_epoch + 3600,
+                window_minutes=window_minutes,
+                recorded_at=now,
+            )
+
+    balancer = LoadBalancer(_repo_factory)
+    selection = await balancer.select_account(additional_limit_name="codex_spark")
+
+    assert selection.account is not None
+    assert selection.account.id == spark_account.id
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_selects_best_draining_account_when_all_are_draining(db_setup):
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary_reset = now_epoch + 3600
+    secondary_reset = now_epoch + 7200
+
+    account_a = Account(
+        id="acc_all_draining_a",
+        email="all_draining_a@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-drain-a"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-drain-a"),
+        id_token_encrypted=encryptor.encrypt("id-drain-a"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    account_b = Account(
+        id="acc_all_draining_b",
+        email="all_draining_b@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-drain-b"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-drain-b"),
+        id_token_encrypted=encryptor.encrypt("id-drain-b"),
+        last_refresh=now,
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        await accounts_repo.upsert(account_a)
+        await accounts_repo.upsert(account_b)
+
+        await usage_repo.add_entry(
+            account_id=account_a.id,
+            used_percent=94.0,
+            window="primary",
+            reset_at=primary_reset,
+            window_minutes=300,
+            recorded_at=now,
+        )
+        await usage_repo.add_entry(
+            account_id=account_a.id,
+            used_percent=96.0,
+            window="secondary",
+            reset_at=secondary_reset,
+            window_minutes=10080,
+            recorded_at=now,
+        )
+        await usage_repo.add_entry(
+            account_id=account_b.id,
+            used_percent=88.0,
+            window="primary",
+            reset_at=primary_reset,
+            window_minutes=300,
+            recorded_at=now,
+        )
+        await usage_repo.add_entry(
+            account_id=account_b.id,
+            used_percent=93.0,
+            window="secondary",
+            reset_at=secondary_reset,
+            window_minutes=10080,
+            recorded_at=now,
+        )
+
+    balancer = LoadBalancer(_repo_factory)
+    selection = await balancer.select_account(routing_strategy="usage_weighted")
+
+    assert selection.account is not None
+    assert selection.account.id == account_b.id
+    assert balancer._runtime[account_a.id].health_tier == HEALTH_TIER_DRAINING
+    assert balancer._runtime[account_b.id].health_tier == HEALTH_TIER_DRAINING
+
+
+@pytest.mark.asyncio
+async def test_load_balancer_fill_first_cycles_through_accounts(db_setup):
+    encryptor = TokenEncryptor()
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    primary_reset = now_epoch + 3600
+    secondary_reset = now_epoch + 7 * 24 * 3600
+
+    accounts: list[Account] = []
+    for suffix in ("a", "b", "c"):
+        accounts.append(
+            Account(
+                id=f"acc_fill_first_{suffix}",
+                email=f"fill_first_{suffix}@example.com",
+                plan_type="plus",
+                access_token_encrypted=encryptor.encrypt(f"access-{suffix}"),
+                refresh_token_encrypted=encryptor.encrypt(f"refresh-{suffix}"),
+                id_token_encrypted=encryptor.encrypt(f"id-{suffix}"),
+                last_refresh=now,
+                status=AccountStatus.ACTIVE,
+                deactivation_reason=None,
+            )
+        )
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        for account in accounts:
+            await accounts_repo.upsert(account)
+        for account, primary, secondary in (
+            (accounts[0], 0.0, 0.0),
+            (accounts[1], 0.0, 0.0),
+            (accounts[2], 0.0, 0.0),
+        ):
+            await usage_repo.add_entry(
+                account_id=account.id,
+                used_percent=primary,
+                window="primary",
+                reset_at=primary_reset,
+                window_minutes=300,
+                recorded_at=now,
+            )
+            await usage_repo.add_entry(
+                account_id=account.id,
+                used_percent=secondary,
+                window="secondary",
+                reset_at=secondary_reset,
+                window_minutes=10080,
+                recorded_at=now,
+            )
+
+    balancer = LoadBalancer(_repo_factory)
+
+    first = await balancer.select_account(routing_strategy="fill_first")
+    assert first.account is not None
+    assert first.account.id == accounts[0].id
+
+    again = await balancer.select_account(routing_strategy="fill_first")
+    assert again.account is not None
+    assert again.account.id == accounts[0].id
+
+    async with SessionLocal() as session:
+        usage_repo = UsageRepository(session)
+        await usage_repo.add_entry(
+            account_id=accounts[0].id,
+            used_percent=60.0,
+            window="primary",
+            reset_at=primary_reset,
+            window_minutes=300,
+            recorded_at=now,
+        )
+
+    second = await balancer.select_account(routing_strategy="fill_first")
+    assert second.account is not None
+    assert second.account.id == accounts[0].id
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        accounts[0].status = AccountStatus.RATE_LIMITED
+        accounts[0].reset_at = primary_reset
+        await accounts_repo.upsert(accounts[0])
+        await usage_repo.add_entry(
+            account_id=accounts[1].id,
+            used_percent=70.0,
+            window="primary",
+            reset_at=primary_reset,
+            window_minutes=300,
+            recorded_at=now,
+        )
+    balancer._runtime.clear()
+
+    third = await balancer.select_account(routing_strategy="fill_first")
+    assert third.account is not None
+    assert third.account.id == accounts[1].id

@@ -1,0 +1,30 @@
+# Development environment — based on the bundled install mode with local-friendly scale and logging.
+replicaCount: 1
+
+autoscaling:
+  enabled: false
+
+postgresql:
+  enabled: true
+
+metrics:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+config:
+  databaseMigrateOnStartup: true
+  logFormat: text
+
+migration:
+  schemaGate:
+    enabled: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

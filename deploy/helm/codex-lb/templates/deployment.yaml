@@ -1,0 +1,359 @@
+{{- /*
+Graceful shutdown uses one application drain deadline beginning when the
+Python preStop helper starts. Keep the routing dwell inside that budget and
+reserve a conservative post-deadline cleanup window before kubelet can send
+SIGKILL. Kubelet's grace begins earlier, so the default retains extra helper
+launch headroom above the enforced arithmetic minimum.
+*/}}
+{{- $shutdownDrainTimeoutSeconds := int .Values.config.shutdownDrainTimeoutSeconds }}
+{{- $preStopSleepSeconds := int .Values.preStopSleepSeconds }}
+{{- if lt $shutdownDrainTimeoutSeconds $preStopSleepSeconds }}
+{{- fail "config.shutdownDrainTimeoutSeconds must be greater than or equal to preStopSleepSeconds so routing dwell fits inside the shared drain deadline." }}
+{{- end }}
+{{- $preStopStartFailureBudgetSeconds := 2 }}
+{{- $postDrainCleanupBufferSeconds := 30 }}
+{{- $minimumTerminationGraceSeconds := add (add $shutdownDrainTimeoutSeconds $preStopStartFailureBudgetSeconds) $postDrainCleanupBufferSeconds }}
+{{- if lt (int .Values.terminationGracePeriodSeconds) $minimumTerminationGraceSeconds }}
+{{- fail "terminationGracePeriodSeconds must cover preStop start fallback and bounded post-drain cleanup: set it to at least config.shutdownDrainTimeoutSeconds + 32." }}
+{{- end }}
+
+{{- /*
+Static bridge ring guard: a manual config.sessionBridgeInstanceRing must list exactly
+the StatefulSet pod names or Settings validation crashloops pods at startup (each pod
+requires its own $(POD_NAME) to appear literally in the ring). Fail loudly at render
+time instead of shipping a stalled rollout.
+*/}}
+{{- if .Values.config.sessionBridgeInstanceRing }}
+{{- $ringEntries := list }}
+{{- range splitList "," .Values.config.sessionBridgeInstanceRing }}
+{{- $entry := trim . }}
+{{- if $entry }}
+{{- $ringEntries = append $ringEntries $entry }}
+{{- end }}
+{{- end }}
+{{- if .Values.autoscaling.enabled }}
+{{- fail "config.sessionBridgeInstanceRing is a static ring and is incompatible with autoscaling.enabled=true: the HPA can create pods that are missing from the ring and crashloop at startup. Remove the static ring (database-backed ring discovery is automatic) or disable autoscaling." }}
+{{- end }}
+{{- $workloadName := include "codex-lb.workloadName" . }}
+{{- $expectedPodNames := list }}
+{{- range $ordinal := until (int .Values.replicaCount) }}
+{{- $expectedPodNames = append $expectedPodNames (printf "%s-%d" $workloadName $ordinal) }}
+{{- end }}
+{{- $missingPodNames := list }}
+{{- range $expectedPodNames }}
+{{- if not (has . $ringEntries) }}
+{{- $missingPodNames = append $missingPodNames . }}
+{{- end }}
+{{- end }}
+{{- $unexpectedEntries := list }}
+{{- range $ringEntries }}
+{{- if not (has . $expectedPodNames) }}
+{{- $unexpectedEntries = append $unexpectedEntries . }}
+{{- end }}
+{{- end }}
+{{- if $missingPodNames }}
+{{- fail (printf "config.sessionBridgeInstanceRing is missing pod name(s) %q: every pod name must be present in the static ring or the missing pods fail Settings validation at startup. With replicaCount=%d the ring must list exactly %q. List every pod or remove the static ring (database-backed ring discovery is automatic)." (join "," $missingPodNames) (int .Values.replicaCount) (join "," $expectedPodNames)) }}
+{{- end }}
+{{- if $unexpectedEntries }}
+{{- fail (printf "config.sessionBridgeInstanceRing entry(ies) %q do not match any StatefulSet pod name: ring entries must be bare pod names (not FQDNs or other identifiers) or the rendered ring routes to members that do not exist. With replicaCount=%d the ring must list exactly %q. Fix the entries or remove the static ring (database-backed ring discovery is automatic)." (join "," $unexpectedEntries) (int .Values.replicaCount) (join "," $expectedPodNames)) }}
+{{- end }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "codex-lb.workloadName" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "codex-lb.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  serviceName: {{ include "codex-lb.bridgeHeadlessServiceName" . }}
+  {{- $httpPort := .Values.service.port | default 2455 }}
+  {{- $statefulSetUpdateStrategyType := .Values.updateStrategy.type }}
+  {{- if eq $statefulSetUpdateStrategyType "Recreate" }}
+  {{- $statefulSetUpdateStrategyType = "RollingUpdate" }}
+  {{- end }}
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  podManagementPolicy: {{ .Values.podManagementPolicy }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "codex-lb.workloadSelectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: {{ $statefulSetUpdateStrategyType }}
+    {{- if eq $statefulSetUpdateStrategyType "RollingUpdate" }}
+    rollingUpdate:
+      partition: {{ .Values.updateStrategy.rollingUpdate.partition }}
+    {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "codex-lb.workloadSelectorLabels" . | nindent 8 }}
+        {{- with .Values.commonLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.externalSecrets.enabled }}
+        checksum/external-secret: {{ include (print $.Template.BasePath "/externalsecret.yaml") . | sha256sum }}
+        {{- else if not .Values.auth.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- else }}
+        checksum/secret-ref: {{ printf "%s:%s:%s" (include "codex-lb.secretName" .) .Values.auth.secretKeys.databaseUrl .Values.auth.secretKeys.encryptionKey | sha256sum }}
+        {{- end }}
+        {{- if .Values.rollout.reloader.enabled }}
+        reloader.stakater.com/auto: "true"
+        configmap.reloader.stakater.com/reload: {{ include "codex-lb.fullname" . | quote }}
+        secret.reloader.stakater.com/reload: {{ include "codex-lb.secretName" . | quote }}
+        {{- end }}
+        {{- if .Values.rollout.manualToken }}
+        rollout-token: {{ .Values.rollout.manualToken | quote }}
+        {{- end }}
+        {{- with .Values.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "codex-lb.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- $pullSecrets := concat (.Values.global.imagePullSecrets | default list) (.Values.image.pullSecrets | default list) }}
+      {{- if $pullSecrets }}
+      imagePullSecrets:
+        {{- range $pullSecrets }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      {{- if eq .Values.affinity.podAntiAffinity "soft" }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "codex-lb.workloadSelectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- else if eq .Values.affinity.podAntiAffinity "hard" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "codex-lb.workloadSelectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (include "codex-lb.nodeSelector" .) }}
+      nodeSelector:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName | quote }}
+      {{- end }}
+      volumes:
+        - name: encryption-key
+          secret:
+            secretName: {{ include "codex-lb.secretName" . }}
+            items:
+              - key: {{ .Values.auth.secretKeys.encryptionKey }}
+                path: encryption.key
+            defaultMode: 0444
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- $waitForDatabaseEnabled := and .Values.postgresql.enabled .Values.config.databaseMigrateOnStartup -}}
+      {{- $schemaGateEnabled := and .Values.migration.enabled (not .Values.config.databaseMigrateOnStartup) .Values.migration.schemaGate.enabled -}}
+      {{- if or $waitForDatabaseEnabled $schemaGateEnabled }}
+      initContainers:
+        {{- if $waitForDatabaseEnabled }}
+        - name: wait-for-database
+          image: {{ include "codex-lb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command:
+            - python
+            - -m
+            - app.db.migrate
+            - wait-for-connection
+            - --timeout-seconds
+            - {{ .Values.migration.schemaGate.timeoutSeconds | quote }}
+            - --interval-seconds
+            - {{ .Values.migration.schemaGate.intervalSeconds | quote }}
+          env:
+            - name: CODEX_LB_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codex-lb.databaseUrlSecretName" . }}
+                  key: {{ .Values.auth.secretKeys.databaseUrl }}
+            - name: CODEX_LB_ENCRYPTION_KEY_FILE
+              value: /var/lib/codex-lb/encryption.key
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+        {{- end }}
+        {{- if $schemaGateEnabled }}
+        - name: wait-for-schema-head
+          image: {{ include "codex-lb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command:
+            - python
+            - -m
+            - app.db.migrate
+            - wait-for-head
+            - --timeout-seconds
+            - {{ .Values.migration.schemaGate.timeoutSeconds | quote }}
+            - --interval-seconds
+            - {{ .Values.migration.schemaGate.intervalSeconds | quote }}
+          env:
+            - name: CODEX_LB_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codex-lb.databaseUrlSecretName" . }}
+                  key: {{ .Values.auth.secretKeys.databaseUrl }}
+            - name: CODEX_LB_ENCRYPTION_KEY_FILE
+              value: /var/lib/codex-lb/encryption.key
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: codex-lb
+          image: {{ include "codex-lb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command:
+            - python
+            - -m
+            - app.cli
+            - --host
+            - "0.0.0.0"
+            - --port
+            - {{ $httpPort | quote }}
+          ports:
+            - name: http
+              containerPort: {{ $httpPort }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "codex-lb.fullname" . }}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: CODEX_LB_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "codex-lb.databaseUrlSecretName" . }}
+                  key: {{ .Values.auth.secretKeys.databaseUrl }}
+            - name: CODEX_LB_ENCRYPTION_KEY_FILE
+              value: /var/lib/codex-lb/encryption.key
+            {{- if .Values.config.sessionBridgeEnabled }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_INSTANCE_ID
+              value: "$(POD_NAME)"
+            - name: CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ADVERTISE_BASE_URL
+              value: {{ default (printf "http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.%s:%v" (include "codex-lb.bridgeHeadlessServiceName" .) .Values.clusterDomain .Values.service.port) .Values.config.sessionBridgeAdvertiseBaseUrl | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: encryption-key
+              mountPath: /var/lib/codex-lb/encryption.key
+              subPath: encryption.key
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /app/.cache
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - python
+                  - -m
+                  - app.core.prestop
+                  - --base-url
+                  - "http://127.0.0.1:{{ $httpPort }}"
+                  - --routing-dwell-seconds
+                  - {{ .Values.preStopSleepSeconds | toString | quote }}
+                  - --drain-timeout-seconds
+                  - {{ .Values.config.shutdownDrainTimeoutSeconds | toString | quote }}
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
