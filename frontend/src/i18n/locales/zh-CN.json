@@ -969,7 +969,6 @@
   "reports.charts.queueWait": "队列等待",
   "reports.charts.timeToFirstToken": "首 token 时间",
   "reports.charts.tokensByDay": "按天 token",
-  "reports.charts.tokensPerSecond": "每秒 token",
   "reports.dailyBreakdown.columns.accounts": "账户",
   "reports.dailyBreakdown.columns.cancelled": "已取消",
   "reports.dailyBreakdown.columns.cost": "费用",
