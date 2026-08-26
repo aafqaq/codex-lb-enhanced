@@ -334,16 +334,15 @@ class Settings(BaseSettings):
         default=7 * 24 * 60 * 60,
         gt=0,
     )
-    # Codex LB Enhanced prioritizes native-client continuity. Durable operation
-    # fences and transcript spools arbitrate ambiguous sends while the bridge
-    # keeps retrying across reconnects and account changes. Operators that need
-    # strict at-most-once behavior can still opt back into ``fail_closed``.
+    # Recovery-first mode can either ask the client to drop an ambiguous anchor
+    # or let the bridge retry that anchored request once on a fresh upstream
+    # socket. Both are at-least-once strategies; fail-closed remains default.
     http_responses_session_bridge_ambiguous_continuation_recovery_mode: Literal[
         "fail_closed",
         "client_full_history_once",
         "server_anchored_replay_once",
         "server_indefinite_recovery",
-    ] = "server_indefinite_recovery"
+    ] = "fail_closed"
     http_responses_session_bridge_instance_id: str = Field(default_factory=_default_http_bridge_instance_id)
     http_responses_session_bridge_instance_ring: Annotated[list[str], NoDecode] = Field(default_factory=list)
     http_responses_session_bridge_advertise_base_url: str | None = None
