@@ -524,22 +524,24 @@ The dashboard request-log table MUST show time to first token and output-token g
 - **WHEN** the dashboard renders request logs
 - **THEN** it does not show a misleading calculated TPS value
 
-### Requirement: Reports show daily median generation speed trends
+### Requirement: Reports show daily median latency trends
 
-The Reports dashboard MUST expose daily median TTFT, daily median TPS, and daily median queue-wait trends when request-log latency fields are available. Empty days and rows with no valid timing/speed inputs MUST render as zero in those trend charts. Daily TPS MUST median per-request output-token TPS after TTFT rather than use input tokens or include TTFT wait time. Daily queue wait MUST median per-request `latency_queue_ms` over rows where it is non-null.
+The Reports dashboard MUST expose daily median TTFT and daily median queue-wait
+trends when request-log latency fields are available. Empty days and rows with
+no valid timing inputs MUST render as zero in those trend charts. Daily queue
+wait MUST median per-request `latency_queue_ms` over rows where it is non-null.
 
 #### Scenario: Daily speed charts use median valid request values
 
-- **GIVEN** one report day has request logs with TTFT and output-token TPS values
+- **GIVEN** one report day has request logs with TTFT values
 - **WHEN** the dashboard renders Reports
 - **THEN** it shows a Time to First Token chart using median TTFT for the day
-- **AND** it shows a Tokens per Second chart using median per-request TPS for the day
 
 #### Scenario: Missing daily speed data is zero-filled
 
 - **GIVEN** a selected report range includes a day with no request logs or no valid timing data
 - **WHEN** the dashboard renders Reports
-- **THEN** the TTFT and TPS charts include that day with value zero
+- **THEN** the TTFT chart includes that day with value zero
 
 #### Scenario: Daily queue-wait trend surfaces load-balancer wait
 
