@@ -257,6 +257,27 @@ def _http_bridge_durable_recovery_predecessor_proven(request_state: _WebSocketRe
     return request_state.previous_response_id is not None or request_state.operation_parent_response_id is not None
 
 
+def _mark_http_bridge_durable_recovery_eligible(
+    exc: ProxyResponseError,
+    *,
+    request_state: _WebSocketRequestState,
+    session: _HTTPBridgeSession,
+) -> None:
+    """Expose a proven durable bridge failure to the API recovery loop."""
+    if (
+        request_state.operation_registered
+        and request_state.operation_id is not None
+        and session.durable_session_id is not None
+        and session.durable_owner_epoch is not None
+        and _http_bridge_durable_recovery_predecessor_proven(request_state)
+    ):
+        # The API-level recovery loop must only run when this request has an
+        # actual durable operation fence. Settings alone are insufficient
+        # during a rolling migration where durable tables may be unavailable
+        # and the bridge falls back to an in-memory session.
+        setattr(exc, "http_bridge_durable_recovery_eligible", True)
+
+
 class _VerifiedDurableFullResend:
     """Immutable proof that one payload contains a durable turn's complete context."""
 
@@ -2895,19 +2916,11 @@ class _HTTPBridgeStreamingMixin:
                 yield event_block
                 yielded_any = True
         except ProxyResponseError as exc:
-            if (
-                request_state.operation_registered
-                and request_state.operation_id is not None
-                and session.durable_session_id is not None
-                and session.durable_owner_epoch is not None
-                and _http_bridge_durable_recovery_predecessor_proven(request_state)
-            ):
-                # The API-level recovery loop must only run when this request
-                # has an actual durable operation fence. Settings alone are
-                # insufficient during a rolling migration where the durable
-                # tables may be unavailable and the bridge falls back to an
-                # in-memory session.
-                setattr(exc, "http_bridge_durable_recovery_eligible", True)
+            _mark_http_bridge_durable_recovery_eligible(
+                exc,
+                request_state=request_state,
+                session=session,
+            )
             if yielded_any:
                 yield _partial_output_proxy_error_event_block(
                     exc,
@@ -3376,7 +3389,13 @@ class _HTTPBridgeStreamingMixin:
                             raise
                         continue
                     break
-            except BaseException:
+            except BaseException as recovery_exc:
+                if isinstance(recovery_exc, ProxyResponseError):
+                    _mark_http_bridge_durable_recovery_eligible(
+                        recovery_exc,
+                        request_state=request_state,
+                        session=session,
+                    )
                 await rollback_pre_dispatch_recovery_claim()
                 raise
             _record_bridge_reattach(path=recovery_path, outcome="success")
@@ -3485,7 +3504,13 @@ class _HTTPBridgeStreamingMixin:
                         await retry_events.aclose()
                     except Exception:
                         pass
-            except BaseException:
+            except BaseException as recovery_exc:
+                if isinstance(recovery_exc, ProxyResponseError):
+                    _mark_http_bridge_durable_recovery_eligible(
+                        recovery_exc,
+                        request_state=retry_request_state or request_state,
+                        session=session,
+                    )
                 await rollback_pre_dispatch_recovery_claim()
                 if retry_reservation_reacquired and retry_api_key_reservation is not None:
                     retry_lifecycle = (
