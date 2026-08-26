@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, Coins, DollarSign, Flame, MessageSquare, type LucideIcon } from "lucide-react";
+import { Activity, AlertTriangle, Coins, Flame, MessageSquare, type LucideIcon } from "lucide-react";
 
 import i18n from "@/i18n";
 import type {
@@ -15,7 +15,6 @@ import { buildDonutPalette } from "@/utils/colors";
 import {
   formatCachedTokensMeta,
   formatCompactNumber,
-  formatCurrency,
   formatNumber,
   formatRate,
   formatWindowMinutes,
@@ -759,7 +758,6 @@ export function buildDashboardView(
   const primaryWindow = overview.windows.primary;
   const secondaryWindow = overview.windows.secondary;
   const metrics = overview.summary.metrics;
-  const cost = overview.summary.cost.totalUsd;
   const timeframeLabel = (() => {
     const formatted = formatWindowMinutes(overview.timeframe.windowMinutes);
     return formatted === "--" ? overview.timeframe.key : formatted;
@@ -770,11 +768,6 @@ export function buildDashboardView(
     timeframeHours <= 24
       ? t("dashboard.stats.avgPerHour", { value: formatCompactNumber(Math.round(avgPerUnit(metrics?.requests ?? 0, timeframeHours))) })
       : t("dashboard.stats.avgPerDay", { value: formatCompactNumber(Math.round(avgPerUnit(metrics?.requests ?? 0, timeframeDays))) });
-  const costAverage =
-    timeframeHours <= 24
-      ? t("dashboard.stats.avgPerHour", { value: formatCurrency(avgPerUnit(cost, timeframeHours)) })
-      : t("dashboard.stats.avgPerDay", { value: formatCurrency(avgPerUnit(cost, timeframeDays)) });
-  const costMeta = costAverage;
   const trends = overview.trends;
   const primaryBurnLabel = formatBurnWindowLabel("primary", overview.summary.primaryWindow.windowMinutes);
   const secondaryBurnLabel = formatBurnWindowLabel("secondary", overview.summary.secondaryWindow?.windowMinutes);
@@ -805,15 +798,6 @@ export function buildDashboardView(
       icon: Coins,
       trend: trendPointsToValues(trends.tokens),
       trendColor: TREND_COLORS[1],
-    },
-    {
-      label: t("dashboard.stats.estimatedCost", { timeframe: timeframeLabel }),
-      value: formatCurrency(cost),
-      meta: costMeta,
-      comparison: buildStatComparison(cost, comparison?.previous.costUsd ?? 0, canCompare),
-      icon: DollarSign,
-      trend: trendPointsToValues(trends.cost),
-      trendColor: TREND_COLORS[2],
     },
   ];
 
