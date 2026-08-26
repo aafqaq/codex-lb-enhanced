@@ -15,7 +15,7 @@ describe("useReportChartVisibility", () => {
     localStorage.clear();
   });
 
-  it("defaults to all five charts and writes the default", () => {
+  it("defaults to all four charts and writes the default", () => {
     const { result } = renderHook(() => useReportChartVisibility());
 
     expect(result.current.visibleChartIds).toEqual(ALL_IDS);
@@ -36,11 +36,11 @@ describe("useReportChartVisibility", () => {
   it("discards unknown IDs and preserves an empty array", () => {
     localStorage.setItem(
       KEY,
-      JSON.stringify(["unknown", "tokensPerSecond"]),
+      JSON.stringify(["unknown", "queueWait"]),
     );
     const subset = renderHook(() => useReportChartVisibility());
 
-    expect(subset.result.current.visibleChartIds).toEqual(["tokensPerSecond"]);
+    expect(subset.result.current.visibleChartIds).toEqual(["queueWait"]);
 
     subset.unmount();
     localStorage.setItem(KEY, JSON.stringify([]));

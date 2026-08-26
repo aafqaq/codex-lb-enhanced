@@ -969,7 +969,6 @@
   "reports.charts.queueWait": "Queue Wait",
   "reports.charts.timeToFirstToken": "Time to First Token",
   "reports.charts.tokensByDay": "Tokens by Day",
-  "reports.charts.tokensPerSecond": "Tokens per Second",
   "reports.dailyBreakdown.columns.accounts": "Accounts",
   "reports.dailyBreakdown.columns.cancelled": "Cancelled",
   "reports.dailyBreakdown.columns.cost": "Cost",

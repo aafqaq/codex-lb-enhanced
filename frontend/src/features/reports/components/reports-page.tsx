@@ -14,7 +14,6 @@ import { ReportsSummaryCards } from "./reports-summary-cards";
 import type { CostPerDayChartProps } from "./cost-per-day-chart";
 import type { TokensPerDayChartProps } from "./tokens-per-day-chart";
 import type { TimeToFirstTokenChartProps } from "./time-to-first-token-chart";
-import type { TokensPerSecondChartProps } from "./tokens-per-second-chart";
 import type { QueueWaitChartProps } from "./queue-wait-chart";
 import type { ModelDistributionDonutProps } from "./model-distribution-donut";
 import type { UseragentDistributionDonutProps } from "./useragent-distribution-donut";
@@ -39,11 +38,6 @@ const TokensPerDayChart = lazy(() =>
 const TimeToFirstTokenChart = lazy(() =>
   import("./time-to-first-token-chart").then((module) => ({
     default: (props: TimeToFirstTokenChartProps) => <module.TimeToFirstTokenChart {...props} />,
-  })),
-);
-const TokensPerSecondChart = lazy(() =>
-  import("./tokens-per-second-chart").then((module) => ({
-    default: (props: TokensPerSecondChartProps) => <module.TokensPerSecondChart {...props} />,
   })),
 );
 const QueueWaitChart = lazy(() =>
@@ -343,15 +337,6 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
                   />
                 </Suspense>
               ) : null}
-              {visibleChartIds.includes("tokensPerSecond") ? (
-                <Suspense fallback={<div className="h-[270px] rounded-xl border bg-card" />}>
-                  <TokensPerSecondChart
-                    startDate={filters.startDate}
-                    endDate={filters.endDate}
-                    data={reportsQuery.data.daily}
-                  />
-                </Suspense>
-              ) : null}
               {visibleChartIds.includes("queueWait") ? (
                 <Suspense fallback={<div className="h-[270px] rounded-xl border bg-card" />}>
                   <QueueWaitChart
@@ -363,8 +348,8 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
               ) : null}
             </div>
           ) : null}
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-            <div className="space-y-4 lg:col-span-1">
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
               <Suspense fallback={<div className="h-[220px] rounded-xl border bg-card" />}>
                 <ModelDistributionDonut data={reportsQuery.data.byModel} />
               </Suspense>
@@ -372,13 +357,11 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
                 <UseragentDistributionDonut data={reportsQuery.data.byUseragent} />
               </Suspense>
             </div>
-            <div className="lg:col-span-2">
-              <DailyDetailTable
-                startDate={filters.startDate}
-                endDate={filters.endDate}
-                data={reportsQuery.data.daily}
-              />
-            </div>
+            <DailyDetailTable
+              startDate={filters.startDate}
+              endDate={filters.endDate}
+              data={reportsQuery.data.daily}
+            />
           </div>
         </>
       ) : hasAnyError ? (

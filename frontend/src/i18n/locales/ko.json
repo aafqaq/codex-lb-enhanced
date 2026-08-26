@@ -969,7 +969,6 @@
   "reports.charts.queueWait": "Queue Wait",
   "reports.charts.timeToFirstToken": "Time to First Token",
   "reports.charts.tokensByDay": "일별 token",
-  "reports.charts.tokensPerSecond": "Tokens per Second",
   "reports.dailyBreakdown.columns.accounts": "Accounts",
   "reports.dailyBreakdown.columns.cancelled": "취소됨",
   "reports.dailyBreakdown.columns.cost": "비용",
