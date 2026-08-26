@@ -224,7 +224,7 @@ export function ReportsPage({ initialFilters }: ReportsPageProps = {}) {
   };
 
   return (
-    <div className="mx-auto w-full max-w-[1500px] flex-1 space-y-6 px-4 py-8 sm:px-6">
+    <div className="w-full flex-1 space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight text-foreground">
           {t("reports.page.title")}
