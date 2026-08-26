@@ -517,7 +517,7 @@ describe("ReportsPage", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("renders an independent user-agent distribution card below the model card", async () => {
+  it("renders an independent user-agent distribution card alongside the model card", async () => {
     useReportsMock.mockImplementation(() =>
       asUseReportsResult({
         data: {
