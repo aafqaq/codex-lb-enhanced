@@ -2558,6 +2558,24 @@ class _HTTPBridgeUpstreamEventsMixin:
         wait_for_model_capacity_retry = bool(
             retry_error_code is not None
             and retry_error_code != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
+            # A usage-limit response is a definitive account-exhaustion
+            # signal, even though its human message also matches the broad
+            # model-capacity classifier.  Let the quota failover branch below
+            # exclude this owner and select another account; treating it as a
+            # capacity wait keeps the sticky owner pinned and produces the
+            # exact 429/stream_incomplete loop seen by Codex clients.
+            and (
+                account_exhaustion_retry_code is None
+                or (
+                    # ``rate_limit_exceeded`` is also used for transient
+                    # model-capacity responses.  Only retain the capacity
+                    # wait path for that exact classifier; definitive quota
+                    # messages/codes must enter account failover immediately.
+                    retry_error_code == "rate_limit_exceeded"
+                    and is_upstream_model_capacity_error(retry_error_message)
+                    and "usage limit" not in (retry_error_message or "").casefold()
+                )
+            )
             and not is_previous_response_not_found_event
             and status_request_state is not None
             and is_upstream_model_capacity_error(retry_error_message)
@@ -2760,10 +2778,38 @@ class _HTTPBridgeUpstreamEventsMixin:
                 status_request_state.error_type_override = (
                     _websocket_event_error_type(event_type, payload) or owner_pinned_quota_error
                 )
+            elif owner_pinned_quota_error is not None:
+                # A continuation that contains only the stale anchor (or an
+                # otherwise non-portable body) cannot be moved safely to a
+                # different account.  Do not fall through to the generic
+                # owner switch: that path retries the same account-bound
+                # response id and turns a single quota event into the
+                # repeated 429/stream_incomplete loop visible to clients.
+                # Return the neutral transport-recovery semantic instead;
+                # the client can resend its local transcript without binding
+                # the next attempt to this exhausted owner.
+                status_request_state.error_http_status_override = 502
+                status_request_state.error_code_override = "upstream_unavailable"
+                status_request_state.error_message_override = (
+                    "HTTP responses session bridge continuity account is unavailable; retry later."
+                )
+                session.upstream_control.reconnect_requested = True
+                session.upstream_control.retire_after_drain = True
+                (
+                    _downstream_text,
+                    event_block,
+                    event,
+                    payload,
+                    event_type,
+                ) = _build_stream_incomplete_terminal_event_for_request(
+                    status_request_state,
+                    reason="upstream_unavailable",
+                )
             if (
                 status_request_state is not None
                 and status_request_state.previous_response_id is not None
                 and status_request_state.preferred_account_id is not None
+                and owner_pinned_quota_error is None
             ):
                 safe_request_text = _prepare_websocket_request_state_for_account_switch(status_request_state)
                 if safe_request_text is not None:

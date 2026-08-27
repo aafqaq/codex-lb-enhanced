@@ -21274,7 +21274,8 @@ async def test_http_bridge_replays_proxy_verified_full_resend_after_owner_quota(
     handle_stream_error = AsyncMock()
     release_create_lease = AsyncMock()
 
-    async def retry_precreated(retry_session):
+    async def retry_precreated(retry_session, **kwargs):
+        assert kwargs == {"request_state": request_state, "allow_account_exhaustion_failover": True}
         assert retry_session is session
         assert session.upstream_turn_state is None
         assert session.downstream_turn_state is None
