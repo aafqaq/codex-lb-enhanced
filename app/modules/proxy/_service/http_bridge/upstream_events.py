@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -201,16 +200,16 @@ from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
 from app.modules.proxy.helpers import (
     NATIVE_CODEX_CLIENT_RETRY_BOUNDARY_FRAME,
     _normalize_error_code,
+    account_exhaustion_code_for_failover,
     is_upstream_model_capacity_error,
-    upstream_usage_limit_error_code,
+)
+from app.modules.proxy.replay_safety import (
+    project_responses_text_for_account_neutral_quota_replay,
 )
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED
 from app.modules.proxy.tool_call_dedupe import (
     mark_duplicate_tool_call_downstream_event,
     rewrite_parallel_tool_call_text,
-)
-from app.modules.proxy.replay_safety import (
-    project_responses_payload_for_account_neutral_quota_replay,
 )
 from app.modules.proxy.tool_call_dedupe import (
     response_id_from_payload as tool_call_response_id_from_payload,
@@ -238,22 +237,7 @@ def _quota_replay_text_for_client_full_resend(
         if request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
         else request_state.request_text
     )
-    if not isinstance(source_text, str):
-        return None
-    try:
-        source_payload = json.loads(source_text)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if not isinstance(source_payload, dict):
-        return None
-    projected_payload = project_responses_payload_for_account_neutral_quota_replay(source_payload)
-    if projected_payload is None:
-        return None
-    return json.dumps(
-        {"type": "response.create", **projected_payload},
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+    return project_responses_text_for_account_neutral_quota_replay(source_text)
 
 _HTTP_BRIDGE_RECOVERY_SETTLEMENT_RETRY_DELAYS = (
     0.25,
@@ -2519,11 +2503,11 @@ class _HTTPBridgeUpstreamEventsMixin:
             payload=payload,
         )
         retry_error_message = _websocket_event_error_message(event_type, payload)
-        account_exhaustion_retry_code = upstream_usage_limit_error_code(
+        account_exhaustion_retry_code = account_exhaustion_code_for_failover(
             retry_error_code,
             retry_error_message,
         )
-        terminal_account_exhaustion_code = upstream_usage_limit_error_code(
+        terminal_account_exhaustion_code = account_exhaustion_code_for_failover(
             _normalize_error_code(
                 _websocket_event_error_code(event_type, payload),
                 _websocket_event_error_type(event_type, payload),
