@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -888,6 +889,35 @@ def project_responses_payload_for_account_neutral_quota_replay(
     if not responses_payload_is_account_neutral_fresh_replay(projected, allow_file_references=True):
         return None
     return projected
+
+
+def project_responses_text_for_account_neutral_quota_replay(
+    source_text: str | None,
+) -> str | None:
+    """Serialize a portable fresh ``response.create`` replay.
+
+    HTTP-bridge recovery has two entry points (the upstream event reader and
+    the reconnect/submit path).  Keeping JSON parsing, projection and
+    serialization in one function prevents those paths from drifting apart
+    as Codex adds new client bookkeeping fields.
+    """
+
+    if not isinstance(source_text, str):
+        return None
+    try:
+        source_payload = json.loads(source_text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(source_payload, dict):
+        return None
+    projected_payload = project_responses_payload_for_account_neutral_quota_replay(source_payload)
+    if projected_payload is None:
+        return None
+    return json.dumps(
+        {"type": "response.create", **projected_payload},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
 
 
 def _reasoning_config_is_account_neutral(reasoning: JsonValue | None) -> bool:

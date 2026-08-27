@@ -332,8 +332,8 @@ from app.modules.proxy.helpers import (
     _is_account_model_unsupported_error,
     _normalize_error_code,
     _parse_openai_error,
+    account_exhaustion_code_for_failover,
     is_upstream_model_capacity_error,
-    upstream_usage_limit_error_code,
 )
 from app.modules.proxy.http_bridge_forwarding import (
     HTTPBridgeForwardContext as HTTPBridgeForwardContext,
@@ -833,7 +833,7 @@ def _websocket_precreated_retry_error_code(
     )
     error_param = _websocket_event_error_param(event_type, payload)
     error_message = _websocket_event_error_message(event_type, payload)
-    account_exhaustion_code = upstream_usage_limit_error_code(error_code, error_message)
+    account_exhaustion_code = account_exhaustion_code_for_failover(error_code, error_message)
     if account_exhaustion_code is not None:
         # Account exhaustion is safe to replay repeatedly while no model
         # output (or sequenced frame) was exposed.  ``excluded_account_ids``
@@ -1087,15 +1087,11 @@ def _websocket_owner_pinned_quota_error_code(
         _websocket_event_error_code(event_type, payload),
         _websocket_event_error_type(event_type, payload),
     )
-    if is_upstream_model_capacity_error(_websocket_event_error_message(event_type, payload)):
-        if error_code in {
-            "rate_limit_exceeded",
-            "usage_limit_reached",
-            "insufficient_quota",
-            "usage_not_included",
-            "quota_exceeded",
-        }:
-            return error_code
+    error_message = _websocket_event_error_message(event_type, payload)
+    definitive_quota_code = account_exhaustion_code_for_failover(error_code, error_message)
+    if definitive_quota_code is not None:
+        return definitive_quota_code
+    if is_upstream_model_capacity_error(error_message):
         if _websocket_response_id(None, payload) is not None:
             return None
         return "server_is_overloaded"

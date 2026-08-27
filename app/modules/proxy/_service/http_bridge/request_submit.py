@@ -219,7 +219,7 @@ from app.modules.proxy.helpers import (
 )
 from app.modules.proxy.load_balancer import effective_account_concurrency_caps
 from app.modules.proxy.replay_safety import (
-    project_responses_payload_for_account_neutral_quota_replay,
+    project_responses_text_for_account_neutral_quota_replay,
 )
 from app.modules.proxy.tool_call_dedupe import (
     dedupe_replayed_side_effect_input_items,
@@ -3019,22 +3019,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 if candidate.fresh_upstream_request_is_retry_safe and candidate.fresh_upstream_request_text
                 else candidate.request_text
             )
-            if not isinstance(source_text, str):
-                return None
-            try:
-                source_payload = json.loads(source_text)
-            except (TypeError, json.JSONDecodeError):
-                return None
-            if not isinstance(source_payload, dict):
-                return None
-            projected_payload = project_responses_payload_for_account_neutral_quota_replay(source_payload)
-            if projected_payload is None:
-                return None
-            projected_payload_with_type: dict[str, JsonValue] = {
-                "type": "response.create",
-                **projected_payload,
-            }
-            return json.dumps(projected_payload_with_type, separators=(",", ":"), ensure_ascii=False)
+            return project_responses_text_for_account_neutral_quota_replay(source_text)
 
         def request_is_retryable(request_state: _WebSocketRequestState) -> bool:
             if _websocket_request_can_replay_before_visible_output(

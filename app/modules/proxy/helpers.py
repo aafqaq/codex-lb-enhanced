@@ -119,6 +119,27 @@ def upstream_usage_limit_error_code(code: str | None, message: str | None) -> st
     return None
 
 
+def account_exhaustion_code_for_failover(code: str | None, message: str | None) -> str | None:
+    """Classify only definitive account exhaustion for pool failover.
+
+    ``rate_limit_exceeded`` is overloaded by the upstream: it can mean a
+    depleted account window, or a temporary model-capacity response.  The
+    latter must remain on the capacity-wait path and must not rotate an
+    otherwise healthy account.  Keep the broad
+    :func:`upstream_usage_limit_error_code` helper unchanged for response
+    normalization, while exposing this narrower policy to account selection.
+    """
+
+    normalized_code = _normalize_error_code(code, None)
+    if (
+        normalized_code == "rate_limit_exceeded"
+        and is_upstream_model_capacity_error(message)
+        and not any(marker in (message or "").casefold() for marker in _UPSTREAM_USAGE_LIMIT_MESSAGE_MARKERS)
+    ):
+        return None
+    return upstream_usage_limit_error_code(code, message)
+
+
 def classify_upstream_failure(
     *,
     error_code: str,

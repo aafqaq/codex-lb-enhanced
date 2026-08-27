@@ -11,6 +11,7 @@ from app.modules.proxy.continuity import (
 from app.modules.proxy.replay_safety import (
     project_responses_input_for_account_neutral_fresh_replay,
     project_responses_payload_for_account_neutral_quota_replay,
+    project_responses_text_for_account_neutral_quota_replay,
     responses_input_suffix_matches_pending_tool_calls,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
@@ -94,6 +95,21 @@ def test_quota_replay_projection_rejects_scalar_input_without_history() -> None:
     }
 
     assert project_responses_payload_for_account_neutral_quota_replay(payload) is None
+
+
+def test_quota_replay_text_builder_is_single_portable_response_create_frame() -> None:
+    source = (
+        '{"type":"response.create","previous_response_id":"resp_owner",'
+        '"model":"gpt-5.6-sol","input":[{"type":"message","role":"user",'
+        '"content":[{"type":"input_text","text":"continue"}]}]}'
+    )
+
+    replay = project_responses_text_for_account_neutral_quota_replay(source)
+
+    assert replay is not None
+    assert replay.startswith('{"type":"response.create"')
+    assert "previous_response_id" not in replay
+    assert '"input"' in replay
 
 
 @pytest.mark.parametrize(
