@@ -7,7 +7,7 @@ Regenerate with `uv run python scripts/generate_settings_reference.py`;
 `tests/unit/test_settings_reference.py` fails when this page drifts from
 `app/core/config/settings.py`.
 
-codex-lb currently exposes 131 settings. Every setting is an environment
+codex-lb currently exposes 129 settings. Every setting is an environment
 variable with the `CODEX_LB_` prefix (process environment or `.env` /
 `.env.local` next to the process). All defaults work with zero configuration —
 start from [Configuration](../configuration.md) for the handful that matter,
@@ -234,17 +234,6 @@ the host side of the compose `ports` mapping instead.
 | `CODEX_LB_OTEL_EXPORTER_ENDPOINT` | `str` | `''` |
 | `CODEX_LB_TRACE` | `str` | `''` |
 
-`CODEX_LB_TRACE` accepts comma-separated channels. For a one-off incident
-capture, use `shape,payload,upstream_summary,upstream_events`; add
-`upstream_payload,upstream_event_payload` only when the bounded request/event
-bodies are required, because those channels may contain user prompts, tool
-arguments, or model output. `upstream_events` emits one record per upstream
-frame, so enable it only for a short reproduction window. Account identifiers and response identifiers in
-`upstream_events` are logged as short SHA-256 hashes; authorization headers and
-API keys are never emitted by these channels. For websocket client-side frames,
-add `client_events` (metadata) and, only when necessary,
-`client_event_payload` (bounded raw frames).
-
 ## Resilience & load shedding
 
 | Environment variable | Type | Default |
@@ -263,8 +252,6 @@ add `client_events` (metadata) and, only when necessary,
 | Environment variable | Type | Default |
 | --- | --- | --- |
 | `CODEX_LB_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS` | `float` | `0.5` |
-| `CODEX_LB_TELEMETRY_ENABLED` | `bool \| None` | `None` |
-| `CODEX_LB_TELEMETRY_ENDPOINT` | `str` | `'https://telemetry.tokmaxxing.com'` |
 | `CODEX_LB_TIMEOUT_INVARIANT_VALIDATION_STRICT` | `bool` | `False` |
 | `CODEX_LB_WARMUP_MODEL` | `str` | `'gpt-5.4-mini'` |
 

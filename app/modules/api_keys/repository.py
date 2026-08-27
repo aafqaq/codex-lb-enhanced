@@ -357,6 +357,8 @@ class ApiKeysRepository:
         allowed_reasoning_efforts: str | None | _Unset = _UNSET,
         enforced_service_tier: str | None | _Unset = _UNSET,
         traffic_class: str | _Unset = _UNSET,
+        codex_quota_mode: str | _Unset = _UNSET,
+        codex_quota_passthrough_enabled: bool | _Unset = _UNSET,
         transport_policy_override: str | None | _Unset = _UNSET,
         usage_sections: str | _Unset = _UNSET,
         account_assignment_scope_enabled: bool | _Unset = _UNSET,
@@ -394,6 +396,12 @@ class ApiKeysRepository:
         if traffic_class is not _UNSET:
             assert isinstance(traffic_class, str)
             row.traffic_class = traffic_class
+        if codex_quota_mode is not _UNSET:
+            assert isinstance(codex_quota_mode, str)
+            row.codex_quota_mode = codex_quota_mode
+        if codex_quota_passthrough_enabled is not _UNSET:
+            assert isinstance(codex_quota_passthrough_enabled, bool)
+            row.codex_quota_passthrough_enabled = codex_quota_passthrough_enabled
         if transport_policy_override is not _UNSET:
             assert transport_policy_override is None or isinstance(transport_policy_override, str)
             row.transport_policy_override = transport_policy_override

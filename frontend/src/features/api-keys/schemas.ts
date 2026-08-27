@@ -35,6 +35,8 @@ export type ServiceTierType = (typeof SERVICE_TIERS)[number];
 
 export const TRAFFIC_CLASSES = ["foreground", "opportunistic"] as const;
 export type TrafficClass = (typeof TRAFFIC_CLASSES)[number];
+export const CODEX_QUOTA_MODES = ["api_key", "pool"] as const;
+export type CodexQuotaMode = (typeof CODEX_QUOTA_MODES)[number];
 export const TRANSPORT_POLICY_OVERRIDES = ["smart", "always_http", "always_websocket"] as const;
 export type TransportPolicyOverride = (typeof TRANSPORT_POLICY_OVERRIDES)[number];
 export const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
@@ -52,6 +54,8 @@ export const ApiKeySchema = z.object({
   trafficClass: z
     .enum(TRAFFIC_CLASSES)
     .default("foreground"),
+  codexQuotaMode: z.enum(CODEX_QUOTA_MODES).default("api_key"),
+  codexQuotaPassthroughEnabled: z.boolean().default(true),
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().default(null),
   enforcedReasoningEffort: z.enum(ENFORCED_REASONING_EFFORTS).nullable().default(null),
   enforcedServiceTier: z
@@ -87,6 +91,8 @@ export const ApiKeyCreateRequestSchema = z.object({
   allowedModels: z.array(z.string()).optional(),
   applyToCodexModel: z.boolean().optional(),
   trafficClass: z.enum(TRAFFIC_CLASSES).optional(),
+  codexQuotaMode: z.enum(CODEX_QUOTA_MODES).optional(),
+  codexQuotaPassthroughEnabled: z.boolean().optional(),
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),
   allowedReasoningEfforts: z.array(z.enum(REASONING_EFFORTS)).min(1).nullable().optional(),
@@ -112,6 +118,8 @@ export const ApiKeyUpdateRequestSchema = z.object({
   allowedModels: z.array(z.string()).nullable().optional(),
   applyToCodexModel: z.boolean().optional(),
   trafficClass: z.enum(TRAFFIC_CLASSES).optional(),
+  codexQuotaMode: z.enum(CODEX_QUOTA_MODES).optional(),
+  codexQuotaPassthroughEnabled: z.boolean().optional(),
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),
   allowedReasoningEfforts: z.array(z.enum(REASONING_EFFORTS)).min(1).nullable().optional(),

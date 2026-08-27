@@ -50,6 +50,9 @@ _API_KEY_USAGE_RESERVATION_UNKNOWN_MODEL_BASE_TOKENS = API_KEY_USAGE_RESERVATION
 TRAFFIC_CLASS_FOREGROUND = "foreground"
 TRAFFIC_CLASS_OPPORTUNISTIC = "opportunistic"
 _SUPPORTED_TRAFFIC_CLASSES = frozenset({TRAFFIC_CLASS_FOREGROUND, TRAFFIC_CLASS_OPPORTUNISTIC})
+CODEX_QUOTA_MODE_API_KEY = "api_key"
+CODEX_QUOTA_MODE_POOL = "pool"
+_SUPPORTED_CODEX_QUOTA_MODES = frozenset({CODEX_QUOTA_MODE_API_KEY, CODEX_QUOTA_MODE_POOL})
 _SUPPORTED_TRANSPORT_POLICY_OVERRIDES = frozenset({"smart", "always_http", "always_websocket"})
 _REASONING_POLICY_EXCLUSIVE_CONSTRAINT = "ck_api_keys_reasoning_policy_exclusive"
 
@@ -91,6 +94,8 @@ class ApiKeysRepositoryProtocol(Protocol):
         allowed_reasoning_efforts: str | None | _Unset = ...,
         enforced_service_tier: str | None | _Unset = ...,
         traffic_class: str | _Unset = ...,
+        codex_quota_mode: str | _Unset = ...,
+        codex_quota_passthrough_enabled: bool | _Unset = ...,
         transport_policy_override: str | None | _Unset = ...,
         usage_sections: str | _Unset = ...,
         account_assignment_scope_enabled: bool | _Unset = ...,
@@ -277,6 +282,8 @@ class ApiKeyCreateData:
     allowed_reasoning_efforts: list[str] | None = None
     enforced_service_tier: str | None = None
     traffic_class: str = TRAFFIC_CLASS_FOREGROUND
+    codex_quota_mode: str = CODEX_QUOTA_MODE_API_KEY
+    codex_quota_passthrough_enabled: bool = True
     transport_policy_override: str | None = None
     usage_sections: str = "upstream_limits,account_pool_usage"
     expires_at: datetime | None = None
@@ -303,6 +310,10 @@ class ApiKeyUpdateData:
     enforced_service_tier_set: bool = False
     traffic_class: str | None = None
     traffic_class_set: bool = False
+    codex_quota_mode: str | None = None
+    codex_quota_mode_set: bool = False
+    codex_quota_passthrough_enabled: bool | None = None
+    codex_quota_passthrough_enabled_set: bool = False
     transport_policy_override: str | None = None
     transport_policy_override_set: bool = False
     usage_sections: str | None = None
@@ -336,6 +347,8 @@ class ApiKeyData:
     allowed_reasoning_efforts: list[str] | None = None
     apply_to_codex_model: bool = False
     traffic_class: str = TRAFFIC_CLASS_FOREGROUND
+    codex_quota_mode: str = CODEX_QUOTA_MODE_API_KEY
+    codex_quota_passthrough_enabled: bool = True
     transport_policy_override: str | None = None
     usage_sections: str = "upstream_limits,account_pool_usage"
     limits: list[LimitRuleData] = field(default_factory=list)
@@ -479,6 +492,7 @@ class ApiKeysService:
         allowed_reasoning_efforts = _normalize_allowed_reasoning_efforts(payload.allowed_reasoning_efforts)
         enforced_service_tier = _normalize_service_tier(payload.enforced_service_tier)
         traffic_class = _normalize_traffic_class(payload.traffic_class)
+        codex_quota_mode = _normalize_codex_quota_mode(payload.codex_quota_mode)
         transport_policy_override = _normalize_transport_policy_override(payload.transport_policy_override)
         usage_sections = _normalize_usage_sections(payload.usage_sections)
         _validate_model_enforcement(enforced_model=enforced_model, allowed_models=normalized_allowed_models)
@@ -500,6 +514,8 @@ class ApiKeysService:
             account_assignment_scope_enabled=bool(assigned_account_ids),
             source_assignment_scope_enabled=bool(assigned_source_ids),
             traffic_class=traffic_class,
+            codex_quota_mode=codex_quota_mode,
+            codex_quota_passthrough_enabled=bool(payload.codex_quota_passthrough_enabled),
             transport_policy_override=transport_policy_override,
             usage_sections=usage_sections,
             expires_at=expires_at,
@@ -638,6 +654,14 @@ class ApiKeysService:
         traffic_class_update: str | _Unset = _UNSET
         if payload.traffic_class_set:
             traffic_class_update = _normalize_traffic_class(payload.traffic_class)
+        codex_quota_mode_update: str | _Unset = _UNSET
+        if payload.codex_quota_mode_set:
+            codex_quota_mode_update = _normalize_codex_quota_mode(payload.codex_quota_mode)
+        codex_quota_passthrough_enabled_update: bool | _Unset = _UNSET
+        if payload.codex_quota_passthrough_enabled_set:
+            if payload.codex_quota_passthrough_enabled is None:
+                raise ApiKeyValidationError("codex_quota_passthrough_enabled must be a boolean")
+            codex_quota_passthrough_enabled_update = payload.codex_quota_passthrough_enabled
         transport_policy_override_update: str | None | _Unset = _UNSET
         if payload.transport_policy_override_set:
             transport_policy_override_update = _normalize_transport_policy_override(payload.transport_policy_override)
@@ -708,6 +732,8 @@ class ApiKeysService:
                 ),
                 enforced_service_tier=(enforced_service_tier if payload.enforced_service_tier_set else _UNSET),
                 traffic_class=traffic_class_update,
+                codex_quota_mode=codex_quota_mode_update,
+                codex_quota_passthrough_enabled=codex_quota_passthrough_enabled_update,
                 transport_policy_override=transport_policy_override_update,
                 usage_sections=usage_sections,
                 account_assignment_scope_enabled=account_assignment_scope_enabled,
@@ -1554,6 +1580,21 @@ def _normalize_traffic_class_lenient(value: str | None) -> str:
     return TRAFFIC_CLASS_FOREGROUND
 
 
+def _normalize_codex_quota_mode(value: str | None) -> str:
+    normalized = (value or CODEX_QUOTA_MODE_API_KEY).strip().lower()
+    if normalized not in _SUPPORTED_CODEX_QUOTA_MODES:
+        options = ", ".join(sorted(_SUPPORTED_CODEX_QUOTA_MODES))
+        raise ApiKeyValidationError(f"Unsupported Codex quota mode '{normalized}'. Expected one of: {options}")
+    return normalized
+
+
+def _normalize_codex_quota_mode_lenient(value: str | None) -> str:
+    normalized = (value or CODEX_QUOTA_MODE_API_KEY).strip().lower()
+    if normalized in _SUPPORTED_CODEX_QUOTA_MODES:
+        return normalized
+    return CODEX_QUOTA_MODE_API_KEY
+
+
 def _normalize_transport_policy_override(value: str | None) -> str | None:
     if value is None:
         return None
@@ -1787,6 +1828,8 @@ def _to_created_data(data: ApiKeyData, key: str) -> ApiKeyCreatedData:
         allowed_reasoning_efforts=data.allowed_reasoning_efforts,
         enforced_service_tier=data.enforced_service_tier,
         traffic_class=data.traffic_class,
+        codex_quota_mode=data.codex_quota_mode,
+        codex_quota_passthrough_enabled=data.codex_quota_passthrough_enabled,
         transport_policy_override=data.transport_policy_override,
         usage_sections=data.usage_sections,
         expires_at=data.expires_at,
@@ -1825,6 +1868,14 @@ def _to_api_key_data(
         ),
         enforced_service_tier=_normalize_service_tier_lenient(row.enforced_service_tier),
         traffic_class=_normalize_traffic_class_lenient(getattr(row, "traffic_class", TRAFFIC_CLASS_FOREGROUND)),
+        codex_quota_mode=_normalize_codex_quota_mode_lenient(
+            getattr(row, "codex_quota_mode", CODEX_QUOTA_MODE_API_KEY)
+        ),
+        codex_quota_passthrough_enabled=(
+            True
+            if getattr(row, "codex_quota_passthrough_enabled", None) is None
+            else bool(row.codex_quota_passthrough_enabled)
+        ),
         transport_policy_override=_normalize_transport_policy_override_lenient(
             getattr(row, "transport_policy_override", None)
         ),

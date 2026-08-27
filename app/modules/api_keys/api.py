@@ -49,6 +49,12 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
         allowed_reasoning_efforts=row.allowed_reasoning_efforts,
         enforced_service_tier=row.enforced_service_tier,
         traffic_class=row.traffic_class,
+        codex_quota_mode=getattr(row, "codex_quota_mode", "api_key"),
+        codex_quota_passthrough_enabled=(
+            True
+            if getattr(row, "codex_quota_passthrough_enabled", None) is None
+            else bool(row.codex_quota_passthrough_enabled)
+        ),
         transport_policy_override=row.transport_policy_override,
         usage_sections=row.usage_sections,
         expires_at=row.expires_at,
@@ -139,6 +145,12 @@ async def create_api_key(
                 allowed_reasoning_efforts=payload.allowed_reasoning_efforts,
                 enforced_service_tier=payload.enforced_service_tier,
                 traffic_class=payload.traffic_class or "foreground",
+                codex_quota_mode=payload.codex_quota_mode or "api_key",
+                codex_quota_passthrough_enabled=(
+                    payload.codex_quota_passthrough_enabled
+                    if payload.codex_quota_passthrough_enabled is not None
+                    else True
+                ),
                 transport_policy_override=payload.transport_policy_override,
                 usage_sections=(
                     payload.usage_sections
@@ -203,6 +215,10 @@ async def update_api_key(
         enforced_service_tier_set="enforced_service_tier" in fields,
         traffic_class=payload.traffic_class,
         traffic_class_set="traffic_class" in fields,
+        codex_quota_mode=payload.codex_quota_mode,
+        codex_quota_mode_set="codex_quota_mode" in fields,
+        codex_quota_passthrough_enabled=payload.codex_quota_passthrough_enabled,
+        codex_quota_passthrough_enabled_set="codex_quota_passthrough_enabled" in fields,
         transport_policy_override=payload.transport_policy_override,
         transport_policy_override_set="transport_policy_override" in fields,
         usage_sections=payload.usage_sections,

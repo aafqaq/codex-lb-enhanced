@@ -31,9 +31,11 @@ import { ModelMultiSelect } from "@/features/api-keys/components/model-multi-sel
 import { ReasoningEffortsMultiSelect } from "@/features/api-keys/components/reasoning-efforts-multi-select";
 import { UsageSectionsMultiSelect } from "@/features/api-keys/components/usage-sections-multi-select";
 import { ModelSourceMultiSelect } from "@/features/model-sources/components/model-source-multi-select";
+import { CODEX_QUOTA_MODES } from "@/features/api-keys/schemas";
 import type {
   ApiKey,
   ApiKeyUpdateRequest,
+  CodexQuotaMode,
   LimitRuleCreate,
   LimitType,
   ReasoningEffortType,
@@ -104,6 +106,8 @@ type ApiKeyEditDraft = {
   enforcedReasoningEffort: string;
   enforcedServiceTier: string;
   trafficClass: TrafficClass;
+  codexQuotaMode: CodexQuotaMode;
+  codexQuotaPassthroughEnabled: boolean;
   transportPolicyOverride: TransportPolicyOverride | null;
 };
 
@@ -122,6 +126,8 @@ function createApiKeyEditDraft(apiKey: ApiKey): ApiKeyEditDraft {
     enforcedReasoningEffort: apiKey.enforcedReasoningEffort || "none",
     enforcedServiceTier: apiKey.enforcedServiceTier || "none",
     trafficClass: apiKey.trafficClass || "foreground",
+    codexQuotaMode: apiKey.codexQuotaMode || "api_key",
+    codexQuotaPassthroughEnabled: apiKey.codexQuotaPassthroughEnabled,
     transportPolicyOverride: apiKey.transportPolicyOverride,
   };
 }
@@ -177,6 +183,8 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
         : {}),
       enforcedServiceTier: draft.enforcedServiceTier === "none" ? null : draft.enforcedServiceTier as ServiceTierType,
       trafficClass: draft.trafficClass,
+      codexQuotaMode: draft.codexQuotaMode,
+      codexQuotaPassthroughEnabled: draft.codexQuotaPassthroughEnabled,
       transportPolicyOverride: draft.transportPolicyOverride,
       usageSections: draft.usageSections,
       expiresAt: draft.expiresAt?.toISOString() ?? null,
@@ -272,6 +280,42 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
             <div className="space-y-1">
               <div className="text-sm font-medium">{t("apiKeys.form.usageSections")}</div>
               <UsageSectionsMultiSelect value={draft.usageSections} onChange={(usageSections) => updateDraft({ usageSections })} />
+            </div>
+
+            <div className="space-y-1">
+              <label htmlFor="edit-api-key-codex-quota-mode" className="text-sm font-medium">
+                {t("apiKeys.form.codexQuotaMode")}
+              </label>
+              <Select
+                value={draft.codexQuotaMode}
+                onValueChange={(value) => updateDraft({ codexQuotaMode: value as CodexQuotaMode })}
+              >
+                <SelectTrigger id="edit-api-key-codex-quota-mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {CODEX_QUOTA_MODES.map((mode) => (
+                    <SelectItem key={mode} value={mode}>
+                      {t(`apiKeys.codexQuotaModes.${mode}`)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t("apiKeys.form.codexQuotaModeHint")}</p>
+            </div>
+
+            <div className="flex items-center justify-between rounded-md border p-2 text-sm">
+              <div className="pr-3">
+                <label htmlFor="edit-api-key-codex-quota-enabled" className="cursor-pointer font-medium">
+                  {t("apiKeys.form.codexQuotaPassthrough")}
+                </label>
+                <p className="text-xs text-muted-foreground">{t("apiKeys.form.codexQuotaPassthroughHint")}</p>
+              </div>
+              <Switch
+                id="edit-api-key-codex-quota-enabled"
+                checked={draft.codexQuotaPassthroughEnabled}
+                onCheckedChange={(checked) => updateDraft({ codexQuotaPassthroughEnabled: checked })}
+              />
             </div>
 
             <div className="space-y-1">

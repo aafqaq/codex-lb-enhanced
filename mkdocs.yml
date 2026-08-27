@@ -61,7 +61,6 @@ nav:
   - Conversations: conversations.md
   - Usage Reporting: usage-reporting.md
   - Configuration: configuration.md
-  - Anonymous Telemetry: telemetry.md
   - Authentication: authentication.md
   - API Keys: api-keys.md
   - Routing: routing.md

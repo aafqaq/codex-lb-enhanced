@@ -961,14 +961,6 @@ class DashboardSettings(Base):
     )
     totp_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     totp_last_verified_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    telemetry_consent: Mapped[str] = mapped_column(
-        String(16),
-        default="undecided",
-        server_default=text("'undecided'"),
-        nullable=False,
-    )
-    telemetry_instance_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    telemetry_private_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     http_responses_session_bridge_prompt_cache_idle_ttl_seconds: Mapped[int] = mapped_column(
         Integer,
         default=3600,
@@ -1172,6 +1164,18 @@ class ApiKey(Base):
         String,
         default="foreground",
         server_default=text("'foreground'"),
+        nullable=False,
+    )
+    codex_quota_mode: Mapped[str] = mapped_column(
+        String,
+        default="api_key",
+        server_default=text("'api_key'"),
+        nullable=False,
+    )
+    codex_quota_passthrough_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default=true(),
         nullable=False,
     )
     transport_policy_override: Mapped[str | None] = mapped_column(String, nullable=True)

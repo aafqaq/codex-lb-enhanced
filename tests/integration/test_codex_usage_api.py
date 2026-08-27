@@ -15,6 +15,11 @@ from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService, LimitRuleInput
 from app.modules.proxy.account_cache import get_account_selection_cache
+from app.modules.proxy.types import (
+    RateLimitStatusDetailsData,
+    RateLimitStatusPayloadData,
+    RateLimitWindowSnapshotData,
+)
 from app.modules.rate_limit_reset_credits.store import get_rate_limit_reset_credits_store
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
@@ -60,13 +65,21 @@ def _reset_credit_snapshot(credit_id: str) -> RateLimitResetCreditsSnapshot:
     )
 
 
-async def _create_api_key(*, name: str, limits: list[LimitRuleInput] | None = None) -> tuple[str, str]:
+async def _create_api_key(
+    *,
+    name: str,
+    limits: list[LimitRuleInput] | None = None,
+    codex_quota_mode: str = "api_key",
+    codex_quota_passthrough_enabled: bool = True,
+) -> tuple[str, str]:
     async with SessionLocal() as session:
         service = ApiKeysService(ApiKeysRepository(session))
         created = await service.create_key(
             ApiKeyCreateData(
                 name=name,
                 allowed_models=None,
+                codex_quota_mode=codex_quota_mode,
+                codex_quota_passthrough_enabled=codex_quota_passthrough_enabled,
                 limits=limits or [],
             )
         )
@@ -614,6 +627,51 @@ async def test_codex_usage_api_key_maps_token_and_cost_limits_to_codex_windows(a
     assert payload["rate_limit"]["primary_window"]["limit_window_seconds"] == 86400
     assert payload["rate_limit"]["secondary_window"]["used_percent"] == 12
     assert payload["rate_limit"]["secondary_window"]["limit_window_seconds"] == 604800
+    assert payload["credits"] is None
+
+
+@pytest.mark.asyncio
+async def test_codex_usage_api_key_pool_mode_uses_aggregate_payload(async_client, db_setup, monkeypatch):
+    _, plain_key = await _create_api_key(name="codex-usage-pool-mode", codex_quota_mode="pool")
+
+    async def fake_pool_payload(self):
+        del self
+        return RateLimitStatusPayloadData(
+            plan_type="plus",
+            rate_limit=RateLimitStatusDetailsData(
+                allowed=True,
+                limit_reached=False,
+                primary_window=RateLimitWindowSnapshotData(used_percent=37, limit_window_seconds=300),
+            ),
+        )
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.get_rate_limit_payload", fake_pool_payload)
+    response = await async_client.get(
+        "/api/codex/usage",
+        headers={"Authorization": f"Bearer {plain_key}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["plan_type"] == "plus"
+    assert payload["rate_limit"]["primary_window"]["used_percent"] == 37
+
+
+@pytest.mark.asyncio
+async def test_codex_usage_api_key_quota_display_can_be_disabled(async_client, db_setup):
+    _, plain_key = await _create_api_key(
+        name="codex-usage-disabled",
+        limits=[LimitRuleInput(limit_type="total_tokens", limit_window="5h", max_value=1000)],
+        codex_quota_passthrough_enabled=False,
+    )
+    response = await async_client.get(
+        "/api/codex/usage",
+        headers={"Authorization": f"Bearer {plain_key}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["rate_limit"] is None
     assert payload["credits"] is None
 
 

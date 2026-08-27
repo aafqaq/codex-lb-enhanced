@@ -218,18 +218,19 @@ from app.modules.proxy.tool_call_dedupe import (
 logger = logging.getLogger("app.modules.proxy.service")
 
 
-def _quota_replay_text_for_client_full_resend(
+def _portable_full_resend_text_for_recovery(
     request_state: "_WebSocketRequestState",
 ) -> str | None:
-    """Project a client full resend into a portable quota replay body.
+    """Project a verified client full resend into a portable replay body.
 
     A client retry may still carry ``previous_response_id`` after the old
     owner rejected it.  In that case the normal strict continuity classifier
     intentionally fails closed (reasoning ids and file references are not
     portable by themselves), but a definitive pre-dispatch quota response
-    proves the operation was never accepted and permits a fresh replay
-    projection.  The projection retains file references for upstream
-    validation while dropping response-owned bookkeeping and the stale anchor.
+    or anchor rejection proves the operation was not accepted by this owner
+    and permits a fresh replay projection.  The projection retains file
+    references for upstream validation while dropping response-owned
+    bookkeeping and the stale anchor.
     """
 
     source_text = (
@@ -347,6 +348,53 @@ async def _update_http_bridge_operation_state(
             "Failed to persist HTTP bridge operation outcome operation_id=%s state=%s",
             operation_id,
             state,
+            exc_info=True,
+        )
+
+
+async def _mark_http_bridge_operation_failed_for_rebind(
+    service: Any,
+    session: "_HTTPBridgeSession",
+    request_state: Any,
+) -> None:
+    """Make a rejected pre-dispatch operation eligible for a new owner.
+
+    ``previous_response_not_found`` is not an account-health signal, but it
+    does prove that the current account could not accept this particular
+    anchored request.  When the client supplied a complete portable
+    transcript, the operation can safely be rebound to another pool account;
+    leaving the durable row in ``submitted`` would make the retry path treat
+    it as an ambiguous in-flight send and stop before selecting a replacement.
+    """
+
+    operation_id = getattr(request_state, "operation_id", None)
+    session_id = getattr(session, "durable_session_id", None)
+    owner_epoch = getattr(session, "durable_owner_epoch", None)
+    update_operation = getattr(getattr(service, "_durable_bridge", None), "update_operation", None)
+    if not operation_id or session_id is None or owner_epoch is None or not callable(update_operation):
+        return
+    try:
+        marked_failed = await update_operation(
+            operation_id=operation_id,
+            session_id=session_id,
+            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+            owner_epoch=owner_epoch,
+            state="failed",
+        )
+        if not marked_failed:
+            logger.info(
+                "HTTP bridge previous-response replay operation row was not marked failed; "
+                "continuing with fenced rebind operation_id=%s",
+                operation_id,
+            )
+    except Exception:
+        # The owner fence still protects the subsequent record_operation call.
+        # Keep recovery alive; a durable failure is handled fail-closed by the
+        # submit path instead of silently dispatching an unfenced duplicate.
+        logger.warning(
+            "Failed to mark HTTP bridge previous-response operation failed before account failover "
+            "operation_id=%s",
+            operation_id,
             exc_info=True,
         )
 
@@ -2503,6 +2551,119 @@ class _HTTPBridgeUpstreamEventsMixin:
             payload=payload,
         )
         retry_error_message = _websocket_event_error_message(event_type, payload)
+        # A full client resend gives us an account-neutral copy of the turn.
+        # If the current owner rejects the injected/forwarded anchor before
+        # response.created, do the same owner handoff that a definitive quota
+        # rejection uses.  Previously this branch only rewrote the error and
+        # left the hard sticky owner intact, so Codex retried the same account
+        # (and the same stale anchor) until a later 429 happened to trigger
+        # quota failover.  That is the source of the "three retries" symptom.
+        previous_response_replay_text = (
+            _portable_full_resend_text_for_recovery(status_request_state)
+            if (
+                is_previous_response_not_found_event
+                and status_request_state is not None
+                and not has_other_pending_requests
+                and status_request_state.response_id is None
+                and status_request_state.response_event_count == 0
+                and _websocket_request_can_replay_before_visible_output(status_request_state)
+            )
+            else None
+        )
+        if previous_response_replay_text is not None and status_request_state is not None:
+            old_account_id = session.account.id
+            previous_upstream_turn_state = session.upstream_turn_state
+            previous_downstream_turn_state = session.downstream_turn_state
+            previous_headers = session.headers
+            session.upstream_turn_state = None
+            session.downstream_turn_state = None
+            session.headers = {
+                key: value for key, value in session.headers.items() if key.lower() != "x-codex-turn-state"
+            }
+            await self._release_request_state_account_response_create_lease(status_request_state)
+            status_request_state.excluded_account_ids.add(old_account_id)
+            status_request_state.affinity_policy = replace(
+                status_request_state.affinity_policy,
+                key=None,
+                kind=None,
+                reallocate_sticky=True,
+                codex_session_source=None,
+                legacy_codex_session_key=None,
+                legacy_continuity_source=None,
+                seed_selection_key=None,
+                seed_selection_kind=None,
+            )
+            status_request_state.request_text = previous_response_replay_text
+            status_request_state.previous_response_id = None
+            status_request_state.proxy_injected_previous_response_id = False
+            status_request_state.hard_continuity_anchor = False
+            status_request_state.fresh_upstream_request_text = None
+            status_request_state.fresh_upstream_request_is_retry_safe = False
+            status_request_state.file_required_preferred_account = False
+            status_request_state.preferred_account_id = None
+            status_request_state.operation_rebind_required = True
+            status_request_state.awaiting_response_created = True
+            status_request_state.response_id = None
+            status_request_state.response_event_count = 0
+            status_request_state.upstream_model_output_seen = False
+            status_request_state.deferred_reasoning_downstream_texts = []
+            async with session.pending_lock:
+                if status_request_state not in session.pending_requests:
+                    session.pending_requests.appendleft(status_request_state)
+                    session.queued_request_count += 1
+            await _mark_http_bridge_operation_failed_for_rebind(self, session, status_request_state)
+            _log_http_bridge_event(
+                "previous_response_failover_reconnect",
+                session.key,
+                account_id=old_account_id,
+                model=session.request_model,
+                pending_count=1,
+                detail=(
+                    f"source=client_full_resend excluded_count={len(status_request_state.excluded_account_ids)} "
+                    "previous_response_id_stripped=true account_health_unchanged=true"
+                ),
+                cache_key_family=session.key.affinity_kind,
+                model_class=_extract_model_class(session.request_model) if session.request_model else None,
+            )
+            # Reuse the hardened pre-created retry path.  Its quota-failover
+            # mode is also the generic "pre-dispatch owner rejected a fully
+            # portable turn" mode: it clears hard affinity for selection,
+            # fences/rebinds the operation, and walks the pool without A→B→A.
+            retried = await self._retry_http_bridge_precreated_request(
+                session,
+                request_state=status_request_state,
+                allow_account_exhaustion_failover=True,
+            )
+            if retried:
+                return
+            # A replacement could not be connected or accepted. Restore only
+            # the physical session metadata; the request remains terminal and
+            # the client can retry with its local transcript later.
+            session.upstream_turn_state = previous_upstream_turn_state
+            session.downstream_turn_state = previous_downstream_turn_state
+            session.headers = previous_headers
+            async with session.pending_lock:
+                if status_request_state in session.pending_requests:
+                    session.pending_requests.remove(status_request_state)
+                    session.queued_request_count = max(0, session.queued_request_count - 1)
+            status_request_state.error_http_status_override = 502
+            status_request_state.error_code_override = "upstream_unavailable"
+            status_request_state.error_message_override = (
+                "HTTP responses session bridge could not rebind the rejected previous response; retry later."
+            )
+            status_request_state.error_type_override = "server_error"
+            session.upstream_control.reconnect_requested = True
+            session.upstream_control.retire_after_drain = True
+            (
+                _downstream_text,
+                event_block,
+                event,
+                payload,
+                event_type,
+            ) = _build_stream_incomplete_terminal_event_for_request(
+                status_request_state,
+                reason="upstream_unavailable",
+            )
         account_exhaustion_retry_code = account_exhaustion_code_for_failover(
             retry_error_code,
             retry_error_message,
@@ -2685,7 +2846,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             if status_request_state is not None:
                 setattr(status_request_state, "account_health_error_handled", True)
             quota_replay_text = (
-                _quota_replay_text_for_client_full_resend(status_request_state)
+                _portable_full_resend_text_for_recovery(status_request_state)
                 if status_request_state is not None
                 else None
             )

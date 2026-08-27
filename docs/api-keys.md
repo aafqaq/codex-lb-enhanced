@@ -23,6 +23,17 @@ The protected proxy routes covered by this setting are:
 
 Dashboard → API Keys → Create. The full key is shown **only once** at creation. Keys support optional expiration, model restrictions, and rate limits (tokens / cost per day / week / month).
 
+### Codex quota display
+
+Each key has two independent Codex quota-display settings:
+
+- **Codex quota display** chooses the source shown by Codex-compatible response headers, `/api/codex/usage`, and the `limits` view in `/v1/usage`:
+  - **API-key limits** (the key's own global limit rules; if none is configured, the historical pool fallback is used).
+  - **Pooled account quota** (the aggregate estimate from the account pool).
+- **Enable Codex quota emulation** controls whether the Codex-compatible quota headers and quota payload are sent at all. Turning it off does not disable the key or stop `/v1/usage` accounting; it only removes quota-display fields so clients do not mistake them for an upstream subscription limit.
+
+The existing **Usage sections** setting is separate. It controls which aggregate sections are returned in `/v1/usage` (`upstream_limits` and `account_pool_usage`); it does not enforce limits and does not select the source for Codex quota headers. API-key limit rules remain enforcement rules regardless of these display settings.
+
 Keys can also be scoped to specific accounts, so a key draws quota only from the accounts assigned to it:
 
 ![API keys with assigned accounts](screenshots/apis-assigned-accounts.jpg)
