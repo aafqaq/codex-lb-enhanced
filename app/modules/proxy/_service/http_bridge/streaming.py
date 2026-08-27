@@ -1261,6 +1261,12 @@ class _HTTPBridgeStreamingMixin:
             forwarded_affinity_kind=forwarded_affinity_kind,
             forwarded_affinity_key=forwarded_affinity_key,
         )
+        # Capture quarantine before durable lookup.  A rapid client retry can
+        # arrive while the previous request is still settling, in which case
+        # lookup may transiently return no row (or an alias that cannot be
+        # canonicalized).  The in-memory key registry is authoritative and
+        # must suppress anchor injection even without a durable row.
+        bridge_session_key_quarantined = _http_bridge_session_key_quarantined(self, bridge_session_key)
         durable_lookup_turn_state = (
             downstream_turn_state
             if forwarded_request
@@ -1401,6 +1407,17 @@ class _HTTPBridgeStreamingMixin:
         # dispatch genuinely goes unanchored instead of rebuilding the same
         # wedged reattach through the session-state side door.
         fresh_reattach_anchor_suppressed_quarantined = False
+        if payload_looks_like_full_resend and bridge_session_key_quarantined:
+            fresh_reattach_anchor_suppressed_quarantined = True
+            _log_http_bridge_event(
+                "fresh_reattach_anchor_skipped_quarantined",
+                bridge_session_key,
+                account_id=None,
+                model=payload.model,
+                detail="response_id=unresolved_before_durable_lookup",
+                cache_key_family=bridge_session_key.affinity_kind,
+                model_class=_extract_model_class(payload.model) if payload.model else None,
+            )
 
         def classify_durable_full_resend(
             lookup: DurableBridgeLookup,
@@ -1620,7 +1637,11 @@ class _HTTPBridgeStreamingMixin:
                 and durable_lookup.latest_response_id is not None
                 and (not payload_looks_like_full_resend or durable_anchor_trimmable)
             )
-            if payload_looks_like_full_resend and _http_bridge_session_key_quarantined(self, bridge_session_key):
+            if (
+                payload_looks_like_full_resend
+                and _http_bridge_session_key_quarantined(self, bridge_session_key)
+                and not fresh_reattach_anchor_suppressed_quarantined
+            ):
                 # The previous attach on this key proved silent/wedged
                 # (#1534). The client's own payload already carries the full
                 # conversation, so send it unanchored on the fresh path

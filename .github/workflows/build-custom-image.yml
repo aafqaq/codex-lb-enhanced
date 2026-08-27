@@ -46,6 +46,7 @@ jobs:
             type=raw,value=custom-latest
             type=raw,value=1.24.5
             type=raw,value=1.24.6
+            type=raw,value=1.24.7
             type=sha,prefix=
 
       - name: Build and publish
