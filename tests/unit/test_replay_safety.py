@@ -64,6 +64,38 @@ def test_quota_replay_projection_strips_codex_account_bound_bookkeeping() -> Non
     assert all("id" not in item for item in projected["input"] if isinstance(item, dict))
 
 
+def test_quota_replay_projection_accepts_codex_empty_trailing_tool_output_part() -> None:
+    payload: dict[str, JsonValue] = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "pwd"},
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "input_text", "text": "Script completed"},
+                    {"type": "input_text", "text": ""},
+                ],
+            },
+        ],
+    }
+
+    projected = project_responses_payload_for_account_neutral_quota_replay(payload)
+
+    assert projected is not None
+    assert responses_payload_is_account_neutral_fresh_replay(projected)
+
+
+def test_quota_replay_projection_rejects_scalar_input_without_history() -> None:
+    payload: dict[str, JsonValue] = {
+        "model": "gpt-5.6-sol",
+        "previous_response_id": "resp_owner_only",
+        "input": "follow-up only",
+    }
+
+    assert project_responses_payload_for_account_neutral_quota_replay(payload) is None
+
+
 @pytest.mark.parametrize(
     "payload",
     [

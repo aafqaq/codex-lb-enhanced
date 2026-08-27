@@ -728,7 +728,15 @@ def _tool_output_is_self_contained(item_type: str, item: Mapping[str, JsonValue]
         isinstance(output, list)
         and bool(output)
         and all(
-            isinstance(part, dict) and _input_content_part_is_self_contained(part, allow_output=False)
+            isinstance(part, dict)
+            and (
+                _input_content_part_is_self_contained(part, allow_output=False)
+                # Codex Desktop emits an empty trailing ``input_text`` part
+                # for successful exec/custom-tool calls.  It carries no
+                # account state and must not make an otherwise complete tool
+                # transcript look non-replayable.
+                or (part.get("type") == "input_text" and part.get("text") == "")
+            )
             for part in output
         )
     )
@@ -853,7 +861,13 @@ def project_responses_payload_for_account_neutral_quota_replay(
                         items.append(projected_item)
                 projected[key] = items
             elif isinstance(value, str):
-                projected[key] = value
+                # A scalar input is only the current prompt; it does not
+                # carry the prior conversation needed to replace an
+                # account-bound ``previous_response_id``.  Refuse this
+                # projection so the caller returns the neutral 502 recovery
+                # semantic instead of silently switching accounts with lost
+                # context.
+                return None
             else:
                 return None
         elif key == "tools":

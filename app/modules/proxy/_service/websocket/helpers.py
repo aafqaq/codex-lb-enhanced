@@ -1280,6 +1280,11 @@ def _websocket_continuity_error_fields(
     reason: str,
     expose_stale_previous_response_classifier: bool,
 ) -> tuple[str, str]:
+    if reason == "upstream_unavailable":
+        return (
+            "upstream_unavailable",
+            "HTTP responses session bridge continuity account is unavailable; retry later.",
+        )
     if reason == "previous_response_not_found" and expose_stale_previous_response_classifier:
         return PREVIOUS_RESPONSE_NOT_FOUND_CODE, PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE
     return "stream_incomplete", PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE
