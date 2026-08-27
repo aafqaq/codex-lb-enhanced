@@ -431,6 +431,14 @@ class _HTTPBridgeMixin(
         defer_account_health_writes: bool = False,
     ) -> "_HTTPBridgeSession | _HTTPBridgeOwnerForward":
         settings = _service_get_settings()
+        # A reconnect publishes a handoff future while it swaps the upstream
+        # socket.  Other requests for the same bridge key may arrive during
+        # that short window; one admission timeout must not surface as a
+        # client-visible overload while the owner is still making progress.
+        # Keep the existing bounded fail-closed behavior after a few waits so
+        # a genuinely wedged handoff cannot block a request forever.
+        handoff_wait_timeouts = 0
+        handoff_wait_future: asyncio.Future[_HTTPBridgeSession] | None = None
         request_scope_id = ensure_request_scope_id()
         api_key_id = api_key.id if api_key is not None else None
         incoming_turn_state = _sticky_key_from_turn_state_header(headers)
@@ -1412,6 +1420,24 @@ class _HTTPBridgeMixin(
                         continue
                     raise
                 except TimeoutError as exc:
+                    if getattr(inflight_future, "_http_bridge_handoff", False):
+                        if inflight_future is not handoff_wait_future:
+                            handoff_wait_future = inflight_future
+                            handoff_wait_timeouts = 0
+                        handoff_wait_timeouts += 1
+                        if handoff_wait_timeouts < 4:
+                            _log_http_bridge_startup_wait_timeout(
+                                stage="inflight_handoff_retry",
+                                timeout_seconds=wait_timeout_seconds,
+                                key=key,
+                                request_model=request_model,
+                                pending_count=_http_bridge_session_generation_count(self),
+                                inflight_count=len(self._http_bridge_inflight_sessions),
+                            )
+                            # The handoff owner remains authoritative; do not
+                            # evict its future. Re-enter the registry and pick
+                            # up the replacement as soon as it publishes.
+                            continue
                     timeout_error = _http_bridge_startup_wait_timeout_error(
                         "http_bridge_inflight_session",
                         code="capacity_exhausted_active_sessions",
