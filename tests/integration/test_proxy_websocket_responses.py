@@ -9833,9 +9833,40 @@ def test_backend_responses_websocket_transparently_retries_precreated_usage_limi
 
     request_payload = {
         "type": "response.create",
+        "_extra": {"client_trace": "opaque-account-bookkeeping"},
         "model": "gpt-5.1",
         "instructions": "",
-        "input": [{"role": "user", "content": [{"type": "input_text", "text": "retry once"}]}],
+        "reasoning": {"effort": "high", "summary": "detailed", "context": "all_turns"},
+        "client_metadata": {"originator": "codex_cli_rs", "unsupported": "account-bound"},
+        "input": [
+            {
+                "type": "message",
+                "id": "msg_account_a",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "retry the complete transcript"}],
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_account_a",
+                "encrypted_content": "account-scoped",
+                "summary": [],
+            },
+            {
+                "type": "custom_tool_call",
+                "id": "call_item_account_a",
+                "call_id": "call_portable",
+                "name": "exec",
+                "input": "pwd",
+                "status": "completed",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "output_item_account_a",
+                "call_id": "call_portable",
+                "output": "/tmp",
+                "status": "completed",
+            },
+        ],
         "stream": True,
     }
 
@@ -9857,12 +9888,20 @@ def test_backend_responses_websocket_transparently_retries_precreated_usage_limi
     assert len(first_upstream.sent_text) == 1
     assert len(second_upstream.sent_text) == 1
     assert len(third_upstream.sent_text) == 1
-    assert _without_installation_metadata(json.loads(first_upstream.sent_text[0])) == _without_installation_metadata(
-        json.loads(second_upstream.sent_text[0])
-    )
-    assert _without_installation_metadata(json.loads(first_upstream.sent_text[0])) == _without_installation_metadata(
-        json.loads(third_upstream.sent_text[0])
-    )
+    first_sent = _without_installation_metadata(json.loads(first_upstream.sent_text[0]))
+    second_sent = _without_installation_metadata(json.loads(second_upstream.sent_text[0]))
+    third_sent = _without_installation_metadata(json.loads(third_upstream.sent_text[0]))
+    assert first_sent != second_sent
+    assert second_sent == third_sent
+    assert "_extra" not in second_sent
+    assert second_sent["reasoning"] == {"effort": "high", "summary": "detailed"}
+    assert "client_metadata" not in second_sent
+    assert [item["type"] for item in second_sent["input"]] == [
+        "message",
+        "custom_tool_call",
+        "custom_tool_call_output",
+    ]
+    assert all("id" not in item for item in second_sent["input"])
 
 
 def test_backend_responses_websocket_visible_usage_limit_uses_native_client_retry_boundary(

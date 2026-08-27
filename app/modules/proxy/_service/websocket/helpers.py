@@ -341,7 +341,10 @@ from app.modules.proxy.http_bridge_forwarding import (
 from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
-from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
+from app.modules.proxy.replay_safety import (
+    project_responses_text_for_account_neutral_quota_replay,
+    responses_payload_is_account_neutral_fresh_replay,
+)
 
 
 def _facade() -> Any:
@@ -524,13 +527,43 @@ def _install_verified_fresh_replay(
 
 def _prepare_websocket_request_state_for_account_switch(
     request_state: "_WebSocketRequestState",
+    *,
+    allow_quota_projection: bool = False,
 ) -> str | None:
     """Return an unsent request body only when moving accounts is proven safe."""
     if request_state.previous_response_id is None:
-        if not _websocket_request_text_is_account_neutral_fresh_replay(request_state.request_text):
-            return None
-        return request_state.request_text
-    return _install_verified_fresh_replay(request_state)
+        if _websocket_request_text_is_account_neutral_fresh_replay(request_state.request_text):
+            return request_state.request_text
+    else:
+        replay_text = _install_verified_fresh_replay(request_state)
+        if replay_text is not None:
+            return replay_text
+
+    if not allow_quota_projection:
+        return None
+    source_text = (
+        request_state.fresh_upstream_request_text
+        if request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
+        else request_state.request_text
+    )
+    replay_text = project_responses_text_for_account_neutral_quota_replay(source_text)
+    if replay_text is None:
+        return None
+    # A definitive quota terminal before visible model output proves that the
+    # operation was not accepted by this account.  Codex clients may still
+    # include response-owned bookkeeping in an otherwise complete transcript;
+    # replace it with the validated portable projection before walking the
+    # pool so the next owner receives the same conversation and tool history.
+    request_state.request_text = replay_text
+    request_state.previous_response_id = None
+    request_state.proxy_injected_previous_response_id = False
+    request_state.preferred_account_id = None
+    request_state.replay_required_account_id = None
+    request_state.fresh_upstream_request_text = None
+    request_state.fresh_upstream_request_is_retry_safe = False
+    request_state.file_required_preferred_account = False
+    _refresh_websocket_request_input_fingerprint_from_text(request_state)
+    return replay_text
 
 
 def _websocket_continuity_anchor_for_payload(

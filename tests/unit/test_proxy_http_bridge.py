@@ -26524,18 +26524,27 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
         reasoning_effort=None,
         api_key_reservation=None,
         started_at=time.monotonic(),
-        awaiting_response_created=True,
+        awaiting_response_created=False,
+        response_id="resp-quota-created-before-limit",
+        response_event_count=1,
         request_text=(
-            '{"type":"response.create","model":"gpt-5.6-sol","input":['
-            '{"role":"user","content":[{"type":"input_text","text":"hello"},'
-            '{"type":"input_file","file_id":"file_from_previous_account"}]}]}'
+            '{"type":"response.create","_extra":{"trace":"opaque"},'
+            '"model":"gpt-5.6-sol","reasoning":{"effort":"high","context":"all_turns"},'
+            '"client_metadata":{"originator":"codex_cli_rs","unsupported":"owner-bound"},'
+            '"input":[{"type":"message","id":"msg_owner","role":"user",'
+            '"content":[{"type":"input_text","text":"hello"}]},'
+            '{"type":"reasoning","id":"rs_owner","encrypted_content":"owner-bound","summary":[]},'
+            '{"type":"custom_tool_call","id":"call_owner","call_id":"call_portable",'
+            '"name":"exec","input":"pwd","status":"completed"},'
+            '{"type":"custom_tool_call_output","id":"output_owner","call_id":"call_portable",'
+            '"output":"/tmp","status":"completed"}]}'
         ),
         transport="http",
         replay_count=2,
         account_exhaustion_replay_count=2,
         operation_id="op-quota-rebind",
         operation_rebind_required=True,
-        file_required_preferred_account=True,
+        file_required_preferred_account=False,
         preferred_account_id="acc-quota-c",
         excluded_account_ids={"acc-quota-a", "acc-quota-b", "acc-quota-c"},
         account_response_create_lease=cast(Any, object()),
@@ -26568,6 +26577,15 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
     )
     assert request_state.replay_count == 3
     assert request_state.excluded_account_ids == {"acc-quota-a", "acc-quota-b", "acc-quota-c"}
+    replay_payload = json.loads(cast(AsyncMock, session.upstream.send_text).await_args.args[0])
+    assert "_extra" not in replay_payload
+    assert replay_payload["reasoning"] == {"effort": "high"}
+    assert replay_payload["client_metadata"] == {"codex_lb_operation_id": "op-quota-rebind"}
+    assert [item["type"] for item in replay_payload["input"]] == [
+        "message",
+        "custom_tool_call",
+        "custom_tool_call_output",
+    ]
     reconnect.assert_awaited_once()
     reconnect_call = reconnect.await_args
     assert reconnect_call is not None

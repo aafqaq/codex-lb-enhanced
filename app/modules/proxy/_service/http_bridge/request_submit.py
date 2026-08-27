@@ -3038,7 +3038,10 @@ class _HTTPBridgeRequestSubmitMixin:
 
         def quota_failover_replay_text(candidate: _WebSocketRequestState) -> str | None:
             """Project a definitive pre-dispatch quota retry onto portable state."""
-            if not allow_account_exhaustion_failover or candidate.response_event_count != 0:
+            if not allow_account_exhaustion_failover or not _websocket_request_can_replay_before_visible_output(
+                candidate,
+                allow_account_exhaustion_replay=True,
+            ):
                 return None
             source_text = (
                 candidate.fresh_upstream_request_text
