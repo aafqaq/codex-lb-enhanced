@@ -3332,6 +3332,17 @@ class _HTTPBridgeRequestSubmitMixin:
                     require_preferred_account=True,
                     **reconnect_reader_kwargs,
                 )
+            elif quota_hard_account_switch:
+                # Quota rejection is definitive before any response event.
+                # It must take precedence over the clean-close continuity
+                # branch below; that branch intentionally pins hard anchors,
+                # but doing so here would keep retrying the exhausted owner.
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    selection_affinity=request_state.affinity_policy,
+                    **reconnect_reader_kwargs,
+                )
             elif clean_close_hard_continuation or clean_close_hard_continuity_anchor:
                 await self._reconnect_http_bridge_session(
                     session,
