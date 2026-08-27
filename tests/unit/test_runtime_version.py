@@ -56,7 +56,7 @@ async def test_runtime_version_does_not_report_update_for_same_release() -> None
 async def test_runtime_version_falls_back_to_latest_tag_when_no_release_exists() -> None:
     service = RuntimeVersionService(current_version="1.24.8", ttl_seconds=60)
     release_response = _mock_response(status=404, json_data=None)
-    tags_response = _mock_response(json_data=[{"name": "1.24.9", "tag_name": "v1.24.9"}])
+    tags_response = _mock_response(json_data=[{"name": "v1.24.9"}])
     session = MagicMock()
     session.get = MagicMock(side_effect=[release_response, tags_response])
     session.__aenter__ = AsyncMock(return_value=session)
