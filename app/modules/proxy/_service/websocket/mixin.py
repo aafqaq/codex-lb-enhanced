@@ -2567,6 +2567,19 @@ class _WebSocketMixin:
                         and account is not None
                         and _is_websocket_response_create(payload)
                     ):
+                        # Connect-time recovery may have replaced a pinned
+                        # previous-response body with a verified account-
+                        # neutral full resend before returning the new socket.
+                        # The outer loop still owns the pre-connect ``text_data``
+                        # local, so refresh it from request state before adding
+                        # account metadata; otherwise the old anchor would be
+                        # sent to the replacement and the quota recovery would
+                        # appear to have done nothing.
+                        if request_state.request_text is not None and request_state.request_text != text_data:
+                            text_data = request_state.request_text
+                            replay_payload = _parse_websocket_payload(text_data)
+                            if replay_payload is not None:
+                                payload = replay_payload
                         text_data = _websocket_text_with_account_installation_id(text_data, account)
                         if request_state.fresh_upstream_request_text is not None:
                             fresh_upstream_request_text = _websocket_text_with_account_installation_id(
@@ -3855,6 +3868,43 @@ class _WebSocketMixin:
             account = selection.account
             if account is not None:
                 break
+            if (
+                selection.error_code == USAGE_LIMIT_REACHED
+                and require_preferred_account
+                and preferred_account_id is not None
+                and not request_state.file_required_preferred_account
+            ):
+                # A continuity owner can be unavailable because its upstream
+                # quota is exhausted, which is recoverable when this request
+                # carries a proof-gated full replay.  Drop the owner anchor,
+                # exclude only that account for this logical turn, and let the
+                # normal routing strategy choose the next account.  Transport
+                # failures and unproven/short continuations still fail closed
+                # below; this branch is deliberately quota-only.
+                switch_text = _prepare_websocket_request_state_for_account_switch(request_state)
+                if switch_text is not None:
+                    exhausted_owner_id = preferred_account_id
+                    exclude_account_ids.add(preferred_account_id)
+                    request_state.excluded_account_ids.add(preferred_account_id)
+                    request_state.affinity_policy = replace(
+                        request_state.affinity_policy,
+                        reallocate_sticky=True,
+                    )
+                    request_state.account_exhaustion_replay_count += 1
+                    request_state.last_account_exhaustion_error_message = (
+                        selection.error_message or "The usage limit has been reached"
+                    )
+                    preferred_account_id = None
+                    require_preferred_account = False
+                    reallocate_sticky = True
+                    _facade().logger.warning(
+                        "Websocket continuity owner quota exhausted; replaying on next account "
+                        "request_id=%s owner_account_id=%s resets_at=%s",
+                        request_state.request_log_id or request_state.request_id,
+                        exhausted_owner_id,
+                        selection.resets_at,
+                    )
+                    continue
             if selection.error_code == USAGE_LIMIT_REACHED:
                 break
 

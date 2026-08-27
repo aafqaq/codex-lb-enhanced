@@ -100,6 +100,7 @@ from app.modules.proxy.load_balancer import (
     _mapped_model_has_registry_entry,
 )
 from app.modules.proxy.repo_bundle import ProxyRepositories
+from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED
 from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.proxy.work_admission import AdmissionLease
 from app.modules.request_logs.repository import PreviousResponseOwnerRecord, RequestLogsRepository
@@ -21193,6 +21194,77 @@ async def test_select_websocket_connect_account_preserves_continuity_for_owner_u
 
 
 @pytest.mark.asyncio
+async def test_select_websocket_connect_account_switches_after_owner_quota_with_verified_replay(monkeypatch):
+    """Direct Codex WebSocket selection must not strand a replayable turn."""
+
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    fresh_text = (
+        '{"type":"response.create","model":"gpt-5.1",'
+        '"input":[{"role":"user","content":[{"type":"input_text","text":"continue"}]}]}'
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_owner_quota_replay",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        request_stage="reattach",
+        previous_response_id="resp_owner",
+        preferred_account_id="acc_owner",
+        proxy_injected_previous_response_id=True,
+        fresh_upstream_request_text=fresh_text,
+        fresh_upstream_request_is_retry_safe=True,
+        request_text=(
+            '{"type":"response.create","model":"gpt-5.1",'
+            '"previous_response_id":"resp_owner","input":"continue"}'
+        ),
+    )
+    replacement = _make_account("acc_replacement")
+    select_account = AsyncMock(
+        side_effect=[
+            AccountSelection(
+                account=None,
+                error_message="The usage limit has been reached",
+                error_code="usage_limit_reached",
+                resets_at=1_700_003_600,
+            ),
+            AccountSelection(account=replacement, error_message=None),
+        ]
+    )
+    monkeypatch.setattr(service, "_select_account_with_budget", select_account)
+
+    result = await service._select_websocket_connect_account(
+        time.monotonic() + 10_000.0,
+        sticky_key=None,
+        sticky_kind=None,
+        prefer_earlier_reset=False,
+        prefer_earlier_reset_window="secondary",
+        routing_strategy="usage_weighted",
+        model="gpt-5.1",
+        request_state=request_state,
+        api_key=None,
+        client_send_lock=anyio.Lock(),
+        websocket=cast(WebSocket, SimpleNamespace()),
+        reallocate_sticky=False,
+        sticky_max_age_seconds=None,
+        exclude_account_ids=set(),
+        preferred_account_id="acc_owner",
+        require_preferred_account=True,
+    )
+
+    assert result is replacement
+    assert select_account.await_count == 2
+    assert "acc_owner" in request_state.excluded_account_ids
+    assert request_state.previous_response_id is None
+    assert request_state.preferred_account_id is None
+    assert request_state.request_text == fresh_text
+    assert select_account.await_args_list[1].kwargs["preferred_account_id"] is None
+    assert select_account.await_args_list[1].kwargs["exclude_account_ids"] == {"acc_owner"}
+
+
+@pytest.mark.asyncio
 async def test_select_websocket_connect_account_records_fail_closed_for_preferred_account_mismatch(
     monkeypatch,
     caplog,
@@ -36916,6 +36988,83 @@ async def test_stream_verified_fresh_replay_moves_off_owner_after_previsible_quo
     assert len(selection_calls) >= 2
     assert [streamed.previous_response_id for streamed in streamed_payloads] == [previous_response_id, None]
     assert streamed_payloads[1].input == full_input
+
+
+@pytest.mark.asyncio
+async def test_stream_verified_fresh_replay_moves_off_owner_after_selection_quota(monkeypatch):
+    """A quota-exhausted continuity owner can be bypassed before connect."""
+    settings = _make_proxy_settings()
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    owner_account = _make_account("acc_stream_selection_quota_owner")
+    replacement_account = _make_account("acc_stream_selection_quota_replacement")
+    session_id = "sid_stream_selection_quota"
+    previous_response_id = "resp_stream_selection_quota"
+    request_logs.response_owner_by_id[(previous_response_id, None, session_id)] = owner_account.id
+    initial_input: list[JsonValue] = [{"role": "user", "content": "first turn"}]
+    full_input: list[JsonValue] = [
+        *initial_input,
+        {"role": "user", "content": "selection-time quota"},
+    ]
+    service._websocket_continuity_index[(session_id, None)] = proxy_service._WebSocketContinuityState(
+        last_completed_response_id=previous_response_id,
+        last_completed_input_count=len(initial_input),
+        last_completed_input_prefix_fingerprint=proxy_service._fingerprint_input_items(initial_input),
+    )
+    selection_calls: list[dict[str, object]] = []
+    streamed_payloads: list[ResponsesRequest] = []
+
+    async def fake_select_account(**kwargs):
+        selection_calls.append(dict(kwargs))
+        if kwargs.get("required_account_id") == owner_account.id:
+            return AccountSelection(
+                account=None,
+                error_code=USAGE_LIMIT_REACHED,
+                error_message="owner quota exhausted",
+                resets_at=1_700_003_600,
+            )
+        assert kwargs.get("required_account_id") is None
+        assert kwargs.get("exclude_account_ids") == {owner_account.id}
+        assert kwargs.get("reallocate_sticky") is True
+        return AccountSelection(account=replacement_account, error_message=None)
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del headers, access_token, base_url, raise_for_status, kwargs
+        streamed_payloads.append(payload)
+        assert account_id == replacement_account.chatgpt_account_id
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_selection_quota_ok",'
+            '"status":"completed","usage":{"input_tokens":1,"output_tokens":1,'
+            '"total_tokens":2}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service._load_balancer, "select_account", AsyncMock(side_effect=fake_select_account))
+    monkeypatch.setattr(service._load_balancer, "record_success", AsyncMock())
+    monkeypatch.setattr(service, "_handle_stream_error", AsyncMock(return_value={"failure_class": "rate_limit"}))
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(side_effect=lambda account, **kwargs: account))
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "selection-time owner quota",
+            "input": full_input,
+            "previous_response_id": previous_response_id,
+            "stream": True,
+        }
+    )
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": session_id})]
+
+    assert json.loads(chunks[-1].split("data: ", 1)[1])["type"] == "response.completed"
+    assert len(selection_calls) >= 2
+    assert selection_calls[0]["required_account_id"] == owner_account.id
+    assert selection_calls[1]["required_account_id"] is None
+    assert streamed_payloads[0].previous_response_id is None
+    assert streamed_payloads[0].input == full_input
 
 
 @pytest.mark.asyncio

@@ -1294,6 +1294,33 @@ class _StreamingRetryMixin:
                             raise last_pre_dispatch_transport_error
                         yield _render_dispatch_transport_error(last_pre_dispatch_transport_error)
                         return
+                    if (
+                        selection.error_code == USAGE_LIMIT_REACHED
+                        and require_preferred_account
+                        and preferred_account_id is not None
+                        and file_preferred_account_id is None
+                        and verified_fresh_replay_payload is not None
+                    ):
+                        # Selection can fail before an upstream request is
+                        # opened when the previous-response owner has already
+                        # been marked quota-exhausted.  Treat that as the same
+                        # recoverable owner failure as an upstream 429: the
+                        # verified full resend is independent of the owner's
+                        # response object, so drop the owner and let the normal
+                        # pool walk continue.  A file pin remains hard-bound.
+                        exhausted_owner_id = preferred_account_id
+                        if _move_verified_fresh_replay_from_owner(
+                            account_id=exhausted_owner_id,
+                            outcome="owner_selection_quota_exhausted",
+                        ):
+                            logger.warning(
+                                "Retrying stream after continuity owner quota exhaustion during selection "
+                                "request_id=%s owner_account_id=%s resets_at=%s",
+                                request_id,
+                                exhausted_owner_id,
+                                selection.resets_at,
+                            )
+                            continue
                     if selection.error_code == USAGE_LIMIT_REACHED:
                         await _drain_pending_post_refresh_penalty_on_terminal(settlement)
                         no_accounts_msg = selection.error_message or "Usage limit reached"
