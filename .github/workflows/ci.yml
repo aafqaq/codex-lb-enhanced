@@ -60,22 +60,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/detect_changed_areas.py
 
-  contributors:
-    name: Contributors attribution
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Check all-contributors coverage
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python .github/scripts/check_all_contributors.py
-
   beta-release-guard:
     name: Beta release guard
     runs-on: ubuntu-24.04
@@ -817,7 +801,6 @@ jobs:
     if: always()
     needs:
       - changes
-      - contributors
       - beta-release-guard
       - frontend-lint
       - frontend-typecheck

@@ -9,8 +9,7 @@
 
 [readme]
 path = "README.md"
-# Lines counted AFTER stripping the generated ALL-CONTRIBUTORS-LIST block
-# (bot-managed; not hand-written complexity).
+# Lines counted from the checked-in README content.
 max_lines = 200
 # h1 + h2 only; lines inside fenced code blocks are excluded.
 max_top_level_headings = 10
@@ -34,8 +33,6 @@ max_items = 5
 # check. Keep the list sorted.
 allowed = [
   ".agents",
-  ".all-contributorsrc",
-  ".claude",
   ".dockerignore",
   ".env.example",
   ".github",
@@ -43,14 +40,12 @@ allowed = [
   ".pre-commit-config.yaml",
   "AGENTS.md",
   "CHANGELOG.md",
-  "CLAUDE.md",
   "Dockerfile",
   "Dockerfile.distroless",
   "LICENSE",
   "Makefile",
   "PRINCIPLES.md",
   "README.md",
-  "README.zh-CN.md",
   "app",
   "config",
   "deploy",
