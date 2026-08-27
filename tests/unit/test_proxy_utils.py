@@ -16669,6 +16669,93 @@ async def test_stream_responses_retries_hard_owner_after_transient_exclusion(mon
 
 
 @pytest.mark.asyncio
+async def test_stream_responses_reallocates_paused_hard_sticky_owner_without_wait_loop(monkeypatch):
+    """A paused first-turn sticky owner must rebind once, not spin forever."""
+    settings = _make_proxy_settings()
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    replacement = _make_account("acc_paused_sticky_replacement")
+    selection_calls: list[dict[str, object]] = []
+
+    async def select_account(**kwargs: object) -> AccountSelection:
+        selection_calls.append(dict(kwargs))
+        if not kwargs.get("reallocate_sticky"):
+            return AccountSelection(
+                account=None,
+                error_message="Hard affinity owner account is unavailable",
+                error_code="hard_affinity_saturated",
+            )
+        return AccountSelection(account=replacement, error_message=None)
+
+    async def fake_stream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
+        yield 'data: {"type":"response.completed","response":{"id":"resp_reallocated"}}\n\n'
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=replacement))
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+
+    payload = ResponsesRequest.model_validate(
+        {"model": "gpt-5.6-sol", "instructions": "first turn", "input": [], "stream": True}
+    )
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-paused-sticky"})]
+
+    event = json.loads(chunks[-1].split("data: ", 1)[1])
+    assert event["type"] == "response.completed"
+    assert len(selection_calls) == 2
+    assert selection_calls[0]["reallocate_sticky"] is False
+    assert selection_calls[1]["reallocate_sticky"] is True
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_hard_sticky_continuation_fails_closed_without_replay(monkeypatch):
+    """A continuation lacking a safe full replay gets one bounded terminal error."""
+    settings = _make_proxy_settings()
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    owner = _make_account("acc_paused_continuation_owner")
+    turn_state = "turn-paused-owner"
+    selection_calls: list[dict[str, object]] = []
+
+    async def select_account(**kwargs: object) -> AccountSelection:
+        selection_calls.append(dict(kwargs))
+        return AccountSelection(
+            account=None,
+            error_message="Hard affinity owner account is unavailable",
+            error_code="hard_affinity_saturated",
+        )
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(service, "_resolve_compact_turn_state_owner", AsyncMock(return_value=owner.id))
+
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "continuation",
+            "input": [{"role": "user", "content": "delta only"}],
+            "stream": True,
+        }
+    )
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            payload,
+            {"session_id": "sid-paused-continuation", "x-codex-turn-state": turn_state},
+        )
+    ]
+
+    event = json.loads(chunks[-1].split("data: ", 1)[1])
+    assert event["type"] == "response.failed"
+    assert event["response"]["error"]["code"] == "previous_response_owner_unavailable"
+    assert len(selection_calls) == 1
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+    assert request_logs.calls[-1]["error_code"] == "previous_response_owner_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_empty_upstream_emits_terminal_failure(monkeypatch):
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()
