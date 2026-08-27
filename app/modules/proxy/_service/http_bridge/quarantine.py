@@ -35,6 +35,7 @@ _HTTP_BRIDGE_QUARANTINE_MAX_ENTRIES = 1024
 
 _HTTP_BRIDGE_QUARANTINE_WEDGED_REATTACH_REASON = "reattach_missing_response_created"
 _HTTP_BRIDGE_QUARANTINE_REPEATED_EVENTLESS_REASON = "repeated_eventless_timeout"
+_HTTP_BRIDGE_QUARANTINE_CONTINUITY_LOSS_REASON = "full_resend_anchor_rejected"
 
 
 @dataclass(slots=True)
@@ -167,6 +168,25 @@ def _record_http_bridge_quarantine_eventless_timeout(service: Any, session: _HTT
         session,
         reason=_HTTP_BRIDGE_QUARANTINE_REPEATED_EVENTLESS_REASON,
     )
+
+
+def _record_http_bridge_quarantine_continuity_loss(
+    service: Any,
+    session: _HTTPBridgeSession,
+    request_state: _WebSocketRequestState,
+) -> bool:
+    """Fence a rejected proxy anchor when the request carries full history."""
+    if not (
+        getattr(request_state, "proxy_injected_previous_response_id", False)
+        and getattr(request_state, "proxy_injected_anchor_had_full_resend_payload", False)
+    ):
+        return False
+    _quarantine_http_bridge_session(
+        service,
+        session,
+        reason=_HTTP_BRIDGE_QUARANTINE_CONTINUITY_LOSS_REASON,
+    )
+    return True
 
 
 def _clear_http_bridge_quarantine(service: Any, session: _HTTPBridgeSession) -> None:

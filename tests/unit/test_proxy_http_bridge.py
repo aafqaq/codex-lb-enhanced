@@ -20752,6 +20752,8 @@ async def test_process_http_bridge_upstream_text_masks_previous_response_not_fou
         event_queue=asyncio.Queue(),
         transport="http",
         skip_request_log=True,
+        proxy_injected_previous_response_id=True,
+        proxy_injected_anchor_had_full_resend_payload=True,
     )
     session = proxy_service._HTTPBridgeSession(
         key=proxy_service._HTTPBridgeSessionKey("session_header", "sid-123", None),
@@ -20814,6 +20816,7 @@ async def test_process_http_bridge_upstream_text_masks_previous_response_not_fou
     assert request_state.previous_response_not_found_rewritten is True
     assert session.pending_requests == deque()
     assert session.queued_request_count == 0
+    assert http_bridge_quarantine_module._http_bridge_session_key_quarantined(service, session.key) is True
 
 
 @pytest.mark.asyncio
@@ -30782,6 +30785,37 @@ def test_http_bridge_quarantine_marks_key_and_expires_by_ttl(caplog: pytest.LogC
     )
     assert http_bridge_quarantine_module._http_bridge_session_key_quarantined(service, session.key) is False
     assert session.key not in http_bridge_quarantine_module._http_bridge_quarantine_registry(service)
+
+
+@pytest.mark.parametrize(
+    ("proxy_injected", "full_resend", "expected"),
+    [
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_http_bridge_quarantine_continuity_loss_only_fences_injected_full_resend(
+    proxy_injected: bool,
+    full_resend: bool,
+    expected: bool,
+) -> None:
+    service = SimpleNamespace()
+    session = _make_bridge_session(key_value="quarantine-continuity-loss")
+    request_state = SimpleNamespace(
+        proxy_injected_previous_response_id=proxy_injected,
+        proxy_injected_anchor_had_full_resend_payload=full_resend,
+    )
+
+    assert (
+        http_bridge_quarantine_module._record_http_bridge_quarantine_continuity_loss(
+            service,
+            session,
+            request_state,
+        )
+        is expected
+    )
+    assert http_bridge_quarantine_module._http_bridge_session_key_quarantined(service, session.key) is expected
 
 
 def test_http_bridge_quarantine_registry_is_size_bounded() -> None:

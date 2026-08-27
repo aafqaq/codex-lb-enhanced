@@ -1644,6 +1644,120 @@ def test_full_resend_retained_output_tolerates_fresh_developer_after_user() -> N
     )
 
 
+def test_full_resend_interrupted_commentary_accepts_matching_fresh_turn() -> None:
+    stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
+    suffix: list[JsonValue] = [
+        {
+            "type": "message",
+            "id": "msg_commentary",
+            "role": "assistant",
+            "phase": "commentary",
+            "status": "completed",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn_previous"},
+            "content": [{"type": "output_text", "text": "partial but retained context"}],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn_recovery"},
+            "content": [{"type": "input_text", "text": "continue"}],
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn_recovery"},
+            "content": [{"type": "input_text", "text": "current environment"}],
+        },
+    ]
+
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        [*stored_input, *suffix],
+        stored_count=len(stored_input),
+        preserve_developer_message_ids=True,
+    )
+
+    assert projection is not None
+    assert responses_input_suffix_retains_prior_output(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+    )
+
+
+def test_full_resend_interrupted_commentary_rejects_mismatched_fresh_turn() -> None:
+    stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
+    suffix: list[JsonValue] = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "partial"}],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn_user"},
+            "content": [{"type": "input_text", "text": "continue"}],
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn_other"},
+            "content": [{"type": "input_text", "text": "current environment"}],
+        },
+    ]
+
+    assert not responses_input_suffix_retains_prior_output(
+        [*stored_input, *suffix],
+        stored_count=len(stored_input),
+    )
+
+
+def test_full_resend_accepts_and_normalizes_codex_client_turn_metadata() -> None:
+    metadata = {
+        "turn_id": "turn_recovery",
+        "create_time": 1787754724.7678144,
+        "content_item_kinds": ["user.text"],
+    }
+    input_items: list[JsonValue] = [
+        {"role": "user", "content": "first question"},
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "partial"}],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "internal_chat_message_metadata_passthrough": metadata,
+            "content": "continue",
+        },
+        {
+            "type": "message",
+            "role": "developer",
+                "internal_chat_message_metadata_passthrough": {
+                    **metadata,
+                    "content_item_kinds": ["environments.environment_context"],
+                },
+            "content": [{"type": "input_text", "text": "environment"}],
+        },
+    ]
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=1,
+    )
+    assert projection is not None
+    assert responses_input_suffix_retains_prior_output(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+    )
+    for item in projection.input_items:
+        if isinstance(item, dict) and item.get("internal_chat_message_metadata_passthrough") is not None:
+            assert item["internal_chat_message_metadata_passthrough"] == {"turn_id": "turn_recovery"}
+
+
 def test_full_resend_retained_output_accepts_canonical_lite_prefix_developer_without_pending_call() -> None:
     stored_input: list[JsonValue] = [
         {
@@ -1957,7 +2071,7 @@ def test_full_resend_retained_output_rejects_response_owned_fresh_developer() ->
                     "content": [{"type": "input_text", "text": "control after commentary"}],
                 },
             ],
-            id="developer-after-assistant-commentary",
+            id="commentary-with-unidentified-user-turn",
         ),
     ],
 )

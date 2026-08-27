@@ -73,6 +73,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
 )
 from app.modules.proxy._service.http_bridge.quarantine import (
     _clear_http_bridge_quarantine,
+    _record_http_bridge_quarantine_continuity_loss,
     _record_http_bridge_quarantine_eventless_timeout,
     _record_http_bridge_quarantine_wedged_pending,
 )
@@ -1053,6 +1054,17 @@ class _HTTPBridgeUpstreamEventsMixin:
         # ``response_event_count == 0`` and never trip on it, so quarantine
         # the session here so later requests stop re-attaching to it.
         _record_http_bridge_quarantine_wedged_pending(self, session, pending_request_states)
+        # An unclean close can be the upstream's way of rejecting an exhausted
+        # or otherwise invalid account-bound continuation.  If the request
+        # already carried a complete client transcript, fence the stale
+        # injected anchor before the next client retry; otherwise the retry
+        # would be reattached and trimmed again instead of walking the pool.
+        for pending_request_state in pending_request_states:
+            _record_http_bridge_quarantine_continuity_loss(
+                self,
+                session,
+                pending_request_state,
+            )
         observed_close_code = (
             upstream_close_code if upstream_close_code is not None else session.last_upstream_close_code
         )
@@ -2425,6 +2437,16 @@ class _HTTPBridgeUpstreamEventsMixin:
 
         if status_request_state is not None and is_previous_response_not_found_event:
             status_request_state.error_http_status_override = 502
+            # If the bridge injected an anchor into a request that already
+            # contained the client's complete transcript, the next client
+            # retry must stay unanchored.  Otherwise the durable/session
+            # lookup can inject the same rejected ID again and trim the full
+            # history back to a tiny suffix (the 502 -> 3 incident).
+            _record_http_bridge_quarantine_continuity_loss(
+                self,
+                session,
+                status_request_state,
+            )
             status_request_state.previous_response_not_found_rewritten = (
                 response_id is None and not has_other_pending_requests
             )
