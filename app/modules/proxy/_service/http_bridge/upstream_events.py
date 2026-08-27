@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -208,11 +209,51 @@ from app.modules.proxy.tool_call_dedupe import (
     mark_duplicate_tool_call_downstream_event,
     rewrite_parallel_tool_call_text,
 )
+from app.modules.proxy.replay_safety import (
+    project_responses_payload_for_account_neutral_quota_replay,
+)
 from app.modules.proxy.tool_call_dedupe import (
     response_id_from_payload as tool_call_response_id_from_payload,
 )
 
 logger = logging.getLogger("app.modules.proxy.service")
+
+
+def _quota_replay_text_for_client_full_resend(
+    request_state: "_WebSocketRequestState",
+) -> str | None:
+    """Project a client full resend into a portable quota replay body.
+
+    A client retry may still carry ``previous_response_id`` after the old
+    owner rejected it.  In that case the normal strict continuity classifier
+    intentionally fails closed (reasoning ids and file references are not
+    portable by themselves), but a definitive pre-dispatch quota response
+    proves the operation was never accepted and permits a fresh replay
+    projection.  The projection retains file references for upstream
+    validation while dropping response-owned bookkeeping and the stale anchor.
+    """
+
+    source_text = (
+        request_state.fresh_upstream_request_text
+        if request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
+        else request_state.request_text
+    )
+    if not isinstance(source_text, str):
+        return None
+    try:
+        source_payload = json.loads(source_text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(source_payload, dict):
+        return None
+    projected_payload = project_responses_payload_for_account_neutral_quota_replay(source_payload)
+    if projected_payload is None:
+        return None
+    return json.dumps(
+        {"type": "response.create", **projected_payload},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
 
 _HTTP_BRIDGE_RECOVERY_SETTLEMENT_RETRY_DELAYS = (
     0.25,
@@ -2641,6 +2682,84 @@ class _HTTPBridgeUpstreamEventsMixin:
             )
             if status_request_state is not None:
                 setattr(status_request_state, "account_health_error_handled", True)
+            quota_replay_text = (
+                _quota_replay_text_for_client_full_resend(status_request_state)
+                if status_request_state is not None
+                else None
+            )
+            if (
+                quota_replay_text is not None
+                and status_request_state is not None
+                and not has_other_pending_requests
+            ):
+                # The client supplied a full transcript, but its stale
+                # previous_response_id is tied to the exhausted owner.  A
+                # definitive pre-dispatch quota response makes this safe to
+                # project into a fresh request for another account.
+                old_account_id = session.account.id
+                previous_upstream_turn_state = session.upstream_turn_state
+                previous_downstream_turn_state = session.downstream_turn_state
+                session.upstream_turn_state = None
+                session.downstream_turn_state = None
+                await self._release_request_state_account_response_create_lease(status_request_state)
+                status_request_state.excluded_account_ids.add(old_account_id)
+                status_request_state.affinity_policy = replace(
+                    status_request_state.affinity_policy,
+                    reallocate_sticky=True,
+                )
+                status_request_state.request_text = quota_replay_text
+                status_request_state.previous_response_id = None
+                status_request_state.proxy_injected_previous_response_id = False
+                status_request_state.fresh_upstream_request_text = None
+                status_request_state.fresh_upstream_request_is_retry_safe = False
+                status_request_state.file_required_preferred_account = False
+                status_request_state.preferred_account_id = None
+                status_request_state.operation_rebind_required = True
+                status_request_state.account_exhaustion_replay_count += 1
+                status_request_state.last_account_exhaustion_error_message = (
+                    retry_error_message or "The usage limit has been reached"
+                )
+                status_request_state.awaiting_response_created = True
+                status_request_state.response_id = None
+                status_request_state.response_event_count = 0
+                async with session.pending_lock:
+                    if status_request_state not in session.pending_requests:
+                        session.pending_requests.appendleft(status_request_state)
+                        session.queued_request_count += 1
+                _log_http_bridge_event(
+                    "quota_failover_reconnect",
+                    session.key,
+                    account_id=old_account_id,
+                    model=session.request_model,
+                    pending_count=1,
+                    detail=(
+                        f"source=client_full_resend excluded_count={len(status_request_state.excluded_account_ids)} "
+                        "previous_response_id_stripped=true"
+                    ),
+                    cache_key_family=session.key.affinity_kind,
+                    model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                )
+                retried = await self._retry_http_bridge_precreated_request(
+                    session,
+                    request_state=status_request_state,
+                    allow_account_exhaustion_failover=True,
+                )
+                if retried:
+                    return
+                session.upstream_turn_state = previous_upstream_turn_state
+                session.downstream_turn_state = previous_downstream_turn_state
+                async with session.pending_lock:
+                    if status_request_state in session.pending_requests:
+                        session.pending_requests.remove(status_request_state)
+                        session.queued_request_count = max(0, session.queued_request_count - 1)
+                status_request_state.error_http_status_override = 429
+                status_request_state.error_code_override = owner_pinned_quota_error
+                status_request_state.error_message_override = (
+                    retry_error_message or "The usage limit has been reached"
+                )
+                status_request_state.error_type_override = (
+                    _websocket_event_error_type(event_type, payload) or owner_pinned_quota_error
+                )
             if (
                 status_request_state is not None
                 and status_request_state.previous_response_id is not None
