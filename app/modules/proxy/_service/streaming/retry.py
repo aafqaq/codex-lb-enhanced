@@ -401,6 +401,12 @@ class _StreamingRetryMixin:
         excluded_account_ids: set[str] = set()
         transient_failed_account_id: str | None = None
         hard_affinity_same_owner_retry_attempted = False
+        # A paused hard sticky owner must not trap the request in the generic
+        # capacity wait loop.  We allow one explicit reallocation/recovery
+        # pass, then surface a bounded continuity error when no safe replay
+        # exists.  This keeps the normal load-balancer policy untouched for
+        # all other selection failures.
+        hard_affinity_recovery_attempted = False
         deferred_capacity_account: Account | None = None
         deferred_capacity_lease: AccountLease | None = None
         preferred_account_id: str | None = None
@@ -1236,6 +1242,112 @@ class _StreamingRetryMixin:
                             transient_failed_account_id,
                         )
                         continue
+                    if not account and selection.error_code == "hard_affinity_saturated":
+                        effective_owner_id = effective_preferred_account_id
+                        can_use_verified_replay = bool(
+                            verified_fresh_replay_payload is not None
+                            and responses_payload_is_account_neutral_fresh_replay(
+                                verified_fresh_replay_payload.to_replay_safety_payload()
+                            )
+                        )
+                        if can_use_verified_replay and not hard_affinity_recovery_attempted:
+                            moved = False
+                            if effective_owner_id is not None:
+                                moved = _move_verified_fresh_replay_from_owner(
+                                    account_id=effective_owner_id,
+                                    outcome="hard_affinity_owner_unavailable",
+                                )
+                            if not moved:
+                                # A hard CODEX_SESSION mapping can be resolved
+                                # inside the balancer even when no explicit
+                                # preferred owner was supplied to this layer.
+                                # The validated full replay is still safe to
+                                # dispatch account-neutrally in that case.
+                                payload = verified_fresh_replay_payload
+                                verified_fresh_replay_payload = None
+                                payload_replay_required_account_id = None
+                                if effective_owner_id is not None:
+                                    excluded_account_ids.add(effective_owner_id)
+                                preferred_account_id = None
+                                require_preferred_account = False
+                                affinity = replace(affinity, reallocate_sticky=True)
+                                moved = True
+                            if moved:
+                                hard_affinity_recovery_attempted = True
+                                logger.warning(
+                                    "Retrying stream with verified account-neutral replay after hard affinity "
+                                    "owner unavailable request_id=%s owner_account_id=%s",
+                                    request_id,
+                                    effective_owner_id,
+                                )
+                                continue
+                        if not hard_affinity_recovery_attempted:
+                            # First-turn payloads already contain the complete
+                            # client input, so one sticky reallocation is safe.
+                            # Continuations without a verified replay remain
+                            # owner-bound and must fail closed instead of
+                            # silently dropping previous-response context.
+                            if (
+                                not effective_require_preferred_account
+                                and payload.previous_response_id is None
+                                and file_preferred_account_id is None
+                            ):
+                                hard_affinity_recovery_attempted = True
+                                affinity = replace(affinity, reallocate_sticky=True)
+                                logger.warning(
+                                    "Reallocating paused hard affinity owner for first-turn request_id=%s",
+                                    request_id,
+                                )
+                                continue
+                            hard_affinity_recovery_attempted = True
+                        await _drain_pending_post_refresh_penalty_on_terminal(settlement)
+                        recovery_error_code = (
+                            "previous_response_owner_unavailable"
+                            if effective_require_preferred_account or payload.previous_response_id is not None
+                            else "upstream_unavailable"
+                        )
+                        recovery_message = (
+                            "Previous response owner account is unavailable; retry later."
+                            if recovery_error_code == "previous_response_owner_unavailable"
+                            else "Hard affinity owner account is unavailable; retry later."
+                        )
+                        await proxy._write_request_log(
+                            account_id=effective_owner_id,
+                            api_key=api_key,
+                            request_id=request_id,
+                            model=payload.model,
+                            latency_ms=int((time.monotonic() - start) * 1000),
+                            status="error",
+                            error_code=recovery_error_code,
+                            error_message=recovery_message,
+                            reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+                            transport=request_transport,
+                            upstream_transport=upstream_stream_transport,
+                            service_tier=payload.service_tier,
+                            requested_service_tier=payload.service_tier,
+                            useragent=useragent,
+                            useragent_group=useragent_group,
+                            conversation_id=conversation_id,
+                            client_ip=client_ip,
+                        )
+                        if propagate_http_errors:
+                            raise ProxyResponseError(
+                                503,
+                                openai_error(
+                                    recovery_error_code,
+                                    recovery_message,
+                                    error_type="server_error",
+                                ),
+                            )
+                        yield format_sse_event(
+                            response_failed_event(
+                                recovery_error_code,
+                                recovery_message,
+                                error_type="server_error",
+                                response_id=request_id,
+                            )
+                        )
+                        return
                     if (
                         not account
                         and selection.error_code != USAGE_LIMIT_REACHED
