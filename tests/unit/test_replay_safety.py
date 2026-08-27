@@ -10,10 +10,58 @@ from app.modules.proxy.continuity import (
 )
 from app.modules.proxy.replay_safety import (
     project_responses_input_for_account_neutral_fresh_replay,
+    project_responses_payload_for_account_neutral_quota_replay,
     responses_input_suffix_matches_pending_tool_calls,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
 )
+
+
+def test_quota_replay_projection_strips_codex_account_bound_bookkeeping() -> None:
+    payload: dict[str, JsonValue] = {
+        "_extra": {"opaque": "client-only"},
+        "model": "gpt-5.6-sol",
+        "reasoning": {"effort": "xhigh", "summary": "detailed", "context": "all_turns"},
+        "client_metadata": {"unsupported": "account-bound"},
+        "input": [
+            {"type": "message", "id": "msg_1", "role": "user", "content": "hello"},
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "account-scoped",
+                "summary": [],
+            },
+            {
+                "type": "custom_tool_call",
+                "id": "call_1",
+                "call_id": "call_1",
+                "name": "exec",
+                "input": "pwd",
+                "status": "completed",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "output_1",
+                "call_id": "call_1",
+                "output": "/tmp",
+                "status": "completed",
+            },
+        ],
+    }
+
+    projected = project_responses_payload_for_account_neutral_quota_replay(payload)
+
+    assert projected is not None
+    assert "_extra" not in projected
+    assert projected["reasoning"] == {"effort": "xhigh", "summary": "detailed"}
+    assert "client_metadata" not in projected
+    assert responses_payload_is_account_neutral_fresh_replay(projected)
+    assert [item["type"] for item in projected["input"] if isinstance(item, dict)] == [
+        "message",
+        "custom_tool_call",
+        "custom_tool_call_output",
+    ]
+    assert all("id" not in item for item in projected["input"] if isinstance(item, dict))
 
 
 @pytest.mark.parametrize(

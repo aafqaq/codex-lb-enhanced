@@ -25,10 +25,14 @@ _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
 _CODEX_CLIENT_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset(
     {"turn_id", "create_time", "content_item_kinds"}
 )
-_ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "web_search", "web_search_preview"})
+_ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "namespace", "web_search", "web_search_preview"})
 _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS = {
     "custom": frozenset({"description", "format", "name", "type"}),
     "function": frozenset({"description", "name", "parameters", "strict", "type"}),
+    # Codex desktop sends its built-in tool bundles as namespace declarations
+    # nested inside an ``additional_tools`` input item.  The namespace itself
+    # carries no account state; validate every nested declaration recursively.
+    "namespace": frozenset({"description", "name", "tools", "type"}),
     "web_search": frozenset({"filters", "search_context_size", "type", "user_location"}),
     "web_search_preview": frozenset({"filters", "search_context_size", "type", "user_location"}),
 }
@@ -783,6 +787,86 @@ def responses_payload_is_account_neutral_fresh_replay(payload: Mapping[str, Json
     return _tools_are_account_neutral(tools)
 
 
+def project_responses_payload_for_account_neutral_quota_replay(
+    payload: Mapping[str, JsonValue],
+) -> dict[str, JsonValue] | None:
+    """Build a portable fresh request after a definitive pre-dispatch quota error.
+
+    Codex Desktop includes proxy/client bookkeeping in a full continuation
+    frame (for example ``_extra``, encrypted reasoning items and rich
+    ``client_metadata``).  Those values are either account-scoped or rejected
+    by a different upstream account.  A quota response is definitive before
+    any response event is emitted, so it is safe to replay only the portable
+    conversation/tool transcript on another account.
+    """
+
+    if not isinstance(payload, Mapping):
+        return None
+    projected: dict[str, JsonValue] = {}
+    # Keep only fields understood by the Responses endpoint.  Continuation
+    # anchors and proxy-only metadata are intentionally omitted.
+    omitted = {
+        "conversation",
+        "previous_response_id",
+        "prompt",
+        "metadata",
+        "prompt_cache_key",
+        "include",
+    }
+    for key in _RESPONSES_PAYLOAD_FIELDS_WITH_DEDICATED_VALIDATION:
+        if key in omitted or key not in payload:
+            continue
+        value = payload[key]
+        if key == "reasoning":
+            if isinstance(value, dict):
+                reasoning = {
+                    field: field_value
+                    for field, field_value in value.items()
+                    if field in _ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS
+                }
+                if reasoning:
+                    projected[key] = reasoning
+            continue
+        if key == "client_metadata":
+            if isinstance(value, dict):
+                metadata = {
+                    field: field_value
+                    for field, field_value in value.items()
+                    if field in _ACCOUNT_NEUTRAL_CLIENT_METADATA_FIELDS
+                }
+                if metadata:
+                    projected[key] = metadata
+            continue
+        if key == "input":
+            if isinstance(value, list):
+                items: list[JsonValue] = []
+                for item in value:
+                    projected_item = _project_account_neutral_replay_item(
+                        item,
+                        preserve_developer_message_ids=False,
+                    )
+                    if projected_item is not None:
+                        items.append(projected_item)
+                projected[key] = items
+            elif isinstance(value, str):
+                projected[key] = value
+            else:
+                return None
+        elif key == "tools":
+            # Hosted/account-bound tools cannot be moved.  Do not silently
+            # drop a tool declaration that the model may rely on.
+            if value is not None and not _tools_are_account_neutral(value):
+                return None
+            projected[key] = value
+        else:
+            projected[key] = value
+    if "input" not in projected:
+        return None
+    if not responses_payload_is_account_neutral_fresh_replay(projected):
+        return None
+    return projected
+
+
 def _reasoning_config_is_account_neutral(reasoning: JsonValue | None) -> bool:
     if reasoning is None:
         return True
@@ -858,6 +942,8 @@ def _tool_declaration_is_account_neutral(tool: Mapping[str, JsonValue]) -> bool:
         return False
     if tool.get("description") is not None and not isinstance(tool.get("description"), str):
         return False
+    if tool_type == "namespace":
+        return _is_nonblank_string(tool.get("name")) and _tools_are_account_neutral(tool.get("tools"))
     if tool_type == "function":
         return (tool.get("parameters") is None or isinstance(tool.get("parameters"), dict)) and (
             tool.get("strict") is None or isinstance(tool.get("strict"), bool)
