@@ -86,6 +86,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_request_counts_against_queue,
     _http_bridge_retry_circuit_attempt_selection_for_pending_requests,
     _log_http_bridge_event,
+    _persistent_http_bridge_affinity,
     _record_continuity_fail_closed,
     _record_http_bridge_prewarm_outcome,
     _register_http_bridge_turn_state_aliases_locked,
@@ -224,6 +225,31 @@ from app.modules.proxy.replay_safety import (
 from app.modules.proxy.tool_call_dedupe import (
     dedupe_replayed_side_effect_input_items,
 )
+
+
+async def _rebind_http_bridge_affinity_after_account_failover(
+    service: Any,
+    session: "_HTTPBridgeSession",
+    previous_affinity: Any,
+) -> None:
+    """Move a durable sticky owner after a definitive pre-dispatch quota failover."""
+    selection_key = getattr(previous_affinity, "selection_key", None)
+    affinity_kind = getattr(previous_affinity, "kind", None)
+    # A live turn-state promotion may leave source metadata unset; the
+    # key/kind pair on the session is still authoritative for this fenced
+    # failover and must be rebound to the replacement account.
+    if selection_key and affinity_kind is not None:
+        async with service._repo_factory() as repos:
+            await repos.sticky_sessions.upsert(
+                selection_key,
+                session.account.id,
+                kind=affinity_kind,
+            )
+    session.affinity = _persistent_http_bridge_affinity(previous_affinity)
+    session.codex_session = bool(
+        getattr(previous_affinity, "kind", None) == StickySessionKind.CODEX_SESSION
+        or session.key.affinity_kind == "thread_header"
+    )
 
 logger = logging.getLogger("app.modules.proxy.service")
 
@@ -3274,6 +3300,29 @@ class _HTTPBridgeRequestSubmitMixin:
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
         reconnect_reader_kwargs = {"restart_reader": True} if restart_reader else {}
+        # A definitive pre-dispatch quota rejection is the one case where a
+        # hard Codex session owner must be bypassed for this retry.  Do not
+        # pass the old key/kind into the selector: ``reallocate_sticky`` only
+        # permits rebinding after the hard owner has been resolved, it does
+        # not turn a hard owner into a pool preference.  We rebind the durable
+        # sticky row after the replacement is connected below.
+        quota_failover_owner_account_id = session.account.id if quota_hard_account_switch else None
+        quota_failover_previous_affinity = session.affinity if quota_hard_account_switch else None
+        quota_failover_selection_affinity = (
+            replace(
+                request_state.affinity_policy,
+                key=None,
+                kind=None,
+                reallocate_sticky=True,
+                codex_session_source=None,
+                legacy_codex_session_key=None,
+                legacy_continuity_source=None,
+                seed_selection_key=None,
+                seed_selection_kind=None,
+            )
+            if quota_hard_account_switch
+            else None
+        )
         try:
             if retry_jitter_seconds > 0:
                 logger.info(
@@ -3339,9 +3388,19 @@ class _HTTPBridgeRequestSubmitMixin:
                 await self._reconnect_http_bridge_session(
                     session,
                     request_state=request_state,
-                    selection_affinity=request_state.affinity_policy,
+                    selection_affinity=quota_failover_selection_affinity,
                     **reconnect_reader_kwargs,
                 )
+                if (
+                    quota_failover_owner_account_id is not None
+                    and quota_failover_previous_affinity is not None
+                    and session.account.id != quota_failover_owner_account_id
+                ):
+                    await _rebind_http_bridge_affinity_after_account_failover(
+                        self,
+                        session,
+                        quota_failover_previous_affinity,
+                    )
             elif hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
                 await self._reconnect_http_bridge_session(
                     session,
@@ -3376,7 +3435,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     # Pass the request's reallocation policy explicitly;
                     # otherwise reconnect falls back to the session's hard
                     # sticky policy and waits forever for the exhausted owner.
-                    selection_affinity=(request_state.affinity_policy if quota_hard_account_switch else None),
+                    selection_affinity=(quota_failover_selection_affinity if quota_hard_account_switch else None),
                     **reconnect_reader_kwargs,
                 )
             if request_state.account_response_create_lease is None:
