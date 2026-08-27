@@ -757,7 +757,7 @@ from app.modules.proxy.repo_bundle import ProxyRepoFactory
 from app.modules.proxy.ring_membership import (
     RingMembershipService,
 )
-from app.modules.proxy.selection_errors import selection_failure_response
+from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 from app.modules.proxy.work_admission import WorkAdmissionController
 
 logger = logging.getLogger(__name__)
@@ -1896,7 +1896,15 @@ class ProxyService(
                         traffic_class=effective_traffic_class,
                         concurrency_caps=concurrency_caps,
                         redact_sensitive_details=redact_sensitive_details,
-                        allow_usage_exhaustion_error=not required_preferred_account,
+                        # Always preserve the structured quota cause, even for
+                        # a hard continuity owner.  Recovery is transport and
+                        # payload-safety driven, never client-kind driven: each
+                        # protocol can either replay a proven account-neutral
+                        # body or surface the native terminal quota response.
+                        # Collapsing this into ``No available accounts`` here
+                        # loses the distinction before any protocol handler can
+                        # attempt a safe account switch.
+                        allow_usage_exhaustion_error=True,
                         api_key_id=api_key_id,
                         api_key_stream_fair_share_threshold_pct=api_key_fair_share_threshold_pct,
                     )
@@ -1909,6 +1917,17 @@ class ProxyService(
                             log_account_id(preferred_account_id),
                         )
                         return preferred_selection
+                    if preferred_selection.error_code == USAGE_LIMIT_REACHED:
+                        logger.warning(
+                            "Proxy preferred account quota exhausted request_id=%s kind=%s "
+                            "request_stage=%s preferred_account_id=%s resets_at=%s error=%s",
+                            request_id,
+                            kind,
+                            request_stage,
+                            log_account_id(preferred_account_id),
+                            preferred_selection.resets_at,
+                            preferred_selection.error_message,
+                        )
                     if not fallback_on_preferred_account_unavailable:
                         logger.warning(
                             "Proxy preferred account unavailable request_id=%s kind=%s request_stage=%s "

@@ -229,6 +229,7 @@ from app.modules.proxy.durable_bridge_repository import durable_bridge_hash
 from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
 from app.modules.proxy.helpers import (
     _normalize_error_code,
+    upstream_usage_limit_error_code,
 )
 from app.modules.proxy.replay_safety import (
     project_responses_input_for_account_neutral_fresh_replay,
@@ -568,6 +569,28 @@ def _proxy_error_code_message(exc: ProxyResponseError) -> tuple[str | None, str 
     code = error.get("code")
     message = error.get("message")
     return (str(code) if code is not None else None, str(message) if message is not None else None)
+
+
+def _http_bridge_owner_quota_exhausted(
+    exc: ProxyResponseError,
+    preferred_account_id: str | None,
+) -> bool:
+    """Identify a quota failure raised while selecting a pinned owner.
+
+    A required continuity-owner selection is intentionally scoped to one
+    account.  Before this check was added, the selector's structured
+    ``usage_limit_reached`` result was treated exactly like a missing/dead
+    owner and the request was returned as ``previous_response_owner_unavailable``
+    without entering the Codex replay path.  Only treat it as an owner quota
+    event when a preferred owner was actually present; a pool-wide quota error
+    after account-neutral replay must remain terminal and be surfaced to the
+    client.
+    """
+
+    if preferred_account_id is None:
+        return False
+    code, message = _proxy_error_code_message(exc)
+    return upstream_usage_limit_error_code(code, message) is not None
 
 
 _HTTP_BRIDGE_AMBIGUOUS_RECOVERY_ERROR_CODES = frozenset(
@@ -1879,6 +1902,7 @@ class _HTTPBridgeStreamingMixin:
         )
         fresh_replay_excluded_account_ids: set[str] = set()
         unanchored_fork_spill_attempted = False
+        owner_failure_reason = "owner_unavailable"
 
         def durable_full_resend_allows_account_neutral_replay() -> bool:
             nonlocal durable_full_resend_fresh_payload
@@ -1927,12 +1951,20 @@ class _HTTPBridgeStreamingMixin:
             return durable_full_resend_is_account_neutral
 
         def owner_unavailable_allows_account_neutral_replay(exc: ProxyResponseError) -> bool:
+            nonlocal owner_failure_reason
+            owner_quota_exhausted = _http_bridge_owner_quota_exhausted(
+                exc,
+                request_state.preferred_account_id,
+            )
+            allowed = _http_bridge_is_previous_response_owner_unavailable(exc) or owner_quota_exhausted
+            if allowed:
+                owner_failure_reason = "owner_quota_exhausted" if owner_quota_exhausted else "owner_unavailable"
             return (
-                _http_bridge_is_previous_response_owner_unavailable(exc)
-                and durable_full_resend_allows_account_neutral_replay()
+                allowed and durable_full_resend_allows_account_neutral_replay()
             )
 
         def switch_to_account_neutral_replay() -> None:
+            nonlocal owner_failure_reason
             nonlocal account_neutral_recovery
             nonlocal affinity
             nonlocal bridge_session_key
@@ -1979,10 +2011,14 @@ class _HTTPBridgeStreamingMixin:
                 bridge_session_key,
                 account_id=failed_owner_id,
                 model=payload.model,
-                detail="outcome=projected_plaintext_full_resend_without_anchor",
+                detail=(
+                    "outcome=projected_plaintext_full_resend_without_anchor;"
+                    f"reason={owner_failure_reason}"
+                ),
                 cache_key_family=bridge_session_key.affinity_kind,
                 model_class=_extract_model_class(payload.model) if payload.model else None,
             )
+            owner_failure_reason = "owner_unavailable"
             if failed_owner_id is not None:
                 fresh_replay_excluded_account_ids.add(failed_owner_id)
             session_creation_headers = without_http_bridge_session_affinity_headers(session_creation_headers)

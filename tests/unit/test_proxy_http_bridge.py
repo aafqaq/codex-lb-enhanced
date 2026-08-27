@@ -9012,6 +9012,88 @@ async def test_select_account_with_budget_prefers_durable_account_id_when_availa
 
 
 @pytest.mark.asyncio
+async def test_select_account_with_budget_preserves_owner_quota_for_codex_transports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned owner always returns structured quota exhaustion.
+
+    Recovery is driven by the request's replay proof and protocol semantics,
+    not by a client-kind allowlist.  Every transport needs the structured cause
+    to decide whether it can move accounts or must surface a native terminal.
+    """
+
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    select_account = AsyncMock(
+        return_value=proxy_service.AccountSelection(
+            account=None,
+            error_message="The usage limit has been reached",
+            error_code="usage_limit_reached",
+            resets_at=1_700_003_600,
+        )
+    )
+    service._load_balancer = cast(Any, SimpleNamespace(select_account=select_account))
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: SimpleNamespace(
+            get=AsyncMock(return_value=SimpleNamespace(sticky_reallocation_budget_threshold_pct=95.0))
+        ),
+    )
+
+    selection = await service._select_account_with_budget(
+        time.monotonic() + 60.0,
+        request_id="req-owner-quota",
+        kind="http_bridge",
+        request_stage="reattach",
+        preferred_account_id="acc-exhausted",
+        preferred_account_is_continuity_owner=True,
+        fallback_on_preferred_account_unavailable=False,
+    )
+
+    assert selection.error_code == "usage_limit_reached"
+    assert selection.resets_at == 1_700_003_600
+    selection_call = select_account.await_args
+    assert selection_call is not None
+    assert selection_call.kwargs["allow_usage_exhaustion_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_select_account_with_budget_preserves_owner_quota_for_stream_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    select_account = AsyncMock(
+        return_value=proxy_service.AccountSelection(
+            account=None,
+            error_message="Rate limit exceeded. Try again in 120s",
+            error_code=None,
+        )
+    )
+    service._load_balancer = cast(Any, SimpleNamespace(select_account=select_account))
+    monkeypatch.setattr(
+        proxy_service,
+        "get_settings_cache",
+        lambda: SimpleNamespace(
+            get=AsyncMock(return_value=SimpleNamespace(sticky_reallocation_budget_threshold_pct=95.0))
+        ),
+    )
+
+    await service._select_account_with_budget(
+        time.monotonic() + 60.0,
+        request_id="req-legacy-owner-quota",
+        kind="stream",
+        request_stage="reattach",
+        preferred_account_id="acc-exhausted",
+        preferred_account_is_continuity_owner=True,
+        fallback_on_preferred_account_unavailable=False,
+    )
+
+    selection_call = select_account.await_args
+    assert selection_call is not None
+    assert selection_call.kwargs["allow_usage_exhaustion_error"] is True
+
+
+@pytest.mark.asyncio
 async def test_select_account_with_budget_skips_preferred_account_outside_assignment_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -24446,18 +24528,22 @@ async def test_stream_via_http_bridge_fails_closed_before_file_affinity_when_pre
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("unsafe_replay_input", "replace_retired_gate", "stored_model"),
+    ("unsafe_replay_input", "replace_retired_gate", "stored_model", "owner_error_code"),
     [
-        (None, False, None),
-        (None, False, "gpt-5.3"),
-        (None, True, None),
-        ("conversation", False, None),
-        ("file", False, None),
-        ("missing_prior_output", False, None),
-        ("orphan_output", False, None),
-        ("response_owned_developer", False, None),
-        ("response_owned_stored_developer", False, None),
-        ("missing_owner", False, None),
+        (None, False, None, "previous_response_owner_unavailable"),
+        (None, False, "gpt-5.3", "previous_response_owner_unavailable"),
+        (None, True, None, "previous_response_owner_unavailable"),
+        # A quota-exhausted continuity owner must enter the same proof-gated
+        # account-neutral replay as a dead owner, instead of being returned as
+        # a generic owner-unavailable 502.
+        (None, False, None, "usage_limit_reached"),
+        ("conversation", False, None, "previous_response_owner_unavailable"),
+        ("file", False, None, "previous_response_owner_unavailable"),
+        ("missing_prior_output", False, None, "previous_response_owner_unavailable"),
+        ("orphan_output", False, None, "previous_response_owner_unavailable"),
+        ("response_owned_developer", False, None, "previous_response_owner_unavailable"),
+        ("response_owned_stored_developer", False, None, "previous_response_owner_unavailable"),
+        ("missing_owner", False, None, "previous_response_owner_unavailable"),
     ],
 )
 async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_when_owner_is_unavailable(
@@ -24465,6 +24551,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
     unsafe_replay_input: str | None,
     replace_retired_gate: bool,
     stored_model: str | None,
+    owner_error_code: str,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     account_neutral_classifier = Mock(
@@ -24618,12 +24705,16 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
         latest_input_full_fingerprint=proxy_service._fingerprint_input_items(historical_input),
         model=stored_model,
     )
-    owner_unavailable = ProxyResponseError(
-        502,
+    owner_error = ProxyResponseError(
+        429 if owner_error_code == "usage_limit_reached" else 502,
         proxy_service.openai_error(
-            "previous_response_owner_unavailable",
-            "Previous response owner account is unavailable; retry later.",
-            error_type="server_error",
+            owner_error_code,
+            (
+                "The usage limit has been reached"
+                if owner_error_code == "usage_limit_reached"
+                else "Previous response owner account is unavailable; retry later."
+            ),
+            error_type=("usage_limit_reached" if owner_error_code == "usage_limit_reached" else "server_error"),
         ),
     )
     capacity_unavailable = ProxyResponseError(
@@ -24651,9 +24742,9 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
     replacement_session = _make_bridge_session(key=session.key, key_value=session.key.affinity_key)
     get_or_create = AsyncMock(
         side_effect=(
-            [owner_unavailable, session, replacement_session]
+            [owner_error, session, replacement_session]
             if replace_retired_gate
-            else [owner_unavailable, capacity_unavailable, session]
+            else [owner_error, capacity_unavailable, session]
         )
     )
     captured_request_states: list[proxy_service._WebSocketRequestState] = []
@@ -24744,7 +24835,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
             assert exc_info.value.status_code == 502
             assert exc_info.value.payload["error"]["code"] == "previous_response_owner_unavailable"
         else:
-            assert exc_info.value is owner_unavailable
+            assert exc_info.value is owner_error
         assert get_or_create.await_count == (0 if unsafe_replay_input == "missing_owner" else 1)
         if unsafe_replay_input == "conversation":
             last_call = get_or_create.await_args

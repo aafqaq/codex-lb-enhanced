@@ -839,12 +839,23 @@ def _websocket_precreated_retry_error_code(
         # output (or sequenced frame) was exposed.  ``excluded_account_ids``
         # grows on every retry, so this walks the finite eligible pool and
         # naturally stops when selection reports no remaining account.
+        # A response.created frame is a pre-output acknowledgement and may
+        # precede a quota terminal.  Keep that created-only shape replayable so
+        # the public response can continue on the next account.  Any other
+        # lifecycle event means the model may have started producing output;
+        # fail closed rather than risking duplicate tool/text delivery.
+        created_only_event = (
+            request_state.response_event_count == 1
+            and request_state.response_id is not None
+            and not request_state.awaiting_response_created
+        )
         if (
             has_other_pending_requests
             or request_state.last_downstream_sequence_number is not None
             or request_state.downstream_visible
             or request_state.upstream_model_output_seen
-            or request_state.response_event_count > 0
+            or request_state.response_event_count > 1
+            or (request_state.response_event_count == 1 and not created_only_event)
         ):
             return None
         if request_state.previous_response_id is not None and request_state.preferred_account_id is not None:

@@ -9536,6 +9536,27 @@ def test_backend_responses_websocket_reconnects_after_account_health_failure(app
                     separators=(",", ":"),
                 ),
             ),
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {"type": "response.created", "response": {"id": "resp_ws_second", "status": "in_progress"}},
+                    separators=(",", ":"),
+                ),
+            ),
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_ws_second",
+                            "status": "completed",
+                            "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
         ]
     )
     upstreams = [first_upstream, second_upstream]
@@ -9620,15 +9641,14 @@ def test_backend_responses_websocket_reconnects_after_account_health_failure(app
     with TestClient(app_instance) as client:
         with client.websocket_connect("/backend-api/codex/responses") as websocket:
             websocket.send_text(json.dumps(first_request))
-            failed_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
 
             websocket.send_text(json.dumps(second_request))
             success_events = [json.loads(websocket.receive_text()) for _ in range(2)]
 
-    assert [event["type"] for event in failed_events] == ["response.created", "response.failed"]
-    assert failed_events[1]["response"]["error"]["code"] == "rate_limit_exceeded"
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
     assert [event["type"] for event in success_events] == ["response.created", "response.completed"]
-    assert connect_models == ["gpt-5.1", "gpt-5.2"]
+    assert connect_models == ["gpt-5.1", "gpt-5.1"]
     assert handled_error_codes == ["rate_limit_exceeded"]
     assert first_upstream.closed is True
     _assert_upstream_payloads(
@@ -9647,6 +9667,14 @@ def test_backend_responses_websocket_reconnects_after_account_health_failure(app
     _assert_upstream_payloads(
         second_upstream.sent_text,
         [
+            {
+                "model": "gpt-5.1",
+                "instructions": "",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "first"}]}],
+                "store": False,
+                "include": [],
+                "type": "response.create",
+            },
             {
                 "model": "gpt-5.2",
                 "instructions": "",
