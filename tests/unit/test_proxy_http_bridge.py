@@ -26438,6 +26438,8 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
         account_exhaustion_replay_count=2,
         operation_id="op-quota-rebind",
         operation_rebind_required=True,
+        file_required_preferred_account=True,
+        preferred_account_id="acc-quota-c",
         excluded_account_ids={"acc-quota-a", "acc-quota-b", "acc-quota-c"},
         account_response_create_lease=cast(Any, object()),
         affinity_policy=proxy_service._AffinityPolicy(reallocate_sticky=True),

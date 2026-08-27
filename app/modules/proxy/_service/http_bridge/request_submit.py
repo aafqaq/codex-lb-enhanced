@@ -3342,6 +3342,15 @@ class _HTTPBridgeRequestSubmitMixin:
                     cache_key_family=session.key.affinity_kind,
                     model_class=_extract_model_class(session.request_model) if session.request_model else None,
                 )
+                # File affinity is normally a hard owner because file
+                # finalize calls must stay on their creating account.  This
+                # request was rejected before dispatch, however, so retaining
+                # that owner would make the reattach selector fail immediately
+                # on the account we just excluded.  Keep the file references
+                # in the replay body and let the replacement account validate
+                # them upstream instead of returning the old quota error.
+                request_state.file_required_preferred_account = False
+                request_state.preferred_account_id = None
                 await self._reconnect_http_bridge_session(
                     session,
                     request_state=request_state,
