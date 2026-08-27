@@ -26436,6 +26436,7 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
         operation_rebind_required=True,
         excluded_account_ids={"acc-quota-a", "acc-quota-b", "acc-quota-c"},
         account_response_create_lease=cast(Any, object()),
+        affinity_policy=proxy_service._AffinityPolicy(reallocate_sticky=True),
     )
     session = _make_bridge_session(
         key=proxy_service._HTTPBridgeSessionKey("session_header", "bridge-quota-walk", None),
@@ -26461,6 +26462,11 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
     assert request_state.replay_count == 3
     assert request_state.excluded_account_ids == {"acc-quota-a", "acc-quota-b", "acc-quota-c"}
     reconnect.assert_awaited_once()
+    reconnect_call = reconnect.await_args
+    assert reconnect_call is not None
+    # A quota exhaustion retry must override the session's hard sticky owner;
+    # otherwise the selector repeatedly chooses the exhausted account.
+    assert reconnect_call.kwargs["selection_affinity"].reallocate_sticky is True
 
 
 @pytest.mark.asyncio
