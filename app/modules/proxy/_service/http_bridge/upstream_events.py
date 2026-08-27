@@ -2776,6 +2776,54 @@ class _HTTPBridgeUpstreamEventsMixin:
                         status_request_state.affinity_policy,
                         reallocate_sticky=True,
                     )
+                    # A 429 usage-limit event arrives before response.created
+                    # and is definitive evidence that this operation was not
+                    # accepted by the current upstream account.  Durable
+                    # operation rows are normally account-bound to prevent
+                    # duplicate sends, but this pre-dispatch rejection is the
+                    # safe exception: mark the row failed and allow the same
+                    # proxy operation identity to be rebound to the next
+                    # eligible account.  Without this, request_submit sees an
+                    # existing operation id and incorrectly enforces the
+                    # exhausted account as the continuity owner.
+                    operation_id = getattr(status_request_state, "operation_id", None)
+                    session_id = getattr(session, "durable_session_id", None)
+                    owner_epoch = getattr(session, "durable_owner_epoch", None)
+                    update_operation = getattr(self._durable_bridge, "update_operation", None)
+                    if (
+                        operation_id
+                        and session_id is not None
+                        and owner_epoch is not None
+                        and callable(update_operation)
+                    ):
+                        try:
+                            marked_failed = await update_operation(
+                                operation_id=operation_id,
+                                session_id=session_id,
+                                instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                                owner_epoch=owner_epoch,
+                                state="failed",
+                            )
+                            if not marked_failed:
+                                logger.info(
+                                    "HTTP bridge quota retry operation row was not marked failed; treating it as "
+                                    "rebindable "
+                                    "for this fenced session operation_id=%s",
+                                    operation_id,
+                                )
+                        except Exception:
+                            # The session owner fence still protects the
+                            # subsequent record_operation call.  Keep the
+                            # retry path alive; if the row is present, the
+                            # durable layer will fail closed rather than
+                            # dispatching a duplicate operation.
+                            logger.warning(
+                                "Failed to mark HTTP bridge quota operation failed before account failover "
+                                "operation_id=%s",
+                                operation_id,
+                                exc_info=True,
+                            )
+                    status_request_state.operation_rebind_required = True
                     status_request_state.account_exhaustion_replay_count += 1
                     status_request_state.last_account_exhaustion_error_message = (
                         retry_error_message or "The usage limit has been reached"
