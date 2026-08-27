@@ -31244,8 +31244,10 @@ async def test_retire_stale_pending_http_bridge_session_quarantines_wedged_reatt
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("durable_lookup_available", [True, False], ids=["lookup", "lookup-race"])
 async def test_stream_http_bridge_quarantined_full_resend_stays_unanchored_when_reattach_gate_already_false(
     monkeypatch: pytest.MonkeyPatch,
+    durable_lookup_available: bool,
 ) -> None:
     """The quarantine suppression must be evaluated independently of the
     fresh-reattach eligibility gate: when that gate is already false (here a
@@ -31382,7 +31384,11 @@ async def test_stream_http_bridge_quarantined_full_resend_stays_unanchored_when_
     monkeypatch.setattr(http_bridge_streaming_module, "_service_get_settings", _make_app_settings)
     monkeypatch.setattr(http_bridge_streaming_module, "_http_bridge_runtime_config", lambda *args: runtime_config)
     monkeypatch.setattr(service, "_resolve_file_account_for_responses", AsyncMock(return_value=None))
-    monkeypatch.setattr(service._durable_bridge, "lookup_request_targets", AsyncMock(return_value=durable_lookup))
+    monkeypatch.setattr(
+        service._durable_bridge,
+        "lookup_request_targets",
+        AsyncMock(return_value=durable_lookup if durable_lookup_available else None),
+    )
     # The bypass shape: a live (alias) session makes the fresh-reattach
     # durable-anchor gate false before the quarantine is ever consulted.
     monkeypatch.setattr(service, "_http_bridge_has_live_local_session", AsyncMock(return_value=True))
