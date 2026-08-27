@@ -218,6 +218,9 @@ from app.modules.proxy.helpers import (
     _parse_openai_error,
 )
 from app.modules.proxy.load_balancer import effective_account_concurrency_caps
+from app.modules.proxy.replay_safety import (
+    project_responses_payload_for_account_neutral_quota_replay,
+)
 from app.modules.proxy.tool_call_dedupe import (
     dedupe_replayed_side_effect_input_items,
 )
@@ -3007,6 +3010,32 @@ class _HTTPBridgeRequestSubmitMixin:
             key=session.key.affinity_key,
         )
 
+        def quota_failover_replay_text(candidate: _WebSocketRequestState) -> str | None:
+            """Project a definitive pre-dispatch quota retry onto portable state."""
+            if not allow_account_exhaustion_failover or candidate.response_event_count != 0:
+                return None
+            source_text = (
+                candidate.fresh_upstream_request_text
+                if candidate.fresh_upstream_request_is_retry_safe and candidate.fresh_upstream_request_text
+                else candidate.request_text
+            )
+            if not isinstance(source_text, str):
+                return None
+            try:
+                source_payload = json.loads(source_text)
+            except (TypeError, json.JSONDecodeError):
+                return None
+            if not isinstance(source_payload, dict):
+                return None
+            projected_payload = project_responses_payload_for_account_neutral_quota_replay(source_payload)
+            if projected_payload is None:
+                return None
+            projected_payload_with_type: dict[str, JsonValue] = {
+                "type": "response.create",
+                **projected_payload,
+            }
+            return json.dumps(projected_payload_with_type, separators=(",", ":"), ensure_ascii=False)
+
         def request_is_retryable(request_state: _WebSocketRequestState) -> bool:
             if _websocket_request_can_replay_before_visible_output(
                 request_state,
@@ -3042,9 +3071,16 @@ class _HTTPBridgeRequestSubmitMixin:
                 ]
                 if len(retryable_candidates) == 1:
                     candidate = retryable_candidates[0]
+                    quota_replay_text = quota_failover_replay_text(candidate)
                     fresh_hard_request_account_switch_candidate = (
                         candidate.previous_response_id is None
-                        and not candidate.hard_continuity_anchor
+                        and (
+                            not candidate.hard_continuity_anchor
+                            or (
+                                quota_replay_text is not None
+                                and candidate.operation_rebind_required
+                            )
+                        )
                         and not candidate.proxy_injected_previous_response_id
                         and not candidate.file_required_preferred_account
                         and (allow_account_exhaustion_failover or candidate.response_event_count == 0)
@@ -3108,10 +3144,17 @@ class _HTTPBridgeRequestSubmitMixin:
             )
             close_generation = session.last_upstream_close_generation
             hard_session_affinity = session.key.strength == "hard"
+            quota_replay_text = quota_failover_replay_text(request_state)
+            quota_hard_account_switch = (
+                quota_replay_text is not None and request_state.operation_rebind_required
+            )
+            if quota_replay_text is not None:
+                request_state.fresh_upstream_request_text = quota_replay_text
+                request_state.fresh_upstream_request_is_retry_safe = True
             fresh_hard_request_account_switch_allowed = (
                 hard_session_affinity
                 and request_state.previous_response_id is None
-                and not request_state.hard_continuity_anchor
+                and (not request_state.hard_continuity_anchor or quota_hard_account_switch)
                 and not request_state.proxy_injected_previous_response_id
                 and not request_state.file_required_preferred_account
             )
