@@ -9,7 +9,7 @@ body:
         Thanks for proposing an idea! Before you continue:
 
         - For open-ended ideas, please consider opening a
-          [Discussion](https://github.com/Soju06/codex-lb/discussions) first to
+          [Discussion](https://github.com/aafqaq/codex-lb-enhanced/discussions) first to
           collect feedback. Use this form when you have a concrete, scoped proposal.
         - codex-lb uses **OpenSpec-first** development. Significant behavior
           changes will eventually live as an `openspec/changes/<change>/`

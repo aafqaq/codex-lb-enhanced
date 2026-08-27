@@ -2,51 +2,98 @@
 
 # Codex LB Enhanced
 
-### 面向长对话连续性的 Codex 兼容账号池网关
+### A high-availability account-pool gateway built for long-running Codex sessions
+
+**English | [简体中文](README.zh-CN.md)**
 
 <p>
-  <a href="https://github.com/aafqaq/codex-lb-enhanced/actions/workflows/build-custom-image.yml"><img src="https://github.com/aafqaq/codex-lb-enhanced/actions/workflows/build-custom-image.yml/badge.svg?branch=main" alt="构建状态"></a>
-  <a href="https://github.com/aafqaq/codex-lb-enhanced/releases"><img src="https://img.shields.io/github/v/release/aafqaq/codex-lb-enhanced?display_name=tag&sort=semver" alt="版本"></a>
-  <a href="https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced"><img src="https://img.shields.io/badge/GHCR-ready-9b87f5?logo=docker&logoColor=white" alt="GHCR"></a>
+  <a href="https://github.com/aafqaq/codex-lb-enhanced/actions/workflows/build-custom-image.yml"><img src="https://github.com/aafqaq/codex-lb-enhanced/actions/workflows/build-custom-image.yml/badge.svg?branch=main" alt="Build status"></a>
+  <a href="https://github.com/aafqaq/codex-lb-enhanced/releases"><img src="https://img.shields.io/github/v/release/aafqaq/codex-lb-enhanced?display_name=tag&sort=semver&color=8b7cf6" alt="Latest release"></a>
+  <a href="https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced"><img src="https://img.shields.io/badge/GHCR-ready-8b7cf6?logo=docker&logoColor=white" alt="GHCR image"></a>
+  <a href="https://github.com/aafqaq/codex-lb-enhanced/blob/main/LICENSE"><img src="https://img.shields.io/github/license/aafqaq/codex-lb-enhanced?color=8b7cf6" alt="License"></a>
 </p>
 
-<p><a href="https://aafqaq.github.io/codex-lb-enhanced/">文档</a> · <a href="https://github.com/aafqaq/codex-lb-enhanced/issues">问题反馈</a> · <a href="https://github.com/aafqaq/codex-lb-enhanced/discussions">讨论</a></p>
+<p>
+  <a href="https://github.com/aafqaq/codex-lb-enhanced/tree/main/docs">Documentation</a> ·
+  <a href="https://github.com/aafqaq/codex-lb-enhanced/issues">Issues</a> ·
+  <a href="https://github.com/aafqaq/codex-lb-enhanced/discussions">Discussions</a>
+</p>
 
-![Codex LB Enhanced](docs/screenshots/banner.jpg)
+![Codex LB Enhanced — multi-account load balancing, usage tracking, dashboard, and OpenAI-compatible endpoints](docs/screenshots/banner-en.jpg)
 
-<p><em>极大的缓解了stream disconnected before completion的问题。</em></p>
+<p><strong>Not just another reverse proxy: a session-aware gateway designed for “stop anywhere, continue anytime” Codex workflows.</strong></p>
 
 </div>
 
-> **独立发行版。** 本项目基于 [Soju06/codex-lb](https://github.com/Soju06/codex-lb) 独立维护，不是 OpenAI 或上游 Codex 的官方发布版本。
+> **Independent enhanced distribution.** This project is independently maintained on top of [Soju06/codex-lb](https://github.com/Soju06/codex-lb). It is not an official OpenAI, ChatGPT, or upstream Codex release. It retains the original account pool and API compatibility while adding a production-focused continuity, failover, quota, and observability layer.
 
-## 项目简介
+## Why Enhanced?
 
-Codex LB 是 ChatGPT 账号负载均衡器：聚合多个账号、追踪用量、管理 API Key，并提供 OpenAI 兼容接口和管理仪表盘。
+Codex sessions are stateful, long-lived, and frequently interrupted by conditions a conventional load balancer does not understand: an upstream account reaches its quota, an operator pauses an account, a WebSocket disappears without a close frame, a tool call is interrupted, or a user resumes the same conversation hours later.
 
-Codex LB Enhanced 保留原版账号池、额度统计、API Key 和路由能力，重点强化长对话连续性：上游 WebSocket 断开、额度耗尽、账号暂停、延迟重试、上下文压缩失败，以及桌面端关闭数小时后恢复，都尽可能交由程序自动处理并尽最大可能平顺恢复。
-
-## 与原版的区别
-
-| 能力 | 原版 | Enhanced |
-|---|---|---|
-| 账号池 | 多账号负载均衡 | 保持原选择器，增加请求级故障账号排除 |
-| 额度响应 | 账号池估算 | API Key 自定义额度优先，无自定义时回退账号池估算 |
-| 额度耗尽 | 可能直接终止会话 | 自动遍历可用账号，池耗尽后才返回 429 |
-| WebSocket | 依赖当前连接和缓存 | 首事件前可回退 HTTP，支持延迟恢复和安全重连 |
-| 会话恢复 | 对账号绑定敏感 | 保留完整历史，安全时跨账号重放，不丢工具调用上下文 |
-| 可观测性 | 基础请求日志 | 记录上下游事件、传输、恢复阶段和最终原因 |
-
-增强逻辑叠加在原负载均衡器之上，不替换 API Key 鉴权、账号分配、预留额度、路由策略或普通 `/v1` 合约。
-
-## 核心能力
+Codex LB Enhanced treats those failures as gateway responsibilities. Whenever recovery is safe, the client should experience a slower response—not a lost conversation or an unexplained `stream disconnected before completion`.
 
 <table>
-<tr><td><b>账号池</b><br>多个 ChatGPT 账号负载均衡</td><td><b>用量追踪</b><br>Token、费用和历史趋势</td><td><b>API Key</b><br>按窗口、模型和用量限额</td></tr>
-<tr><td><b>原生额度头</b><br>primary、secondary、monthly、credits</td><td><b>连续会话</b><br>断网、切号和延迟重试恢复</td><td><b>传输容错</b><br>WebSocket/HTTP 安全回退</td></tr>
+<tr>
+<td width="33%"><h3>🔁 Transparent failover</h3>Quota exhaustion, suspension, timeout, and incomplete streams are classified separately. Failed accounts leave the current candidate set before the original load-balancing policy selects the next one.</td>
+<td width="33%"><h3>🧠 Session continuity</h3>Verified request history is preserved and replayed across accounts when safe, including resumed turns and interrupted tool-call context.</td>
+<td width="33%"><h3>📡 Transport resilience</h3>Codex Responses, the HTTP session bridge, and upstream WebSockets cooperate. Pre-first-event failures can fall back without exposing a broken stream.</td>
+</tr>
+<tr>
+<td><h3>📊 Native Codex quota semantics</h3>Expose API-key limits or pooled-account estimates through Codex-style primary, secondary, and credits headers, backed by the same data as <code>/v1/usage</code>.</td>
+<td><h3>🎛️ Per-key policy</h3>Configure time windows, models, quota types, display source, and passthrough independently for every API key.</td>
+<td><h3>🔎 Actionable diagnostics</h3>Correlate requests with upstream accounts, transport, failover stage, quota reason, retry count, and final client-facing semantics. No anonymous telemetry.</td>
+</tr>
 </table>
 
-## 快速部署
+## What it adds over the base distribution
+
+The upstream project provides the foundation: multiple ChatGPT accounts, load balancing, usage tracking, API-key management, an OpenAI-compatible API, and a web dashboard. Enhanced keeps those capabilities and concentrates the complicated recovery paths into a more explicit, testable, and extensible flow.
+
+| Capability | Base behavior | Codex LB Enhanced |
+|---|---|---|
+| Account selection | Multi-account load balancing | Preserves the configured selector and rotation policy; adds request-scoped failed-account exclusion |
+| Quota exhaustion | May surface one account's limit directly | Records the real quota response, excludes that account for the attempt, and walks the usable pool before returning a final limit |
+| `previous_response_id` ownership | Often tied to the original upstream account | Prefers the original owner, then performs safe recovery from verified full history when that owner is unavailable |
+| WebSocket disconnects | A lost connection may become `stream_incomplete` | Distinguishes pre-output, partial-output, and completed streams; coordinates retries, HTTP bridge fallback, and replay |
+| Interrupted tools and manual stops | Can remain dependent on the previous account | Preserves tool-call state and only crosses accounts at recovery-safe boundaries |
+| Codex quota display | Primarily reflects pooled upstream data | Uses custom API-key limits when configured, otherwise pooled estimates; `/v1/usage` shares the same source of truth |
+| Observability | Basic request logs | Records upstream events, ownership, account selection, recovery decisions, retries, and terminal semantics |
+| Client compatibility | Depends heavily on client retries | Prioritizes official Codex semantics while retaining the `/v1` contract for other OpenAI-compatible clients |
+
+### Recovery flow
+
+```text
+Client request
+    │
+    ├─ account succeeds ─────────────────► normal streaming response
+    │
+    └─ quota / suspension / timeout / disconnect
+          │
+          ├─ record the actual upstream cause and settle the attempt
+          ├─ exclude the failed account from this request
+          ├─ select the next account through the configured LB policy
+          ├─ replay verified full context (HTTP bridge when required)
+          └─ return a client-visible terminal error only when the pool is exhausted
+```
+
+## Interfaces and clients
+
+- **Codex desktop, CLI, and IDE integrations:** `/backend-api/codex`, Responses wire protocol, WebSocket support, and Codex quota headers.
+- **OpenAI-compatible clients:** `/v1`, including Responses, Chat Completions, models, and usage endpoints.
+- **Web dashboard:** accounts, API keys, usage windows, reports, request logs, and recovery diagnostics.
+- **Upstream transports:** HTTP and WebSocket, with deployment-level forcing and bridge-assisted fallback.
+
+## API-key quotas and `/v1/usage`
+
+Quota enforcement and quota presentation are two views of the same data:
+
+1. Configure `5h`, `daily`, `7d`, `weekly`, or `monthly` windows for an API key, using credits, tokens, or cost limits.
+2. Enable Codex quota emulation and choose **API-key limits** or **pooled-account estimates** as the display source.
+3. Codex routes map that source to native-style primary/secondary/credits headers; `/v1/usage` exposes the corresponding details to other clients and automation.
+4. Model-specific limits still enforce and account normally, but only global limits become the default Codex window so one model's cap is not misrepresented as a global cap.
+
+## Quick start
 
 ```bash
 docker volume create codex-lb-enhanced-data
@@ -55,14 +102,14 @@ docker run -d --name codex-lb-enhanced \
   -e CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_AMBIGUOUS_CONTINUATION_RECOVERY_MODE=server_indefinite_recovery \
   -p 2455:2455 -p 1455:1455 \
   -v codex-lb-enhanced-data:/var/lib/codex-lb \
-  ghcr.io/aafqaq/codex-lb-enhanced:1.24.5
+  ghcr.io/aafqaq/codex-lb-enhanced:1.24.11
 ```
 
-打开 [localhost:2455](http://localhost:2455)，添加账号并创建 API Key。
+Open [http://localhost:2455](http://localhost:2455), complete initialization, add accounts, and create an API key. For production, keep your existing ports, volume, environment, network, and restart policy; pin a versioned image and back up the data volume before upgrades.
 
-## Codex 客户端配置
+### Codex client example
 
-在 `~/.codex/config.toml` 中配置：
+Add a provider to `~/.codex/config.toml`:
 
 ```toml
 model = "gpt-5.6-sol"
@@ -77,23 +124,20 @@ supports_websockets = true
 requires_openai_auth = true
 ```
 
-其他 OpenAI 兼容客户端使用 `/v1`；Codex CLI/IDE 使用 `/backend-api/codex`。
+Replace `base_url` with your reverse-proxy address and use an API key created in the dashboard. Other clients can continue using `/v1` without changing their OpenAI SDK integration.
 
-## 恢复原则
+## Operations
 
-- 上游额度耗尽：记录真实额度错误，排除当前账号，继续选择下一个账号。
-- 账号被暂停：首轮请求只重分配一次；有已验证完整历史时跨账号安全重放。
-- 已产生可见输出：不在代理内重复生成，交给客户端使用完整历史重试。
-- 无法证明上下文完整：不静默丢弃上下文，返回可恢复的官方语义并记录日志。
-- 只有整个可用账号池都耗尽或不可用时，才向客户端返回最终失败。
+- **Persistence:** SQLite data lives under `/var/lib/codex-lb/` by default; PostgreSQL remains supported.
+- **Upgrades:** back up the named volume, pin release tags in production, and retain the previous image for rollback.
+- **Troubleshooting:** correlate request IDs with `usage_limit_reached`, `stream_incomplete`, `upstream_request_timeout`, and `http_bridge` events.
+- **Security boundary:** do not expose the admin port directly; use TLS, reverse-proxy access control, and least privilege.
+- **Privacy:** this distribution sends no anonymous telemetry. Account, request, and usage data stay in the database and logs you operate.
 
-## 配置、数据与升级
+## Release and image
 
-配置使用 `CODEX_LB_` 前缀或 `.env.local`，SQLite 是默认数据库，也支持 PostgreSQL。Docker 数据目录为 `/var/lib/codex-lb/`，升级前请备份命名卷并保留旧镜像标签以便回滚。
+Current release: **v1.24.11**. GitHub Actions builds the `main` branch and publishes the Docker image to [GitHub Container Registry](https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced); versioned releases are published through GitHub Releases.
 
-`main` 分支会通过 [GitHub Actions](.github/workflows/build-custom-image.yml) 自动构建并发布到 GHCR。文档站提供详细的鉴权、路由、数据库、Docker/Kubernetes 和故障排查说明。
+## License and disclaimer
 
-## 许可证
-
-MIT，详见 [LICENSE](LICENSE)。
-
+MIT licensed; see [LICENSE](LICENSE). This is a community-maintained independent distribution and does not represent OpenAI, ChatGPT, or the upstream Codex project's commitments.
