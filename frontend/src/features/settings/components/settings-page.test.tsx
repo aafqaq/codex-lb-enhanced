@@ -21,7 +21,6 @@ const quotaPlannerSectionMock = vi.fn();
 const stickySessionsSectionMock = vi.fn();
 const modelSourcesSettingsMock = vi.fn();
 const dataRetentionSettingsMock = vi.fn();
-const telemetrySettingsMock = vi.fn();
 
 vi.mock("@/features/settings/hooks/use-settings", () => ({
   useSettings: () => useSettingsMock(),
@@ -79,12 +78,6 @@ vi.mock("@/features/settings/components/data-retention-settings", () => ({
   },
 }));
 
-vi.mock("@/features/settings/components/telemetry-settings", () => ({
-  TelemetrySettings: (props: unknown) => {
-    telemetrySettingsMock(props);
-    return <div>Telemetry Settings</div>;
-  },
-}));
 
 vi.mock("@/features/api-keys/components/api-keys-section", () => ({
   ApiKeysSection: (props: unknown) => {
@@ -172,7 +165,6 @@ describe("SettingsPage", () => {
     stickySessionsSectionMock.mockReset();
     modelSourcesSettingsMock.mockReset();
     dataRetentionSettingsMock.mockReset();
-    telemetrySettingsMock.mockReset();
   });
 
   function renderSettings(initialEntry = "/settings") {
@@ -188,45 +180,34 @@ describe("SettingsPage", () => {
     );
   }
 
-  async function expandAdvancedSettings() {
-    const user = userEvent.setup({ delay: null });
-    await user.click(screen.getByRole("button", { name: "Show advanced settings" }));
-  }
-
-  it("keeps advanced sections collapsed and unmounted by default", () => {
+  it("shows the general settings tab by default", () => {
     renderSettings();
 
-    expect(screen.getByRole("button", { name: "Show advanced settings" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "General" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Access & security" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Routing & accounts" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Operations" })).toBeInTheDocument();
     expect(screen.queryByText("Routing Settings")).not.toBeInTheDocument();
-    expect(screen.queryByText("Upstream Proxy Settings")).not.toBeInTheDocument();
-    expect(screen.queryByText("Model Sources Settings")).not.toBeInTheDocument();
-    expect(screen.queryByText("Firewall Section")).not.toBeInTheDocument();
-    expect(screen.queryByText("Quota Planner Section")).not.toBeInTheDocument();
-    expect(screen.queryByText("Sticky Sessions Section")).not.toBeInTheDocument();
-    expect(screen.queryByText("Data Retention Settings")).not.toBeInTheDocument();
     expect(routingSettingsMock).not.toHaveBeenCalled();
-    expect(upstreamProxySettingsMock).not.toHaveBeenCalled();
-    expect(modelSourcesSettingsMock).not.toHaveBeenCalled();
-    expect(firewallSectionMock).not.toHaveBeenCalled();
-    expect(quotaPlannerSectionMock).not.toHaveBeenCalled();
-    expect(stickySessionsSectionMock).not.toHaveBeenCalled();
-    expect(dataRetentionSettingsMock).not.toHaveBeenCalled();
 
     // Core sections stay visible without any interaction.
     expect(screen.getByText("Appearance Settings")).toBeInTheDocument();
     expect(screen.getByText("Import Settings")).toBeInTheDocument();
-    expect(screen.getByText("API Keys Section")).toBeInTheDocument();
-    expect(screen.getByText("Telemetry Settings")).toBeInTheDocument();
+    expect(screen.queryByText("API Keys Section")).not.toBeInTheDocument();
   });
 
-  it("mounts every advanced section after one expand interaction", async () => {
+  it("mounts only the selected category and switches without a long page scroll", async () => {
     renderSettings();
+    const user = userEvent.setup({ delay: null });
 
-    await expandAdvancedSettings();
+    await user.click(screen.getByRole("tab", { name: "Routing & accounts" }));
 
     expect(screen.getByText("Routing Settings")).toBeInTheDocument();
     expect(screen.getByText("Upstream Proxy Settings")).toBeInTheDocument();
     expect(screen.getByText("Model Sources Settings")).toBeInTheDocument();
+    expect(screen.queryByText("Firewall Section")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Operations" }));
     expect(screen.getByText("Firewall Section")).toBeInTheDocument();
     expect(screen.getByText("Quota Planner Section")).toBeInTheDocument();
     expect(screen.getByText("Sticky Sessions Section")).toBeInTheDocument();
@@ -237,6 +218,8 @@ describe("SettingsPage", () => {
     useAuthStore.setState({ canWrite: false });
 
     renderSettings();
+    const user = userEvent.setup({ delay: null });
+    await user.click(screen.getByRole("tab", { name: "Access & security" }));
 
     expect(screen.getByText("You are viewing the dashboard with read-only guest access. Admin controls are disabled.")).toBeInTheDocument();
     expect(screen.queryByText("Guest Access Settings")).not.toBeInTheDocument();
@@ -244,12 +227,12 @@ describe("SettingsPage", () => {
     expect(screen.queryByText("Session Settings")).not.toBeInTheDocument();
     expect(importSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: true }));
     expect(apiKeysSectionMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
-    expect(telemetrySettingsMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
 
-    await expandAdvancedSettings();
+    await user.click(screen.getByRole("tab", { name: "Routing & accounts" }));
 
     expect(routingSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: true }));
     expect(upstreamProxySettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: true }));
+    await user.click(screen.getByRole("tab", { name: "Operations" }));
     expect(firewallSectionMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
     expect(quotaPlannerSectionMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
     expect(stickySessionsSectionMock).toHaveBeenCalledWith(expect.objectContaining({ disabled: true }));
@@ -258,6 +241,8 @@ describe("SettingsPage", () => {
 
   it("keeps guest access settings available for writable sessions", async () => {
     renderSettings();
+    const user = userEvent.setup({ delay: null });
+    await user.click(screen.getByRole("tab", { name: "Access & security" }));
 
     expect(screen.getByText("Guest Access Settings")).toBeInTheDocument();
     expect(guestAccessSettingsMock).toHaveBeenCalledWith(
@@ -267,17 +252,24 @@ describe("SettingsPage", () => {
       }),
     );
 
-    await expandAdvancedSettings();
+    await user.click(screen.getByRole("tab", { name: "Routing & accounts" }));
 
     expect(routingSettingsMock).toHaveBeenCalledWith(expect.objectContaining({ busy: false }));
   });
 
-  it("expands Advanced and mounts firewall on the advanced deeplink", () => {
+  it("opens the operations tab on the firewall deeplink", () => {
     renderSettings("/settings?advanced=1#firewall");
 
     expect(screen.getByText("Firewall Section")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Hide advanced settings" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Operations" })).toHaveAttribute("aria-selected", "true");
     expect(firewallSectionMock).toHaveBeenCalled();
+  });
+
+  it("maps the legacy advanced query to the routing tab", () => {
+    renderSettings("/settings?advanced=1");
+
+    expect(screen.getByText("Routing Settings")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Routing & accounts" })).toHaveAttribute("aria-selected", "true");
   });
 
 });

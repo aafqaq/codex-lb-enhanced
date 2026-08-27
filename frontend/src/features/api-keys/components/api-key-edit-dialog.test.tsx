@@ -528,6 +528,34 @@ describe("ApiKeyEditDialog", () => {
     expect(trafficClassSelect).toHaveTextContent("Opportunistic");
   });
 
+  it("submits Codex quota display settings", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={createApiKey()}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox", { name: /codex quota display/i }));
+    await user.click(await screen.findByRole("option", { name: /pooled account quota/i }));
+    await user.click(screen.getByRole("switch", { name: /enable codex quota emulation/i }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    const payload = onSubmit.mock.calls[0][0];
+    expect(payload.codexQuotaMode).toBe("pool");
+    expect(payload.codexQuotaPassthroughEnabled).toBe(false);
+  });
+
   it("shows the stored Ultrafast service tier", () => {
     renderWithProviders(
       <ApiKeyEditDialog

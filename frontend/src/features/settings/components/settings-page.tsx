@@ -1,7 +1,7 @@
-import { Suspense, lazy } from "react";
+import { Suspense, lazy, useState } from "react";
 import { Settings } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 
 import { AlertMessage } from "@/components/alert-message";
 import { LoadingOverlay } from "@/components/layout/loading-overlay";
@@ -11,8 +11,6 @@ import { FirewallSection } from "@/features/firewall/components/firewall-section
 import { ModelSourcesSettings } from "@/features/model-sources/components/model-sources-settings";
 import { QuotaPlannerSection } from "@/features/quota-planner/components/quota-planner-section";
 import { buildSettingsUpdateRequest } from "@/features/settings/payload";
-import { shouldExpandAdvancedSettings } from "@/features/settings/advanced-settings-deeplink";
-import { AdvancedSettingsGroup } from "@/features/settings/components/advanced-settings-group";
 import { AppearanceSettings } from "@/features/settings/components/appearance-settings";
 import { DataRetentionSettings } from "@/features/settings/components/data-retention-settings";
 import { GuestAccessSettings } from "@/features/settings/components/guest-access-settings";
@@ -22,7 +20,6 @@ import { ResetCreditSettings } from "@/features/settings/components/reset-credit
 import { RoutingSettings } from "@/features/settings/components/routing-settings";
 import { SessionSettings } from "@/features/settings/components/session-settings";
 import { SettingsSkeleton } from "@/features/settings/components/settings-skeleton";
-import { TelemetrySettings } from "@/features/settings/components/telemetry-settings";
 import { UpstreamProxySettings } from "@/features/settings/components/upstream-proxy-settings";
 import { StickySessionsSection } from "@/features/sticky-sessions/components/sticky-sessions-section";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
@@ -34,17 +31,28 @@ const TotpSettings = lazy(() =>
   import("@/features/settings/components/totp-settings").then((m) => ({ default: m.TotpSettings })),
 );
 
-const FIREWALL_LAYOUT_QUERY_KEYS = [
-  ["accounts", "list"],
-  ["settings", "upstream-proxy"],
-  ["model-sources", "list"],
-] as const;
+type SettingsTab = "general" | "security" | "routing" | "operations";
+
+const TAB_HASHES: Record<SettingsTab, string> = {
+  general: "#general",
+  security: "#security",
+  routing: "#routing",
+  operations: "#operations",
+};
+
+function tabForLocation(search: string, hash: string): SettingsTab {
+  if (hash === "#firewall" || hash === "#operations") return "operations";
+  if (hash === "#routing") return "routing";
+  if (hash === "#security") return "security";
+  if (new URLSearchParams(search).get("advanced") === "1") return "routing";
+  return "general";
+}
 
 export function SettingsPage() {
   const { t } = useTranslation();
   const location = useLocation();
-  const expandAdvanced = shouldExpandAdvancedSettings(location.search, location.hash);
-  const advancedScrollToId = location.hash.replace(/^#/, "") || undefined;
+  const navigate = useNavigate();
+  const [activeTab, setActiveTab] = useState<SettingsTab>(() => tabForLocation(location.search, location.hash));
   const { settingsQuery, updateSettingsMutation } = useSettings();
   const { accountsQuery } = useAccounts();
   const {
@@ -114,99 +122,142 @@ export function SettingsPage() {
             </div>
           ) : null}
 
-          <div className="space-y-4">
-            <AppearanceSettings />
-            <ImportSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
-            <ResetCreditSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
-            {canWrite ? (
-              <GuestAccessSettings
-                settings={settings}
-                busy={busy}
-                onSave={handleSave}
-                onRefresh={() => settingsQuery.refetch()}
-              />
-            ) : null}
-            {canWrite ? <PasswordSettings disabled={busy} /> : null}
-            {canWrite && passwordManagementEnabled ? (
-              <SessionSettings settings={settings} busy={busy} onSave={handleSave} />
-            ) : null}
-            {canWrite && passwordManagementEnabled && passwordSessionActive ? (
-              <Suspense fallback={null}>
-                <TotpSettings settings={settings} disabled={busy} onSave={handleSave} />
-              </Suspense>
+          <div
+            className="grid grid-cols-2 gap-1 rounded-xl border bg-muted/30 p-1 sm:grid-cols-4"
+            role="tablist"
+            aria-label={t("settings.tabs.ariaLabel")}
+          >
+            {(["general", "security", "routing", "operations"] as const).map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                id={`settings-tab-${tab}`}
+                role="tab"
+                aria-selected={activeTab === tab}
+                aria-controls={`settings-panel-${tab}`}
+                className={`rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
+                  activeTab === tab
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:bg-background/70 hover:text-foreground"
+                }`}
+                onClick={() => {
+                  setActiveTab(tab);
+                  navigate(
+                    { pathname: location.pathname, search: location.search, hash: TAB_HASHES[tab] },
+                    { replace: true },
+                  );
+                }}
+              >
+                {t(`settings.tabs.${tab}`)}
+              </button>
+            ))}
+          </div>
+
+          <section
+            id={`settings-panel-${activeTab}`}
+            role="tabpanel"
+            aria-labelledby={`settings-tab-${activeTab}`}
+            className="grid min-w-0 animate-fade-in-up grid-cols-1 gap-4 lg:grid-cols-2"
+          >
+            {activeTab === "general" ? (
+              <>
+                <AppearanceSettings />
+                <ImportSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
+                <ResetCreditSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
+              </>
             ) : null}
 
-            <ApiKeysSection
-              apiKeyAuthEnabled={settings.apiKeyAuthEnabled}
-              hideUpstreamQuotaFromApiKeys={settings.hideUpstreamQuotaFromApiKeys}
-              disabled={controlsDisabled}
-              onApiKeyAuthEnabledChange={(enabled) =>
-                void handleSave(buildSettingsUpdateRequest(settings, { apiKeyAuthEnabled: enabled }))
-              }
-              onHideUpstreamQuotaFromApiKeysChange={(enabled) =>
-                void handleSave(buildSettingsUpdateRequest(settings, { hideUpstreamQuotaFromApiKeys: enabled }))
-              }
-            />
-
-            <TelemetrySettings disabled={controlsDisabled} />
-
-            <AdvancedSettingsGroup
-              key={expandAdvanced ? `open:${advancedScrollToId ?? ""}` : "closed"}
-              defaultOpen={expandAdvanced}
-              scrollToId={advancedScrollToId}
-              waitForQueryKeys={FIREWALL_LAYOUT_QUERY_KEYS}
-            >
-              <RoutingSettings
-                key={[
-                  settings.openaiCacheAffinityMaxAgeSeconds,
-                  settings.warmupModel,
-                  settings.limitWarmupModel,
-                  settings.limitWarmupPrompt,
-                  settings.limitWarmupExhaustedThresholdPercent,
-                  settings.limitWarmupIdleThresholdPercent,
-                  settings.limitWarmupCooldownSeconds,
-                  settings.limitWarmupStaggeredIdleEnabled,
-                  settings.proxyAccountResponseCreateLimit,
-                  settings.proxyAccountStreamLimit,
-                  settings.proxyAccountStreamRecoveryReserve,
-                  settings.proxyApiKeyFairShareCongestionThresholdPct,
-                ].join(":")}
-                settings={settings}
-                accounts={accountsQuery.data ?? []}
-                accountsLoading={accountsQuery.isLoading}
-                busy={controlsDisabled}
-                onSave={handleSave}
-              />
-              {upstreamProxyQuery.data ? (
-                <UpstreamProxySettings
-                  admin={upstreamProxyQuery.data}
-                  busy={controlsDisabled}
-                  onSaveSettings={handleSave}
-                  onCreateEndpoint={(payload) => createEndpointMutation.mutateAsync(payload)}
-                  onTestEndpoint={(endpointId) => testEndpointMutation.mutateAsync(endpointId)}
-                  onCreatePool={(payload) => createPoolMutation.mutateAsync(payload)}
-                  onAddPoolMember={(poolId, payload) =>
-                    addPoolMemberMutation.mutateAsync({ poolId, payload })
+            {activeTab === "security" ? (
+              <>
+                {canWrite ? (
+                  <GuestAccessSettings
+                    settings={settings}
+                    busy={busy}
+                    onSave={handleSave}
+                    onRefresh={() => settingsQuery.refetch()}
+                  />
+                ) : null}
+                {canWrite ? <PasswordSettings disabled={busy} /> : null}
+                {canWrite && passwordManagementEnabled ? (
+                  <SessionSettings settings={settings} busy={busy} onSave={handleSave} />
+                ) : null}
+                {canWrite && passwordManagementEnabled && passwordSessionActive ? (
+                  <Suspense fallback={null}>
+                    <TotpSettings settings={settings} disabled={busy} onSave={handleSave} />
+                  </Suspense>
+                ) : null}
+                <ApiKeysSection
+                  apiKeyAuthEnabled={settings.apiKeyAuthEnabled}
+                  hideUpstreamQuotaFromApiKeys={settings.hideUpstreamQuotaFromApiKeys}
+                  disabled={controlsDisabled}
+                  onApiKeyAuthEnabledChange={(enabled) =>
+                    void handleSave(buildSettingsUpdateRequest(settings, { apiKeyAuthEnabled: enabled }))
+                  }
+                  onHideUpstreamQuotaFromApiKeysChange={(enabled) =>
+                    void handleSave(buildSettingsUpdateRequest(settings, { hideUpstreamQuotaFromApiKeys: enabled }))
                   }
                 />
-              ) : null}
-              <ModelSourcesSettings disabled={controlsDisabled} />
-              <FirewallSection disabled={controlsDisabled} />
-              <QuotaPlannerSection disabled={controlsDisabled} />
-              <StickySessionsSection disabled={controlsDisabled} />
-              <DataRetentionSettings
-                key={[
-                  settings.requestLogRetentionOverrideDays,
-                  settings.usageHistoryRetentionOverrideDays,
-                  settings.requestLogRetentionDays,
-                  settings.usageHistoryRetentionDays,
-                ].join(":")}
-                settings={settings}
-                busy={controlsDisabled}
-                onSave={handleSave}
-              />
-            </AdvancedSettingsGroup>
-          </div>
+              </>
+            ) : null}
+
+            {activeTab === "routing" ? (
+              <>
+                <RoutingSettings
+                  key={[
+                    settings.openaiCacheAffinityMaxAgeSeconds,
+                    settings.warmupModel,
+                    settings.limitWarmupModel,
+                    settings.limitWarmupPrompt,
+                    settings.limitWarmupExhaustedThresholdPercent,
+                    settings.limitWarmupIdleThresholdPercent,
+                    settings.limitWarmupCooldownSeconds,
+                    settings.proxyAccountResponseCreateLimit,
+                    settings.proxyAccountStreamLimit,
+                    settings.proxyAccountStreamRecoveryReserve,
+                    settings.proxyApiKeyFairShareCongestionThresholdPct,
+                  ].join(":")}
+                  settings={settings}
+                  accounts={accountsQuery.data ?? []}
+                  accountsLoading={accountsQuery.isLoading}
+                  busy={controlsDisabled}
+                  onSave={handleSave}
+                />
+                {upstreamProxyQuery.data ? (
+                  <UpstreamProxySettings
+                    admin={upstreamProxyQuery.data}
+                    busy={controlsDisabled}
+                    onSaveSettings={handleSave}
+                    onCreateEndpoint={(payload) => createEndpointMutation.mutateAsync(payload)}
+                    onTestEndpoint={(endpointId) => testEndpointMutation.mutateAsync(endpointId)}
+                    onCreatePool={(payload) => createPoolMutation.mutateAsync(payload)}
+                    onAddPoolMember={(poolId, payload) =>
+                      addPoolMemberMutation.mutateAsync({ poolId, payload })
+                    }
+                  />
+                ) : null}
+                <ModelSourcesSettings disabled={controlsDisabled} />
+              </>
+            ) : null}
+
+            {activeTab === "operations" ? (
+              <>
+                <FirewallSection disabled={controlsDisabled} />
+                <QuotaPlannerSection disabled={controlsDisabled} />
+                <StickySessionsSection disabled={controlsDisabled} />
+                <DataRetentionSettings
+                  key={[
+                    settings.requestLogRetentionOverrideDays,
+                    settings.usageHistoryRetentionOverrideDays,
+                    settings.requestLogRetentionDays,
+                    settings.usageHistoryRetentionDays,
+                  ].join(":")}
+                  settings={settings}
+                  busy={controlsDisabled}
+                  onSave={handleSave}
+                />
+              </>
+            ) : null}
+          </section>
 
           <LoadingOverlay visible={!!settings && busy} label={t("settings.page.savingLabel")} />
         </>

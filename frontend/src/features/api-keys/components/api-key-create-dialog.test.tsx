@@ -54,6 +54,8 @@ describe("ApiKeyCreateDialog", () => {
     });
 
     expect(onSubmit.mock.calls[0][0].applyToCodexModel).toBe(true);
+    expect(onSubmit.mock.calls[0][0].codexQuotaMode).toBe("api_key");
+    expect(onSubmit.mock.calls[0][0].codexQuotaPassthroughEnabled).toBe(true);
   });
 
   it("submits opportunistic traffic class", async () => {

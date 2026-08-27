@@ -6,7 +6,7 @@ Define API key lifecycle, enforcement, accounting, and dashboard management cont
 ## Requirements
 ### Requirement: API Key creation
 
-The system SHALL allow the admin to create API keys via `POST /api/api-keys` with a `name` (required), `allowed_models` (optional list), `weekly_token_limit` (optional integer), `expires_at` (optional ISO 8601 datetime), `assigned_account_ids` (optional list), and `usage_sections` (optional comma-separated string, defaults to `"upstream_limits,account_pool_usage"`). The system MUST generate a key in the format `sk-clb-{48 hex chars}`, store only the `sha256` hash in the database, and return the plain key exactly once in the creation response. The system MUST accept timezone-aware ISO 8601 datetimes for `expiresAt`, normalize them to UTC naive for persistence, and return the expiration as UTC in API responses.
+The system SHALL allow the admin to create API keys via `POST /api/api-keys` with a `name` (required), `allowed_models` (optional list), `weekly_token_limit` (optional integer), `expires_at` (optional ISO 8601 datetime), `assigned_account_ids` (optional list), `usage_sections` (optional comma-separated string, defaults to `"upstream_limits,account_pool_usage"`), `codex_quota_mode` (optional `api_key` or `pool`, default `api_key`), and `codex_quota_passthrough_enabled` (optional boolean, default `true`). The system MUST generate a key in the format `sk-clb-{48 hex chars}`, store only the `sha256` hash in the database, and return the plain key exactly once in the creation response. The system MUST accept timezone-aware ISO 8601 datetimes for `expiresAt`, normalize them to UTC naive for persistence, and return the expiration as UTC in API responses.
 
 When `assigned_account_ids` is omitted or empty, the created key SHALL remain unscoped and apply to all accounts. When `assigned_account_ids` is provided with one or more valid account IDs, the created key SHALL enable account-assignment scope and persist those assignments.
 
@@ -978,6 +978,19 @@ The system SHALL provide a `hide_upstream_quota_from_api_keys` boolean in `Dashb
 - **GIVEN** `hide_upstream_quota_from_api_keys` is `true`
 - **WHEN** an owner views dashboard settings or owner-facing usage data without API-key authentication
 - **THEN** upstream quota details SHALL remain visible
+
+### Requirement: API-key Codex quota display policy
+
+Each API key SHALL expose `codex_quota_mode` (`api_key` or `pool`) and
+`codex_quota_passthrough_enabled`. When enabled, protected proxy responses and
+`/api/codex/usage` SHALL use the selected source: API-key limits when
+`codex_quota_mode=api_key` (falling back to aggregate pool data when no global
+key limit is configured), or aggregate account-pool data when
+`codex_quota_mode=pool`. When disabled, the proxy SHALL omit Codex quota
+headers and `/api/codex/usage` SHALL return no quota windows while retaining
+the normal authentication contract. `/v1/usage` SHALL keep its historical
+fields and apply the same source selection to its `limits` view; usage totals
+remain available for accounting.
 
 ### Requirement: API keys can inspect and redeem reset credits within their account pool
 

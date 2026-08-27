@@ -42,6 +42,7 @@ from app.modules.api_keys.service import (
     LimitRuleInput,
     _build_api_key_trends,
     _is_sqlite_database_locked,
+    _normalize_codex_quota_mode,
     _normalize_usage_sections,
 )
 from app.modules.usage.repository import UsageRepository
@@ -152,6 +153,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         allowed_reasoning_efforts: str | None | _Unset = _UNSET,
         enforced_service_tier: str | None | _Unset = _UNSET,
         traffic_class: str | _Unset = _UNSET,
+        codex_quota_mode: str | _Unset = _UNSET,
+        codex_quota_passthrough_enabled: bool | _Unset = _UNSET,
         transport_policy_override: str | None | _Unset = _UNSET,
         usage_sections: str | _Unset = _UNSET,
         account_assignment_scope_enabled: bool | _Unset = _UNSET,
@@ -175,6 +178,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             "allowed_reasoning_efforts": allowed_reasoning_efforts,
             "enforced_service_tier": enforced_service_tier,
             "traffic_class": traffic_class,
+            "codex_quota_mode": codex_quota_mode,
+            "codex_quota_passthrough_enabled": codex_quota_passthrough_enabled,
             "transport_policy_override": transport_policy_override,
             "usage_sections": usage_sections,
             "account_assignment_scope_enabled": account_assignment_scope_enabled,
@@ -2503,6 +2508,16 @@ class TestNormalizeUsageSections:
             _normalize_usage_sections("garbage")
 
 
+def test_codex_quota_mode_accepts_supported_values() -> None:
+    assert _normalize_codex_quota_mode("api_key") == "api_key"
+    assert _normalize_codex_quota_mode("POOL") == "pool"
+
+
+def test_codex_quota_mode_rejects_unknown_value() -> None:
+    with pytest.raises(ApiKeyValidationError, match="Unsupported Codex quota mode"):
+        _normalize_codex_quota_mode("automatic")
+
+
 async def test_create_key_stores_usage_sections() -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)
@@ -2514,6 +2529,21 @@ async def test_create_key_stores_usage_sections() -> None:
         )
     )
     assert created.usage_sections == "upstream_limits"
+
+
+async def test_create_key_stores_codex_quota_display_settings() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="pool-key",
+            allowed_models=None,
+            codex_quota_mode="pool",
+            codex_quota_passthrough_enabled=False,
+        )
+    )
+    assert created.codex_quota_mode == "pool"
+    assert created.codex_quota_passthrough_enabled is False
 
 
 async def test_create_key_stores_empty_usage_sections() -> None:

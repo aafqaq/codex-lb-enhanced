@@ -164,6 +164,7 @@ from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import (
+    CODEX_QUOTA_MODE_POOL,
     TRAFFIC_CLASS_OPPORTUNISTIC,
     ApiKeyData,
     ApiKeyInvalidError,
@@ -1603,13 +1604,30 @@ async def v1_usage(
 
     own_limits = [_to_v1_usage_limit_response(limit) for limit in usage.limits]
     upstream_limits = [] if hide_upstream_limits else _ordered_aggregate_limits(aggregate_limits)
+    # The selected display mode is authoritative for the primary ``limits``
+    # view.  In pool mode an empty aggregate result must stay empty instead of
+    # silently exposing API-key rules; this keeps `/v1/usage` consistent with
+    # the Codex headers and `/api/codex/usage`.
+    visible_limits = (
+        upstream_limits if api_key.codex_quota_mode == CODEX_QUOTA_MODE_POOL else own_limits
+    )
+    if not api_key.codex_quota_passthrough_enabled:
+        # Keep accounting totals available, but make the quota-display switch
+        # consistent across the official headers and the /v1/usage view.
+        visible_limits = []
+        upstream_limits = []
+        account_pool_usage = None
 
     return V1UsageResponse(
         request_count=usage.request_count,
         total_tokens=usage.total_tokens,
         cached_input_tokens=usage.cached_input_tokens,
         total_cost_usd=usage.total_cost_usd,
-        limits=own_limits or upstream_limits,
+        limits=(
+            visible_limits
+            if api_key.codex_quota_mode == CODEX_QUOTA_MODE_POOL
+            else visible_limits or upstream_limits
+        ),
         upstream_limits=upstream_limits,
         account_pool_usage=account_pool_usage,
     )
@@ -2154,13 +2172,16 @@ async def _rate_limit_headers_for_request(
     reservation: ApiKeyUsageReservationData | None = None,
 ) -> dict[str, str]:
     if api_key is not None:
-        usage_payload = await _build_codex_usage_payload_for_api_key(
-            api_key,
-            exclude_reservation_id=reservation.reservation_id if reservation is not None else None,
-        )
-        custom_headers = _codex_rate_limit_headers_from_payload(usage_payload)
-        if custom_headers:
-            return custom_headers
+        if not api_key.codex_quota_passthrough_enabled:
+            return {}
+        if api_key.codex_quota_mode != CODEX_QUOTA_MODE_POOL:
+            usage_payload = await _build_codex_usage_payload_for_api_key(
+                api_key,
+                exclude_reservation_id=reservation.reservation_id if reservation is not None else None,
+            )
+            custom_headers = _codex_rate_limit_headers_from_payload(usage_payload)
+            if custom_headers:
+                return custom_headers
     if await _hide_upstream_quota_for_api_key_clients(api_key):
         return {}
     return await context.service.rate_limit_headers()
@@ -6616,11 +6637,19 @@ async def codex_usage(
     context: ProxyContext = Depends(get_proxy_context),
     api_key: ApiKeyData | None = Depends(validate_codex_provider_usage_identity),
 ) -> RateLimitStatusPayload:
-    payload = (
-        await _build_codex_usage_payload_for_api_key(api_key)
-        if api_key is not None
-        else _attach_codex_usage_reset_credits(await context.service.get_rate_limit_payload(), request)
-    )
+    if api_key is not None:
+        if not api_key.codex_quota_passthrough_enabled:
+            payload = RateLimitStatusPayloadData(plan_type="api_key")
+        elif api_key.codex_quota_mode == CODEX_QUOTA_MODE_POOL:
+            payload = await context.service.get_rate_limit_payload()
+        else:
+            payload = await _build_codex_usage_payload_for_api_key(api_key)
+            # Preserve the historical fallback for keys that have no global
+            # API-key rule (for example, only model-specific rules).
+            if payload.rate_limit is None and payload.credits is None:
+                payload = await context.service.get_rate_limit_payload()
+    else:
+        payload = _attach_codex_usage_reset_credits(await context.service.get_rate_limit_payload(), request)
     return RateLimitStatusPayload.from_data(payload)
 
 

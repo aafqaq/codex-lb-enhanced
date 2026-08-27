@@ -21,8 +21,6 @@ on:
 permissions:
   contents: read
 
-# Deploys must not be cancelled mid-flight (GitHub Pages guidance);
-# queued runs still coalesce per-ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -50,25 +48,9 @@ jobs:
           uv sync --only-group docs --frozen
           uv run --no-sync mkdocs build --strict
 
-      - name: Upload Pages artifact
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+      - name: Upload docs build artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
         with:
+          name: docs-site
           path: site
-
-  deploy:
-    name: Deploy to GitHub Pages
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    needs: build
-    runs-on: ubuntu-24.04
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128

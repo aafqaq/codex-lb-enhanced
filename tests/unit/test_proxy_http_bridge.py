@@ -20820,6 +20820,102 @@ async def test_process_http_bridge_upstream_text_masks_previous_response_not_fou
 
 
 @pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_rebinds_full_resend_after_previous_response_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected injected anchor must fail over before the client retries."""
+
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    replay_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "earlier"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "prior answer"}],
+                },
+                {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            ],
+        },
+        separators=(",", ":"),
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-prev-miss-full-resend",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        previous_response_id="resp_missing_full_resend",
+        event_queue=asyncio.Queue(),
+        request_text=replay_text,
+        fresh_upstream_request_text=replay_text,
+        fresh_upstream_request_is_retry_safe=True,
+        awaiting_response_created=True,
+        transport="http",
+        skip_request_log=True,
+        proxy_injected_previous_response_id=True,
+        proxy_injected_anchor_had_full_resend_payload=True,
+        hard_continuity_anchor=True,
+    )
+    request_state.affinity_policy = proxy_service._AffinityPolicy(
+        key="sid-full-resend",
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+    )
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("session_header", "sid-full-resend", None),
+        headers={"x-codex-session-id": "sid-full-resend", "x-codex-turn-state": "turn-old"},
+        affinity=request_state.affinity_policy,
+        request_model="gpt-5.4",
+        account=cast(Any, SimpleNamespace(id="acc-old", status=AccountStatus.ACTIVE)),
+        upstream=cast(UpstreamWebSocket, SimpleNamespace(close=AsyncMock())),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=1,
+        last_used_at=1.0,
+        idle_ttl_seconds=120.0,
+    )
+    retry_precreated = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_handle_stream_error", AsyncMock())
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "status": 400,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "previous_response_not_found",
+                    "message": "Previous response with id 'resp_missing_full_resend' not found.",
+                    "param": "previous_response_id",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    retry_precreated.assert_awaited_once_with(
+        session,
+        request_state=request_state,
+        allow_account_exhaustion_failover=True,
+    )
+    assert request_state.previous_response_id is None
+    assert request_state.proxy_injected_previous_response_id is False
+    assert request_state.hard_continuity_anchor is False
+    assert request_state.excluded_account_ids == {"acc-old"}
+    assert request_state.affinity_policy.key is None
+    assert request_state.affinity_policy.kind is None
+    assert request_state.operation_rebind_required is True
+    assert session.headers == {"x-codex-session-id": "sid-full-resend"}
+
+
+@pytest.mark.asyncio
 async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -36,6 +36,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Read project version
+        id: version
+        shell: bash
+        run: |
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -44,13 +51,7 @@ jobs:
           tags: |
             type=raw,value=latest
             type=raw,value=custom-latest
-            type=raw,value=1.24.5
-            type=raw,value=1.24.6
-            type=raw,value=1.24.7
-            type=raw,value=1.24.8
-            type=raw,value=1.24.9
-            type=raw,value=1.24.10
-            type=raw,value=1.24.11
+            type=raw,value=${{ steps.version.outputs.version }}
             type=sha,prefix=
 
       - name: Build and publish

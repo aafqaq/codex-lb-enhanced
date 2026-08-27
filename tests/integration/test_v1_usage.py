@@ -19,6 +19,8 @@ async def _create_api_key(
     name: str,
     limits: list[LimitRuleInput] | None = None,
     usage_sections: str = "upstream_limits,account_pool_usage",
+    codex_quota_mode: str = "api_key",
+    codex_quota_passthrough_enabled: bool = True,
 ) -> tuple[str, str]:
     async with SessionLocal() as session:
         service = ApiKeysService(ApiKeysRepository(session))
@@ -27,6 +29,8 @@ async def _create_api_key(
                 name=name,
                 allowed_models=None,
                 usage_sections=usage_sections,
+                codex_quota_mode=codex_quota_mode,
+                codex_quota_passthrough_enabled=codex_quota_passthrough_enabled,
                 limits=limits or [],
             )
         )
@@ -318,6 +322,60 @@ async def test_v1_usage_omits_disabled_account_pool_usage_section(async_client):
         "upstream_limits": [],
         "account_pool_usage": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_v1_usage_pool_mode_uses_pool_limits_as_primary_view(async_client):
+    _, plain_key = await _create_api_key(
+        name="pool-display-key",
+        codex_quota_mode="pool",
+        limits=[LimitRuleInput(limit_type="total_tokens", limit_window="daily", max_value=1_000)],
+    )
+    await _seed_upstream_usage(now=utcnow())
+
+    response = await async_client.get("/v1/usage", headers={"Authorization": f"Bearer {plain_key}"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["upstream_limits"]
+    assert payload["limits"] == payload["upstream_limits"]
+    assert all(limit["source"] == "aggregate" for limit in payload["limits"])
+
+
+@pytest.mark.asyncio
+async def test_v1_usage_pool_mode_does_not_fall_back_to_key_limits(async_client):
+    _, plain_key = await _create_api_key(
+        name="pool-display-empty-key",
+        codex_quota_mode="pool",
+        limits=[LimitRuleInput(limit_type="total_tokens", limit_window="daily", max_value=1_000)],
+    )
+
+    response = await async_client.get("/v1/usage", headers={"Authorization": f"Bearer {plain_key}"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["limits"] == []
+    assert payload["upstream_limits"] == []
+
+
+@pytest.mark.asyncio
+async def test_v1_usage_quota_display_can_be_disabled_without_hiding_accounting_totals(async_client):
+    _, plain_key = await _create_api_key(
+        name="disabled-display-key",
+        codex_quota_passthrough_enabled=False,
+        limits=[LimitRuleInput(limit_type="total_tokens", limit_window="daily", max_value=1_000)],
+    )
+    await _seed_upstream_usage(now=utcnow())
+
+    response = await async_client.get("/v1/usage", headers={"Authorization": f"Bearer {plain_key}"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["limits"] == []
+    assert payload["upstream_limits"] == []
+    assert payload["account_pool_usage"] is None
+    assert payload["request_count"] == 0
+    assert payload["total_tokens"] == 0
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dialog";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -30,8 +31,10 @@ import { ModelMultiSelect } from "@/features/api-keys/components/model-multi-sel
 import { ReasoningEffortsMultiSelect } from "@/features/api-keys/components/reasoning-efforts-multi-select";
 import { UsageSectionsMultiSelect } from "@/features/api-keys/components/usage-sections-multi-select";
 import { ModelSourceMultiSelect } from "@/features/model-sources/components/model-source-multi-select";
+import { CODEX_QUOTA_MODES } from "@/features/api-keys/schemas";
 import type {
   ApiKeyCreateRequest,
+  CodexQuotaMode,
   LimitRuleCreate,
   ReasoningEffortType,
   ServiceTierType,
@@ -75,6 +78,8 @@ type ApiKeyCreateDraft = {
   enforcedReasoningEffort: string;
   enforcedServiceTier: string;
   trafficClass: TrafficClass;
+  codexQuotaMode: CodexQuotaMode;
+  codexQuotaPassthroughEnabled: boolean;
   transportPolicyOverride: TransportPolicyOverride | null;
   applyToCodexModel: boolean;
 };
@@ -91,6 +96,8 @@ const initialApiKeyCreateDraft: ApiKeyCreateDraft = {
   enforcedReasoningEffort: "none",
   enforcedServiceTier: "none",
   trafficClass: "foreground",
+  codexQuotaMode: "api_key",
+  codexQuotaPassthroughEnabled: true,
   transportPolicyOverride: null,
   applyToCodexModel: false,
 };
@@ -133,6 +140,8 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
         : {}),
       enforcedServiceTier: draft.enforcedServiceTier === "none" ? null : draft.enforcedServiceTier as ServiceTierType,
       trafficClass: draft.trafficClass,
+      codexQuotaMode: draft.codexQuotaMode,
+      codexQuotaPassthroughEnabled: draft.codexQuotaPassthroughEnabled,
       transportPolicyOverride: draft.transportPolicyOverride,
       expiresAt: draft.expiresAt?.toISOString(),
       limits: validLimits.length > 0 ? validLimits : undefined,
@@ -200,6 +209,42 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
             <div className="space-y-1">
               <label className="text-sm font-medium">{t("apiKeys.form.usageSections")}</label>
               <UsageSectionsMultiSelect value={draft.usageSections} onChange={(usageSections) => updateDraft({ usageSections })} />
+            </div>
+
+            <div className="space-y-1">
+              <label htmlFor="create-api-key-codex-quota-mode" className="text-sm font-medium">
+                {t("apiKeys.form.codexQuotaMode")}
+              </label>
+              <Select
+                value={draft.codexQuotaMode}
+                onValueChange={(value) => updateDraft({ codexQuotaMode: value as CodexQuotaMode })}
+              >
+                <SelectTrigger id="create-api-key-codex-quota-mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {CODEX_QUOTA_MODES.map((mode) => (
+                    <SelectItem key={mode} value={mode}>
+                      {t(`apiKeys.codexQuotaModes.${mode}`)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t("apiKeys.form.codexQuotaModeHint")}</p>
+            </div>
+
+            <div className="flex items-center justify-between rounded-md border p-2 text-sm">
+              <div className="pr-3">
+                <label htmlFor="create-api-key-codex-quota-enabled" className="cursor-pointer font-medium">
+                  {t("apiKeys.form.codexQuotaPassthrough")}
+                </label>
+                <p className="text-xs text-muted-foreground">{t("apiKeys.form.codexQuotaPassthroughHint")}</p>
+              </div>
+              <Switch
+                id="create-api-key-codex-quota-enabled"
+                checked={draft.codexQuotaPassthroughEnabled}
+                onCheckedChange={(checked) => updateDraft({ codexQuotaPassthroughEnabled: checked })}
+              />
             </div>
 
             <div className="space-y-1">
