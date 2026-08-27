@@ -39,6 +39,8 @@ from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
     _as_image_fetch_session,
     _inline_content_images,
     _inline_input_image_urls,
+    _maybe_log_downstream_websocket_event,
+    _maybe_log_upstream_event,
     _payload_has_responses_lite_websocket_marker,
     _payload_uses_responses_lite,
     _ws_transport_payload_budget_bytes,
@@ -1216,6 +1218,14 @@ async def _process_upstream_websocket_transport_end(
     replay_refusal_reasons: list[str] = []
     replay_request_state = None
     message_error_code = getattr(message, "error_code", None)
+    _maybe_log_upstream_event(
+        kind="responses",
+        account_id=account_id_value,
+        transport="websocket",
+        close_code=getattr(message, "close_code", None),
+        error_code=message_error_code,
+        error_message=getattr(message, "error", None),
+    )
     # A classified local transport failure says nothing about account health.
     # It also does not, by itself, mean that a response.create was accepted.
     # Match the official client's connection-retry behavior for requests that
@@ -1695,6 +1705,11 @@ class _WebSocketMixin:
                     bytes_data = message.get("bytes")
 
                     if bytes_data is not None:
+                        _maybe_log_downstream_websocket_event(
+                            raw_text=None,
+                            payload=None,
+                            event_type="<binary>",
+                        )
                         async with client_send_lock:
                             await websocket.send_text(
                                 _serialize_websocket_error_event(
@@ -1705,6 +1720,10 @@ class _WebSocketMixin:
 
                     if text_data is not None:
                         payload = _parse_websocket_payload(text_data)
+                        _maybe_log_downstream_websocket_event(
+                            raw_text=text_data,
+                            payload=payload,
+                        )
                         if payload is None:
                             async with client_send_lock:
                                 await websocket.send_text(
@@ -2688,6 +2707,20 @@ class _WebSocketMixin:
                                     ),
                                 )
                             request_state.response_create_sent_at = time.monotonic()
+                        upstream_payload = _parse_websocket_payload(text_data)
+                        _maybe_log_upstream_event(
+                            kind="request",
+                            account_id=account.id if account is not None else None,
+                            transport="websocket",
+                            event_type=(
+                                upstream_payload.get("type")
+                                if isinstance(upstream_payload, Mapping)
+                                and isinstance(upstream_payload.get("type"), str)
+                                else None
+                            ),
+                            payload=upstream_payload,
+                            raw_text=text_data,
+                        )
                         with _websocket_archive_request_context(archive_request_id):
                             await upstream.send_text(text_data)
                 except ProxyResponseError as exc:
@@ -5236,11 +5269,18 @@ class _WebSocketMixin:
                     "Failed to close upstream websocket after replay sequence refusal",
                     exc_info=True,
                 )
-        except Exception:
+        except Exception as exc:
             _facade().logger.warning(
                 "Upstream websocket reader crashed account_id=%s",
                 account_id_value,
                 exc_info=True,
+            )
+            _maybe_log_upstream_event(
+                kind="responses",
+                account_id=account_id_value,
+                transport="websocket",
+                error_code="stream_incomplete",
+                error_message=str(exc),
             )
             await proxy._fail_pending_websocket_requests(
                 account=account,
@@ -5286,6 +5326,14 @@ class _WebSocketMixin:
         payload = parsed_frame.payload
         event_type = parsed_frame.event_type
         event = parsed_frame.event
+        _maybe_log_upstream_event(
+            kind="responses",
+            account_id=account_id_value,
+            transport="websocket",
+            event_type=event_type,
+            payload=payload,
+            raw_text=text,
+        )
         response_id = _websocket_response_id(event, payload)
         error_message = _websocket_event_error_message(event_type, payload)
         is_typeless_error_event = (

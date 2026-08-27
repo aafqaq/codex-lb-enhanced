@@ -234,6 +234,17 @@ the host side of the compose `ports` mapping instead.
 | `CODEX_LB_OTEL_EXPORTER_ENDPOINT` | `str` | `''` |
 | `CODEX_LB_TRACE` | `str` | `''` |
 
+`CODEX_LB_TRACE` accepts comma-separated channels. For a one-off incident
+capture, use `shape,payload,upstream_summary,upstream_events`; add
+`upstream_payload,upstream_event_payload` only when the bounded request/event
+bodies are required, because those channels may contain user prompts, tool
+arguments, or model output. `upstream_events` emits one record per upstream
+frame, so enable it only for a short reproduction window. Account identifiers and response identifiers in
+`upstream_events` are logged as short SHA-256 hashes; authorization headers and
+API keys are never emitted by these channels. For websocket client-side frames,
+add `client_events` (metadata) and, only when necessary,
+`client_event_payload` (bounded raw frames).
+
 ## Resilience & load shedding
 
 | Environment variable | Type | Default |
