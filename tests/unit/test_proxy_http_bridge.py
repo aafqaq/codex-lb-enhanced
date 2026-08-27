@@ -26428,7 +26428,11 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
         api_key_reservation=None,
         started_at=time.monotonic(),
         awaiting_response_created=True,
-        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        request_text=(
+            '{"type":"response.create","model":"gpt-5.6-sol","input":['
+            '{"role":"user","content":[{"type":"input_text","text":"hello"},'
+            '{"type":"input_file","file_id":"file_from_previous_account"}]}]}'
+        ),
         transport="http",
         replay_count=2,
         account_exhaustion_replay_count=2,
