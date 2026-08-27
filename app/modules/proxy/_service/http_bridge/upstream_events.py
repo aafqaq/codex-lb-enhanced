@@ -19,6 +19,7 @@ from app.core.clients.proxy import (  # noqa: F401
     _as_image_fetch_session,
     _inline_content_images,
     _inline_input_image_urls,
+    _maybe_log_upstream_event,
     _ws_transport_payload_budget_bytes,
     filter_inbound_headers,
     pop_compact_timeout_overrides,
@@ -1375,6 +1376,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                                 ]
                                 if not expired_request_states:
                                     continue
+
                                 expired_retry_circuit_attempt_selection = (
                                     _http_bridge_retry_circuit_attempt_selection_for_pending_requests(
                                         expired_request_states
@@ -1391,6 +1393,18 @@ class _HTTPBridgeUpstreamEventsMixin:
                                     and request_state.proxy_injected_anchor_had_full_resend_payload
                                     for request_state in expired_request_states
                                 )
+
+                            _maybe_log_upstream_event(
+                                kind="responses",
+                                account_id=session.account.id,
+                                transport="http_bridge",
+                                error_code=receive_timeout.error_code,
+                                error_message=receive_timeout.error_message,
+                                response_events_seen=max(
+                                    (request_state.response_event_count for request_state in expired_request_states),
+                                    default=0,
+                                ),
+                            )
 
                             # Do not mutate durable continuity while a receive
                             # may still deliver the response event that proves
@@ -1504,6 +1518,13 @@ class _HTTPBridgeUpstreamEventsMixin:
                         if not receive_cancelled:
                             raise RuntimeError("HTTP bridge upstream receive did not cancel after timeout")
                         receive_task = None
+                    _maybe_log_upstream_event(
+                        kind="responses",
+                        account_id=session.account.id,
+                        transport="http_bridge",
+                        error_code=receive_timeout.error_code,
+                        error_message=receive_timeout.error_message,
+                    )
                     retried = await self._retry_http_bridge_precreated_request(session)
                     if retried:
                         continue
@@ -1542,6 +1563,15 @@ class _HTTPBridgeUpstreamEventsMixin:
                             tuple(session.pending_requests)
                         )
                     )
+                _maybe_log_upstream_event(
+                    kind="responses",
+                    account_id=session.account.id,
+                    transport="http_bridge",
+                    close_code=message.close_code,
+                    error_code=message.error_code,
+                    error_message=message.error,
+                    response_events_seen=response_events_seen,
+                )
                 _archive_http_bridge_upstream_message(session, message, archive_request_state)
                 session.last_upstream_close_generation += 1
                 session.last_upstream_close_code = message.close_code
@@ -1634,6 +1664,13 @@ class _HTTPBridgeUpstreamEventsMixin:
                 exc_info=True,
             )
             error_code = exc.error_code if isinstance(exc, UpstreamWebSocketTransportError) else "stream_incomplete"
+            _maybe_log_upstream_event(
+                kind="responses",
+                account_id=session.account.id,
+                transport="http_bridge",
+                error_code=error_code,
+                error_message=str(exc),
+            )
             account_neutral = is_account_neutral_websocket_error_code(error_code)
             async with session.lifecycle_lock:
                 if not (
@@ -1758,6 +1795,14 @@ class _HTTPBridgeUpstreamEventsMixin:
         event_block = f"data: {text}\n\n"
         payload = parse_sse_data_json(event_block)
         event_type = classify_event_type(payload)
+        _maybe_log_upstream_event(
+            kind="responses",
+            account_id=session.account.id,
+            transport="http_bridge",
+            event_type=event_type,
+            payload=payload,
+            raw_text=text,
+        )
         event = parse_sse_event_payload(payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
         processing_request_state = self._mark_http_bridge_upstream_event_processing(
             session,

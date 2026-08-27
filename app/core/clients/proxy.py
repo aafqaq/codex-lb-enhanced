@@ -1099,6 +1099,137 @@ def _maybe_log_upstream_request_complete(
     )
 
 
+# Response event payloads can contain prompts, tool arguments, and generated
+# text. Even when incident tracing is enabled, keep a hard per-event ceiling
+# so a single large tool call cannot exhaust the container's log buffer.
+_UPSTREAM_EVENT_PAYLOAD_MAX_CHARS = 16 * 1024
+
+
+def _trace_hash_identifier(value: str) -> str:
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _trace_truncate(value: str, *, max_length: int = 96) -> str:
+    if len(value) <= max_length:
+        return value
+    return f"{value[: max_length // 2]}...{value[-16:]}"
+
+
+def _maybe_log_upstream_event(
+    *,
+    kind: str,
+    account_id: str | None,
+    transport: str,
+    event_type: str | None = None,
+    payload: Mapping[str, JsonValue] | None = None,
+    raw_text: str | None = None,
+    close_code: int | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    response_events_seen: int | None = None,
+) -> None:
+    """Emit bounded upstream response/close diagnostics for incident tracing.
+
+    Metadata is logged only with ``upstream_events``. The raw event body is
+    included only when ``upstream_event_payload`` is explicitly enabled.
+    Credentials never reach this function: callers pass parsed event data and
+    the selected account id, not upstream headers.
+    """
+
+    channels = get_settings().trace_channels
+    if "upstream_events" not in channels and "upstream_event_payload" not in channels:
+        return
+
+    event_payload = payload or {}
+    response_id = event_payload.get("response_id")
+    if not isinstance(response_id, str):
+        response = event_payload.get("response")
+        if isinstance(response, Mapping):
+            candidate = response.get("id")
+            response_id = candidate if isinstance(candidate, str) else None
+    sequence_number = event_payload.get("sequence_number")
+    status = event_payload.get("status")
+    error = event_payload.get("error")
+    if isinstance(error, Mapping):
+        if error_code is None and isinstance(error.get("code"), str):
+            error_code = error["code"]
+        if error_message is None and isinstance(error.get("message"), str):
+            error_message = error["message"]
+    if error_code is None and isinstance(event_payload.get("code"), str):
+        error_code = event_payload["code"]
+    if error_message is None and isinstance(event_payload.get("message"), str):
+        error_message = event_payload["message"]
+
+    safe_account_id = _trace_hash_identifier(account_id) if isinstance(account_id, str) and account_id else None
+    if "upstream_events" in channels:
+        logger.info(
+            "upstream_event request_id=%s kind=%s transport=%s account_id=%s event_type=%s "
+            "response_id=%s sequence_number=%s status=%s close_code=%s error_code=%s "
+            "error_message=%s response_events_seen=%s",
+            get_request_id(),
+            kind,
+            transport,
+            safe_account_id,
+            event_type,
+            _trace_hash_identifier(response_id) if response_id else None,
+            sequence_number,
+            status,
+            close_code,
+            error_code,
+            _trace_truncate(error_message) if isinstance(error_message, str) else error_message,
+            response_events_seen,
+        )
+    if "upstream_event_payload" in channels:
+        if raw_text is None:
+            payload_for_log: dict[str, JsonValue] = dict(event_payload)
+            if close_code is not None:
+                payload_for_log["close_code"] = close_code
+            if error_code is not None:
+                payload_for_log["error_code"] = error_code
+            if error_message is not None:
+                payload_for_log["error_message"] = error_message
+            raw_text = json.dumps(payload_for_log, ensure_ascii=True, separators=(",", ":"))
+        logger.info(
+            "upstream_event_payload request_id=%s kind=%s transport=%s event_type=%s payload=%s",
+            get_request_id(),
+            kind,
+            transport,
+            event_type,
+            _trace_truncate(raw_text, max_length=_UPSTREAM_EVENT_PAYLOAD_MAX_CHARS),
+        )
+
+
+def _maybe_log_downstream_websocket_event(
+    *,
+    raw_text: str | None,
+    payload: Mapping[str, JsonValue] | None,
+    event_type: str | None = None,
+) -> None:
+    """Trace client-originated websocket frames without logging credentials."""
+
+    channels = get_settings().trace_channels
+    if "client_events" not in channels and "client_event_payload" not in channels:
+        return
+    if event_type is None and isinstance(payload, Mapping):
+        candidate = payload.get("type")
+        if isinstance(candidate, str):
+            event_type = candidate
+    if "client_events" in channels:
+        logger.info(
+            "client_event request_id=%s transport=websocket event_type=%s payload_bytes=%s",
+            get_request_id(),
+            event_type,
+            len(raw_text.encode("utf-8")) if isinstance(raw_text, str) else None,
+        )
+    if "client_event_payload" in channels:
+        logger.info(
+            "client_event_payload request_id=%s transport=websocket event_type=%s payload=%s",
+            get_request_id(),
+            event_type,
+            _trace_truncate(raw_text or "", max_length=_UPSTREAM_EVENT_PAYLOAD_MAX_CHARS),
+        )
+
+
 def _normalize_error_code(code: str | None, error_type: str | None) -> str:
     if code:
         normalized_code = code.lower()

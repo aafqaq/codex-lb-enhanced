@@ -376,7 +376,13 @@ class Settings(BaseSettings):
     # raw prompt cache key in shape logs), ``payload`` (downstream request
     # payload), ``service_tier`` (service-tier trace), ``upstream_summary``
     # (upstream request summary/completion), ``upstream_payload`` (upstream
-    # request payload). Interactive incident use only, not steady-state config.
+    # request payload), ``upstream_events`` (one-line response/close event
+    # diagnostics; one record per upstream frame), and
+    # ``upstream_event_payload`` (truncated raw upstream response event
+    # payloads), ``client_events`` (one-line downstream websocket frame
+    # diagnostics), and ``client_event_payload`` (truncated raw downstream
+    # websocket frames). Interactive incident use only, not steady-state
+    # config; the payload channels may contain user prompts and model output.
     trace: str = ""
     conversation_archive_enabled: bool = False
     conversation_archive_dir: Path = DEFAULT_CONVERSATION_ARCHIVE_DIR
