@@ -26432,6 +26432,8 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
         transport="http",
         replay_count=2,
         account_exhaustion_replay_count=2,
+        operation_id="op-quota-rebind",
+        operation_rebind_required=True,
         excluded_account_ids={"acc-quota-a", "acc-quota-b", "acc-quota-c"},
         account_response_create_lease=cast(Any, object()),
     )

@@ -3181,7 +3181,20 @@ class _HTTPBridgeRequestSubmitMixin:
                 # codex_lb_operation_id after selection. Keep that operation
                 # identity on its owner unless a dedicated rebind path has
                 # already replaced the operation ID.
-                candidate_portable = request_state.operation_id is None and (
+                # A pre-dispatch usage-limit response is definitive evidence
+                # that the selected account never accepted this operation.
+                # The durable operation id is only a proxy-side idempotency
+                # fence in that case, so an exhausted account must not turn it
+                # into an account-bound replay.  ``upstream_events`` marks the
+                # operation rebind-required before entering this retry path.
+                candidate_portable = (
+                    request_state.operation_id is None
+                    or (
+                        allow_account_exhaustion_failover
+                        and fresh_hard_request_account_switch_allowed
+                        and request_state.operation_rebind_required
+                    )
+                ) and (
                     _websocket_request_text_is_account_neutral_fresh_replay(candidate_text)
                 )
                 request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
