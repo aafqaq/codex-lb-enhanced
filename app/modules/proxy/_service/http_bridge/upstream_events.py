@@ -1259,6 +1259,31 @@ class _HTTPBridgeUpstreamEventsMixin:
         receive_task: asyncio.Task[UpstreamWebSocketMessage] | None = None
         wakeup_task: asyncio.Task[bool] | None = None
         reader_failure_retry_circuit_attempt_selection: _HTTPBridgeRetryCircuitAttemptSelection | None = None
+
+        def mark_receive_completion(task: asyncio.Task[UpstreamWebSocketMessage]) -> None:
+            """Publish frame receipt before the relay performs persistence."""
+            if task.cancelled():
+                return
+            try:
+                message = task.result()
+            except BaseException:
+                return
+            if message.kind != "text" or message.text is None:
+                return
+            event_block = f"data: {message.text}\n\n"
+            try:
+                payload = parse_sse_data_json(event_block)
+            except BaseException:
+                # The normal relay path owns malformed-frame handling; a
+                # completion callback must never surface a second unhandled
+                # exception on the event loop.
+                return
+            self._mark_http_bridge_upstream_event_processing(
+                session,
+                payload=payload,
+                event_type=classify_event_type(payload),
+            )
+
         try:
             while True:
                 reader_failure_retry_circuit_attempt_selection = None
@@ -1287,6 +1312,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                 )
                 if receive_task is None:
                     receive_task = asyncio.create_task(session.upstream.receive())
+                    receive_task.add_done_callback(mark_receive_completion)
 
                 message: UpstreamWebSocketMessage | None = None
                 timed_out = False
@@ -1644,6 +1670,86 @@ class _HTTPBridgeUpstreamEventsMixin:
             if session.upstream is relay_upstream:
                 session.closed = True
 
+    def _mark_http_bridge_upstream_event_processing(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        *,
+        payload: dict[str, JsonValue] | None,
+        event_type: str | None,
+    ) -> _WebSocketRequestState | None:
+        """Mark the request matched by an upstream frame before slow bookkeeping.
+
+        The reader must persist and fan out every frame before the downstream
+        stream sees it.  That work can briefly exceed a very small keepalive
+        interval (especially during a reconnect), so the downstream timeout
+        needs an early, request-scoped indication that a frame was received.
+        Matching here mirrors the pure selection rules used by
+        ``_process_parsed_http_bridge_upstream_event`` without claiming or
+        mutating pending ownership.  The marker is cleared by the caller once
+        the frame has been queued or processing fails.
+        """
+        response_id = _websocket_response_id(None, payload)
+        matched_request_state: _WebSocketRequestState | None = None
+        if event_type == "response.created":
+            if response_id is not None:
+                matched_request_state = _find_websocket_request_state_by_response_id(
+                    session.pending_requests,
+                    response_id,
+                )
+            # A created event normally carries a new upstream response ID, so
+            # fall through to the same unresolved-request order used by
+            # _assign_websocket_response_id when that ID is not found.
+        if matched_request_state is None and event_type == "response.created":
+            # Keep this candidate order identical to _assign_websocket_response_id.
+            for request_state in session.pending_requests:
+                if request_state.response_id is None and _http_bridge_request_counts_against_queue(request_state):
+                    matched_request_state = request_state
+                    break
+            if matched_request_state is None:
+                for request_state in session.pending_requests:
+                    if request_state.response_id is None and request_state.draining_until_terminal:
+                        matched_request_state = request_state
+                        break
+            if matched_request_state is None:
+                for request_state in session.pending_requests:
+                    if request_state.response_id is None:
+                        matched_request_state = request_state
+                        break
+        elif matched_request_state is None:
+            error_message = _websocket_event_error_message(event_type, payload)
+            is_previous_response_not_found_event = _is_previous_response_not_found_error(
+                code=_normalize_error_code(
+                    _websocket_event_error_code(event_type, payload),
+                    _websocket_event_error_type(event_type, payload),
+                ),
+                param=_websocket_event_error_param(event_type, payload),
+                message=error_message,
+            )
+            is_missing_tool_output_event = _is_missing_tool_output_error(
+                code=_normalize_error_code(
+                    _websocket_event_error_code(event_type, payload),
+                    _websocket_event_error_type(event_type, payload),
+                ),
+                param=_websocket_event_error_param(event_type, payload),
+                message=error_message,
+            )
+            matched_request_state = _match_websocket_request_state_for_anonymous_event(
+                session.pending_requests,
+                prefer_previous_response_not_found=is_previous_response_not_found_event
+                or is_missing_tool_output_event,
+                previous_response_id_hint=_previous_response_id_from_not_found_message(error_message),
+                error_message=error_message,
+                allow_unanchored_previous_response_error=is_previous_response_not_found_event,
+                prefer_draining_requests=event_type not in {"response.failed", "response.incomplete", "error"},
+            )
+        if matched_request_state is None:
+            return None
+        now = _service_time().monotonic()
+        matched_request_state.last_upstream_activity_at = now
+        matched_request_state.upstream_event_processing = True
+        matched_request_state.upstream_event_processing_started_at = now
+        return matched_request_state
+
     async def _process_http_bridge_upstream_text(
         self: Any,
         session: "_HTTPBridgeSession",
@@ -1653,6 +1759,11 @@ class _HTTPBridgeUpstreamEventsMixin:
         payload = parse_sse_data_json(event_block)
         event_type = classify_event_type(payload)
         event = parse_sse_event_payload(payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
+        processing_request_state = self._mark_http_bridge_upstream_event_processing(
+            session,
+            payload=payload,
+            event_type=event_type,
+        )
         completed_delivery_scope = _HTTPBridgeCompletedDeliveryScope() if event_type == "response.completed" else None
         claimed_terminal_request_states: list[_WebSocketRequestState] = []
         try:
@@ -1682,6 +1793,9 @@ class _HTTPBridgeUpstreamEventsMixin:
             for claimed_request_state in claimed_terminal_request_states:
                 claimed_request_state.terminal_settlement_phase = None
         finally:
+            if processing_request_state is not None:
+                processing_request_state.upstream_event_processing = False
+                processing_request_state.upstream_event_processing_started_at = None
             if completed_delivery_scope is not None:
                 completed_delivery_scope.active = False
 
@@ -2617,19 +2731,34 @@ class _HTTPBridgeUpstreamEventsMixin:
                         session.queued_request_count = max(0, session.queued_request_count - 1)
                 if account_exhaustion_retry:
                     status_request_state.error_http_status_override = 429
-                    status_request_state.error_code_override = USAGE_LIMIT_REACHED
+                    # Preserve the upstream rate-limit classifier and payload
+                    # metadata when the pool has no eligible replacement. A
+                    # normalized ``usage_limit_reached`` code is still used
+                    # when the upstream supplied no more specific classifier.
+                    status_request_state.error_code_override = (
+                        retry_error_code or terminal_account_exhaustion_code or USAGE_LIMIT_REACHED
+                    )
                     status_request_state.error_message_override = (
                         status_request_state.last_account_exhaustion_error_message
                         or "The usage limit has been reached"
                     )
-                    status_request_state.error_type_override = USAGE_LIMIT_REACHED
+                    status_request_state.error_type_override = (
+                        _websocket_event_error_type(event_type, payload)
+                        or status_request_state.error_code_override
+                    )
+                    original_rate_limit_metadata: dict[str, JsonValue] = {}
+                    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                        for metadata_key in ("plan_type", "resets_at", "resets_in_seconds"):
+                            metadata_value = payload["error"].get(metadata_key)
+                            if isinstance(metadata_value, (str, int, float)):
+                                original_rate_limit_metadata[metadata_key] = metadata_value
                     payload = cast(
                         dict[str, JsonValue],
                         dict(
                             response_failed_event(
-                                USAGE_LIMIT_REACHED,
+                                status_request_state.error_code_override,
                                 status_request_state.error_message_override,
-                                error_type=USAGE_LIMIT_REACHED,
+                                error_type=status_request_state.error_type_override,
                                 response_id=(
                                     status_request_state.replay_downstream_response_id
                                     or status_request_state.request_id
@@ -2637,6 +2766,10 @@ class _HTTPBridgeUpstreamEventsMixin:
                             )
                         ),
                     )
+                    if original_rate_limit_metadata:
+                        response_error = payload.get("response", {}).get("error")
+                        if isinstance(response_error, dict):
+                            response_error.update(original_rate_limit_metadata)
                     event_block = format_sse_event(payload)
                     event = parse_sse_event_payload(payload)
                     event_type = "response.failed"

@@ -5916,8 +5916,14 @@ async def _stream_responses(
                 capacity_startup_wait_event=capacity_wait_event,
                 capacity_startup_ready_event=capacity_ready_event,
             )
-            async for line in retry_stream:
-                yield line
+            try:
+                async for line in retry_stream:
+                    yield line
+            finally:
+                await _close_responses_stream_best_effort(
+                    retry_stream,
+                    action="server-owned recovery",
+                )
 
         return _retry()
 
@@ -7481,6 +7487,7 @@ async def _stream_response_error_events(
             while True:
                 yield ": codex-lb recovery in progress\n\n"
                 await asyncio.sleep(retry_delay)
+                retry_stream: AsyncIterator[str] | None = None
                 try:
                     retry_stream = recovery_stream_factory()
                     retry_saw_downstream_event = False
@@ -7543,6 +7550,12 @@ async def _stream_response_error_events(
                         retry_after_seconds=5,
                     )
                     break
+                finally:
+                    if retry_stream is not None:
+                        await _close_responses_stream_best_effort(
+                            retry_stream,
+                            action="indefinite recovery attempt",
+                        )
         await release_owned_reservation()
         envelope = _parse_error_envelope(exc.payload)
         _, envelope = _mask_previous_response_not_found_error(
