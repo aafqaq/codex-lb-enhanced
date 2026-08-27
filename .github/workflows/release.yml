@@ -350,7 +350,7 @@ jobs:
             fs.writeFileSync("release_notes.md", `${data.body.trimEnd()}\n`);
             core.setOutput("tag_name", tag);
 
-      - name: Append install and contributors
+      - name: Append install instructions
         shell: bash
         env:
           TAG_NAME: ${{ steps.prev_tag.outputs.tag_name }}

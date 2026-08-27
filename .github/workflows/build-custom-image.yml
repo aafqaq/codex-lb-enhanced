@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - custom/resilient-streams-v1.24
+      - main
 
 concurrency:
   group: custom-image-${{ github.ref }}
