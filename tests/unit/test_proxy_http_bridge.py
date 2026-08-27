@@ -10,7 +10,7 @@ import subprocess
 import time
 from collections import deque
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -26443,7 +26443,11 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
         preferred_account_id="acc-quota-c",
         excluded_account_ids={"acc-quota-a", "acc-quota-b", "acc-quota-c"},
         account_response_create_lease=cast(Any, object()),
-        affinity_policy=proxy_service._AffinityPolicy(reallocate_sticky=True),
+        affinity_policy=proxy_service._AffinityPolicy(
+            key="bridge-quota-walk",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+            reallocate_sticky=True,
+        ),
     )
     session = _make_bridge_session(
         key=proxy_service._HTTPBridgeSessionKey("session_header", "bridge-quota-walk", None),
@@ -26474,6 +26478,43 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
     # A quota exhaustion retry must override the session's hard sticky owner;
     # otherwise the selector repeatedly chooses the exhausted account.
     assert reconnect_call.kwargs["selection_affinity"].reallocate_sticky is True
+    assert reconnect_call.kwargs["selection_affinity"].key is None
+    assert reconnect_call.kwargs["selection_affinity"].kind is None
+
+
+@pytest.mark.asyncio
+async def test_quota_failover_rebinds_live_codex_affinity_after_pool_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transient unbound retry must be followed by a durable owner rebind."""
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    sticky_repo = AsyncMock()
+
+    @asynccontextmanager
+    async def repo_factory():
+        yield SimpleNamespace(sticky_sessions=sticky_repo)
+
+    monkeypatch.setattr(service, "_repo_factory", repo_factory)
+    session = _make_bridge_session(key_value="quota-rebind")
+    session.account = cast(Any, SimpleNamespace(id="replacement-account"))
+    previous_affinity = proxy_service._AffinityPolicy(
+        key="turn-state-owner",
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+    )
+
+    await http_bridge_request_submit_module._rebind_http_bridge_affinity_after_account_failover(
+        service,
+        session,
+        previous_affinity,
+    )
+
+    sticky_repo.upsert.assert_awaited_once_with(
+        "turn-state-owner",
+        "replacement-account",
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+    )
+    assert session.affinity == previous_affinity
+    assert session.codex_session is True
 
 
 @pytest.mark.asyncio
