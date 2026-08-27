@@ -5853,7 +5853,10 @@ class _WebSocketMixin:
                     # exclusion set is the retry bound: every failed account is
                     # visited once and selection eventually returns the real
                     # pool-wide usage_limit_reached result.
-                    retry_text = _prepare_websocket_request_state_for_account_switch(request_state)
+                    retry_text = _prepare_websocket_request_state_for_account_switch(
+                        request_state,
+                        allow_quota_projection=True,
+                    )
                     if retry_text is None:
                         retry_error_code = None
                     else:
