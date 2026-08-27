@@ -22,6 +22,9 @@ _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
 )
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
+_CODEX_CLIENT_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset(
+    {"turn_id", "create_time", "content_item_kinds"}
+)
 _ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "web_search", "web_search_preview"})
 _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS = {
     "custom": frozenset({"description", "format", "name", "type"}),
@@ -246,9 +249,16 @@ def _project_account_neutral_replay_item(
         return None
 
     if "id" not in item:
-        return item
-    projected_item = dict(item)
-    projected_item.pop("id")
+        projected_item = dict(item)
+    else:
+        projected_item = dict(item)
+        projected_item.pop("id")
+    metadata = projected_item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    if isinstance(metadata, dict) and _internal_chat_message_metadata_is_account_neutral(metadata):
+        # create_time/content_item_kinds are Codex client bookkeeping, not
+        # portable model context. Keep only the stable turn boundary in a
+        # cross-account replay payload.
+        projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
     return projected_item
 
 
@@ -300,10 +310,19 @@ def responses_input_items_are_self_contained_fresh_replay(input_items: list[Json
 def _internal_chat_message_metadata_is_account_neutral(value: JsonValue | None) -> bool:
     if value is None:
         return True
-    return (
-        isinstance(value, dict)
-        and set(value) == _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS
-        and _is_nonblank_string(value.get("turn_id"))
+    if not isinstance(value, dict) or not _is_nonblank_string(value.get("turn_id")):
+        return False
+    if set(value) == _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS:
+        return True
+    if not set(value) <= _CODEX_CLIENT_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS:
+        return False
+    create_time = value.get("create_time")
+    if create_time is not None and (isinstance(create_time, bool) or not isinstance(create_time, (int, float))):
+        return False
+    content_item_kinds = value.get("content_item_kinds")
+    return content_item_kinds is None or (
+        isinstance(content_item_kinds, list)
+        and all(_is_nonblank_string(kind) for kind in content_item_kinds)
     )
 
 
@@ -329,6 +348,7 @@ def responses_input_suffix_retains_prior_output(
     fresh_followup_seen = False
     fresh_followup_count = 0
     fresh_followup_is_user_message = False
+    fresh_followup_turn_id: str | None = None
     fresh_developer_followup_seen = False
     for item in input_items[stored_count:]:
         if fresh_developer_followup_seen or not isinstance(item, dict):
@@ -353,6 +373,7 @@ def responses_input_suffix_retains_prior_output(
             fresh_followup_seen = False
             fresh_followup_count = 0
             fresh_followup_is_user_message = False
+            fresh_followup_turn_id = None
             continue
         call_type = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.get(item_type or "")
         if call_type is not None:
@@ -373,6 +394,7 @@ def responses_input_suffix_retains_prior_output(
             fresh_followup_seen = False
             fresh_followup_count = 0
             fresh_followup_is_user_message = False
+            fresh_followup_turn_id = None
             continue
         if _is_fresh_followup_input(item):
             if not retained_output_seen or pending_suffix_calls:
@@ -380,13 +402,21 @@ def responses_input_suffix_retains_prior_output(
             fresh_followup_seen = True
             fresh_followup_count += 1
             fresh_followup_is_user_message = item_type in (None, "message") and item.get("role") == "user"
+            fresh_followup_turn_id = _account_neutral_turn_id(item)
             continue
         if _fresh_developer_message_is_transparent(item):
+            developer_turn_id = _account_neutral_turn_id(item)
             if (
                 not fresh_followup_seen
                 or fresh_followup_count != 1
                 or not fresh_followup_is_user_message
-                or not retained_output_is_final_answer
+                or (
+                    not retained_output_is_final_answer
+                    and (
+                        fresh_followup_turn_id is None
+                        or developer_turn_id != fresh_followup_turn_id
+                    )
+                )
                 or pending_suffix_calls
             ):
                 return False
@@ -394,6 +424,14 @@ def responses_input_suffix_retains_prior_output(
             continue
         return False
     return retained_output_seen and fresh_followup_seen and not pending_suffix_calls
+
+
+def _account_neutral_turn_id(item: Mapping[str, JsonValue]) -> str | None:
+    metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    if not isinstance(metadata, dict):
+        return None
+    turn_id = metadata.get("turn_id")
+    return turn_id if _is_nonblank_string(turn_id) else None
 
 
 def responses_input_suffix_matches_pending_tool_calls(
