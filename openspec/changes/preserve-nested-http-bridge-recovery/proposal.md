@@ -14,6 +14,11 @@ and operation fence.
   session, owner epoch, operation id, and predecessor proof.
 - Apply the same proof to failures raised while creating or streaming the
   server-owned local recovery attempt.
+- Explicitly close every server-owned recovery iterator after success,
+  failure, or cancellation so repeated recovery cannot retain bridge resources.
+- Treat a matched upstream frame as request activity as soon as the receive
+  task completes, and defer idle-timeout accounting while that request's
+  persistence/delivery work is still in progress.
 - Keep fresh turns, non-durable sessions, and requests without a predecessor on
   their existing terminal error path.
 
@@ -30,4 +35,5 @@ and operation fence.
 Old Codex conversations no longer lose their downstream stream solely because
 the first local reattach attempt also encounters an eventless websocket drop.
 Account selection and load-balancer rotation remain unchanged; this change only
-preserves recovery metadata on the nested failure.
+preserves recovery metadata on the nested failure and releases each attempt's
+resources deterministically.

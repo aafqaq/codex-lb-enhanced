@@ -241,6 +241,11 @@ logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
 _REQUEST_TRANSPORT_HTTP = "http"
 _RESPONSE_CREATE_GATE_RETRY_SLEEP_SECONDS = 10.0
+# Small scheduler/DB handoff grace used only after asyncio's keepalive wait
+# expires. It prevents a just-received upstream frame from losing its request
+# before the reader can enqueue it, without extending the configured retry
+# count or request deadline indefinitely.
+_HTTP_BRIDGE_RECEIVED_FRAME_HANDOFF_GRACE_SECONDS = 0.05
 
 
 def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketRequestState) -> bool:
@@ -4155,6 +4160,30 @@ class _HTTPBridgeStreamingMixin:
                     try:
                         event_block = await asyncio.wait_for(event_queue.get(), timeout=wait_timeout)
                     except asyncio.TimeoutError:
+                        # Let an upstream reader that became runnable at the
+                        # same deadline publish its frame before accounting an
+                        # idle strike.  Keep this grace bounded: it absorbs
+                        # scheduler/DB handoff jitter without changing the
+                        # configured retry count or request budget materially.
+                        await asyncio.sleep(_HTTP_BRIDGE_RECEIVED_FRAME_HANDOFF_GRACE_SECONDS)
+                        if not event_queue.empty():
+                            continue
+                        # The upstream reader marks a matched request as soon
+                        # as it receives a frame, before durable persistence
+                        # and downstream queue delivery.  Do not spend an
+                        # idle-timeout strike while that request-scoped work
+                        # is still progressing; a multiplexed sibling must not
+                        # suppress this request's timeout.
+                        if request_state.upstream_event_processing:
+                            processing_started_at = request_state.upstream_event_processing_started_at
+                            if processing_started_at is None or _service_time().monotonic() < request_deadline:
+                                keepalive_count = 0
+                                keepalive_event = stream_idle_keepalive(
+                                    downstream_response_id=_websocket_downstream_response_id(request_state),
+                                )
+                                if keepalive_event is not None:
+                                    yield keepalive_event
+                                continue
                         if request_state.account_capacity_waiting:
                             keepalive_count = 0
                             if request_state.account_capacity_wait_suppress_keepalive:

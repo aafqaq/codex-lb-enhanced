@@ -2173,6 +2173,39 @@ class _HTTPBridgeMixin(
                 complete_failed_handoff()
                 raise
             account = selection.account
+            if (
+                account is not None
+                and account.id in excluded_account_ids
+                and request_state.account_exhaustion_replay_count > 0
+            ):
+                # The compatibility selector normally rejects an excluded
+                # account at its boundary. Keep the reattach loop defensive as
+                # well: a stale/mocked selector must never turn one exhausted
+                # account into an A→A retry storm.  Treat an exhausted
+                # account set as the same terminal condition as the selector's
+                # usage-limit result; the upstream event handler then emits
+                # the original Codex-compatible 429 envelope.
+                logger.warning(
+                    "HTTP bridge reattach selector returned an excluded account; stopping retry loop "
+                    "request_id=%s account_id=%s excluded_count=%s",
+                    request_state.request_id,
+                    account.id,
+                    len(excluded_account_ids),
+                )
+                selection = replace(
+                    selection,
+                    account=None,
+                    error_code=(
+                        USAGE_LIMIT_REACHED
+                        if request_state.account_exhaustion_replay_count > 0
+                        else "no_accounts"
+                    ),
+                    error_message=(
+                        request_state.last_account_exhaustion_error_message
+                        or "No eligible accounts remain for this retry"
+                    ),
+                )
+                account = None
             if account is None:
                 try:
                     await release_selected_account_lease()

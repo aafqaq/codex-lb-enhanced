@@ -301,6 +301,123 @@ async def test_indefinite_recovery_stops_after_retry_output_then_transport_error
     assert any('"type":"response.created"' in event for event in events)
 
 
+@pytest.mark.asyncio
+async def test_indefinite_recovery_closes_every_attempt_iterator(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        proxy_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+        ),
+    )
+    monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
+
+    initial_error = ProxyResponseError(
+        502,
+        {"error": {"code": "stream_incomplete", "message": "closed", "type": "server_error"}},
+    )
+    setattr(initial_error, "http_bridge_durable_recovery_eligible", True)
+
+    async def stream():
+        raise initial_error
+        yield ""  # pragma: no cover
+
+    class TrackedRecoveryIterator:
+        def __init__(self, *, failure: ProxyResponseError | None = None) -> None:
+            self.failure = failure
+            self.closed = False
+            self.emitted = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> str:
+            if self.failure is not None:
+                failure = self.failure
+                self.failure = None
+                raise failure
+            if self.emitted:
+                raise StopAsyncIteration
+            self.emitted = True
+            return 'data: {"type":"response.completed"}\n\n'
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    retry_error = ProxyResponseError(
+        502,
+        {"error": {"code": "stream_incomplete", "message": "closed again", "type": "server_error"}},
+    )
+    setattr(retry_error, "http_bridge_durable_recovery_eligible", True)
+    attempts_snapshot = [TrackedRecoveryIterator(failure=retry_error), TrackedRecoveryIterator()]
+    attempts = list(attempts_snapshot)
+
+    events = [
+        event
+        async for event in _stream_response_error_events(
+            stream(),
+            owns_reservation=False,
+            reservation=None,
+            recovery_stream_factory=lambda: attempts.pop(0),
+            require_durable_recovery_fence=True,
+        )
+    ]
+
+    assert attempts == []
+    assert all(attempt.closed for attempt in attempts_snapshot)
+    assert events[-1] == 'data: {"type":"response.completed"}\n\n'
+
+
+@pytest.mark.asyncio
+async def test_indefinite_recovery_closes_active_attempt_on_downstream_cancel(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        proxy_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="server_indefinite_recovery"
+        ),
+    )
+    monkeypatch.setattr(proxy_api.asyncio, "sleep", lambda _delay: _completed_asyncio_sleep())
+
+    initial_error = ProxyResponseError(
+        502,
+        {"error": {"code": "stream_incomplete", "message": "closed", "type": "server_error"}},
+    )
+    setattr(initial_error, "http_bridge_durable_recovery_eligible", True)
+
+    async def stream():
+        raise initial_error
+        yield ""  # pragma: no cover
+
+    class ActiveRecoveryIterator:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> str:
+            return 'data: {"type":"response.created"}\n\n'
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    attempt = ActiveRecoveryIterator()
+    events = _stream_response_error_events(
+        stream(),
+        owns_reservation=False,
+        reservation=None,
+        recovery_stream_factory=lambda: attempt,
+        require_durable_recovery_fence=True,
+    )
+
+    assert await anext(events) == ": codex-lb recovery in progress\n\n"
+    assert await anext(events) == 'data: {"type":"response.created"}\n\n'
+    await events.aclose()
+
+    assert attempt.closed is True
+
+
 async def _completed_asyncio_sleep(_delay: float = 0.0) -> None:
     return None
 

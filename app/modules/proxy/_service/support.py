@@ -1092,6 +1092,13 @@ class _WebSocketRequestState:
     error_http_status_override: int | None = None
     response_event_count: int = 0
     last_upstream_activity_at: float | None = None
+    # Set while the HTTP-bridge reader is processing a matched upstream event.
+    # Downstream idle-timeout handling uses this per-request marker to avoid
+    # declaring a response dead while durable bookkeeping is still in flight.
+    # It is deliberately request-scoped so activity on a multiplexed sibling
+    # request cannot suppress this request's timeout.
+    upstream_event_processing: bool = False
+    upstream_event_processing_started_at: float | None = None
     upstream_model_output_seen: bool = False
     previous_response_not_found_rewritten: bool = False
     previous_response_owner_lookup_source: str | None = None
