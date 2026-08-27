@@ -37,7 +37,7 @@ async def test_runtime_version_reports_update_available_for_newer_github_release
     assert status.latest_version == "1.20.0"
     assert status.update_available is True
     assert status.source == "github"
-    assert status.release_url == "https://github.com/Soju06/codex-lb/releases/latest"
+    assert status.release_url == "https://github.com/aafqaq/codex-lb-enhanced/releases/latest"
 
 
 @pytest.mark.asyncio
@@ -50,6 +50,24 @@ async def test_runtime_version_does_not_report_update_for_same_release() -> None
 
     assert status.latest_version == "1.19.0"
     assert status.update_available is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_version_falls_back_to_latest_tag_when_no_release_exists() -> None:
+    service = RuntimeVersionService(current_version="1.24.8", ttl_seconds=60)
+    release_response = _mock_response(status=404, json_data=None)
+    tags_response = _mock_response(json_data=[{"name": "1.24.9", "tag_name": "v1.24.9"}])
+    session = MagicMock()
+    session.get = MagicMock(side_effect=[release_response, tags_response])
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("app.modules.runtime.service.aiohttp.ClientSession", return_value=session):
+        status = await service.get_version_status()
+
+    assert status.latest_version == "1.24.9"
+    assert status.update_available is True
+    assert status.source == "github"
 
 
 @pytest.mark.asyncio

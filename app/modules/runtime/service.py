@@ -17,6 +17,7 @@ from app.modules.runtime.schemas import RuntimeVersionResponse
 logger = logging.getLogger(__name__)
 
 _GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/aafqaq/codex-lb-enhanced/releases/latest"
+_GITHUB_TAGS_URL = "https://api.github.com/repos/aafqaq/codex-lb-enhanced/tags?per_page=20"
 _LATEST_RELEASE_PAGE_URL = "https://github.com/aafqaq/codex-lb-enhanced/releases/latest"
 _VERSION_RE = re.compile(
     r"^v?(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)"
@@ -104,10 +105,22 @@ class RuntimeVersionService:
             headers["Authorization"] = f"Bearer {github_token}"
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.get(_GITHUB_LATEST_RELEASE_URL, headers=headers) as response:
-                if response.status != 200:
+                if response.status == 200:
+                    data = await response.json()
+                elif response.status == 404:
+                    # A freshly created fork may publish its image/tag before
+                    # the first GitHub Release exists.  Falling back to tags
+                    # keeps the dashboard update check useful and avoids a
+                    # noisy 404 warning on every refresh.
+                    async with session.get(_GITHUB_TAGS_URL, headers=headers) as tags_response:
+                        if tags_response.status != 200:
+                            raise RuntimeError(f"GitHub tags API returned HTTP {tags_response.status}")
+                        data = await tags_response.json()
+                else:
                     raise RuntimeError(f"GitHub releases API returned HTTP {response.status}")
-                data = await response.json()
 
+        if isinstance(data, list):
+            data = data[0] if data else None
         raw_version = data.get("tag_name") if isinstance(data, dict) else None
         if not isinstance(raw_version, str):
             raise RuntimeError(f"GitHub release tag_name is not a string: {raw_version!r}")
