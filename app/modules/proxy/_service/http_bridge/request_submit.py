@@ -3346,6 +3346,12 @@ class _HTTPBridgeRequestSubmitMixin:
                 await self._reconnect_http_bridge_session(
                     session,
                     request_state=request_state,
+                    # A definitive pre-dispatch quota rejection is the one
+                    # hard-session case that is safe to move between owners.
+                    # Pass the request's reallocation policy explicitly;
+                    # otherwise reconnect falls back to the session's hard
+                    # sticky policy and waits forever for the exhausted owner.
+                    selection_affinity=(request_state.affinity_policy if quota_hard_account_switch else None),
                     **reconnect_reader_kwargs,
                 )
             if request_state.account_response_create_lease is None:
