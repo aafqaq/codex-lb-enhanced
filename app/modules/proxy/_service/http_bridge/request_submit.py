@@ -3230,6 +3230,11 @@ class _HTTPBridgeRequestSubmitMixin:
                 # fence in that case, so an exhausted account must not turn it
                 # into an account-bound replay.  ``upstream_events`` marks the
                 # operation rebind-required before entering this retry path.
+                quota_replay_candidate = (
+                    allow_account_exhaustion_failover
+                    and quota_hard_account_switch
+                    and quota_replay_text is not None
+                )
                 candidate_portable = (
                     request_state.operation_id is None
                     or (
@@ -3239,6 +3244,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     )
                 ) and (
                     _websocket_request_text_is_account_neutral_fresh_replay(candidate_text)
+                    or quota_replay_candidate
                 )
                 request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
                 if request_text is None or request_text != candidate_text:
@@ -3317,7 +3323,32 @@ class _HTTPBridgeRequestSubmitMixin:
             # below acquires a lease for the account actually selected.
             if fresh_hard_request_account_switch_allowed:
                 await self._release_request_state_account_response_create_lease(request_state)
-            if hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
+            if quota_hard_account_switch:
+                # A pre-dispatch quota response is definitive: the current
+                # account never accepted the operation. Override hard-owner
+                # continuity guards so selection can move to the next
+                # eligible account, even when retained file references are
+                # present in the replay body.
+                _log_http_bridge_event(
+                    "quota_failover_reconnect",
+                    session.key,
+                    account_id=session.account.id,
+                    model=session.request_model,
+                    pending_count=1,
+                    detail=(
+                        f"excluded_count={len(request_state.excluded_account_ids)} "
+                        f"replay_count={request_state.replay_count} operation_rebind=true"
+                    ),
+                    cache_key_family=session.key.affinity_kind,
+                    model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                )
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    selection_affinity=request_state.affinity_policy,
+                    **reconnect_reader_kwargs,
+                )
+            elif hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
                 await self._reconnect_http_bridge_session(
                     session,
                     request_state=request_state,
@@ -3330,17 +3361,6 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state=request_state,
                     require_same_account=account_neutral_recovery or account_bound_replay,
                     require_preferred_account=True,
-                    **reconnect_reader_kwargs,
-                )
-            elif quota_hard_account_switch:
-                # Quota rejection is definitive before any response event.
-                # It must take precedence over the clean-close continuity
-                # branch below; that branch intentionally pins hard anchors,
-                # but doing so here would keep retrying the exhausted owner.
-                await self._reconnect_http_bridge_session(
-                    session,
-                    request_state=request_state,
-                    selection_affinity=request_state.affinity_policy,
                     **reconnect_reader_kwargs,
                 )
             elif clean_close_hard_continuation or clean_close_hard_continuity_anchor:

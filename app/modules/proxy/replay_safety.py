@@ -738,7 +738,11 @@ def _is_nonblank_string(value: JsonValue | None) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def responses_payload_is_account_neutral_fresh_replay(payload: Mapping[str, JsonValue]) -> bool:
+def responses_payload_is_account_neutral_fresh_replay(
+    payload: Mapping[str, JsonValue],
+    *,
+    allow_file_references: bool = False,
+) -> bool:
     """Return whether a full request can move accounts without stored upstream state."""
 
     if payload.get("conversation") not in (None, ""):
@@ -765,7 +769,7 @@ def responses_payload_is_account_neutral_fresh_replay(payload: Mapping[str, Json
         input_items = cast(list[JsonValue], input_value)
     else:
         return False
-    if extract_input_file_ids(input_items):
+    if extract_input_file_ids(input_items) and not allow_file_references:
         return False
     if any(
         isinstance(item, dict)
@@ -778,7 +782,7 @@ def responses_payload_is_account_neutral_fresh_replay(payload: Mapping[str, Json
         return False
     if not _input_items_have_valid_account_neutral_shape(input_items):
         return False
-    if _contains_account_scoped_input_state(input_items):
+    if _contains_account_scoped_input_state(input_items, allow_file_references=allow_file_references):
         return False
 
     tools = payload.get("tools")
@@ -862,7 +866,12 @@ def project_responses_payload_for_account_neutral_quota_replay(
             projected[key] = value
     if "input" not in projected:
         return None
-    if not responses_payload_is_account_neutral_fresh_replay(projected):
+    # A pre-dispatch quota response proves the operation was not accepted by
+    # the exhausted account.  File references are retained when possible so
+    # the next account can attempt the exact same turn; they are validated by
+    # the upstream account and may still fail if the file is truly account
+    # scoped.  Other account-bound state remains fail-closed.
+    if not responses_payload_is_account_neutral_fresh_replay(projected, allow_file_references=True):
         return None
     return projected
 
@@ -1129,7 +1138,11 @@ def _url_is_account_neutral(value: JsonValue | None, *, allow_data: bool) -> boo
     return scheme in ({"data", "http", "https"} if allow_data else {"http", "https"})
 
 
-def _contains_account_scoped_input_state(value: JsonValue) -> bool:
+def _contains_account_scoped_input_state(
+    value: JsonValue,
+    *,
+    allow_file_references: bool = False,
+) -> bool:
     pending = [value]
     while pending:
         current = pending.pop()
@@ -1148,7 +1161,7 @@ def _contains_account_scoped_input_state(value: JsonValue) -> bool:
                 and item_type not in _TOOL_CALL_TYPE_BY_OUTPUT_TYPE
             ):
                 return True
-            if _mapping_has_account_scoped_reference(current):
+            if _mapping_has_account_scoped_reference(current, allow_file_references=allow_file_references):
                 return True
             pending.extend(
                 nested for key, nested in current.items() if not (item_type == "additional_tools" and key == "tools")
@@ -1158,8 +1171,17 @@ def _contains_account_scoped_input_state(value: JsonValue) -> bool:
     return False
 
 
-def _mapping_has_account_scoped_reference(value: Mapping[str, JsonValue]) -> bool:
-    for key in ("file_id", "container_id", "vector_store_id"):
+def _mapping_has_account_scoped_reference(
+    value: Mapping[str, JsonValue],
+    *,
+    allow_file_references: bool = False,
+) -> bool:
+    reference_keys = (
+        ("container_id", "vector_store_id")
+        if allow_file_references
+        else ("file_id", "container_id", "vector_store_id")
+    )
+    for key in reference_keys:
         if value.get(key) not in (None, ""):
             return True
     if value.get("encrypted_content") not in (None, ""):
