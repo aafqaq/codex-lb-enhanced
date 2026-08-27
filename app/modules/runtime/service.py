@@ -121,7 +121,9 @@ class RuntimeVersionService:
 
         if isinstance(data, list):
             data = data[0] if data else None
-        raw_version = data.get("tag_name") if isinstance(data, dict) else None
+        raw_version = None
+        if isinstance(data, dict):
+            raw_version = data.get("tag_name") or data.get("name")
         if not isinstance(raw_version, str):
             raise RuntimeError(f"GitHub release tag_name is not a string: {raw_version!r}")
         version = _normalize_version(raw_version)

@@ -50,6 +50,7 @@ jobs:
             type=raw,value=1.24.8
             type=raw,value=1.24.9
             type=raw,value=1.24.10
+            type=raw,value=1.24.11
             type=sha,prefix=
 
       - name: Build and publish
