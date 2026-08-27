@@ -14,17 +14,17 @@
 
 ![Codex LB Enhanced](docs/screenshots/banner.jpg)
 
-<p><em>账号池不丢，会话不断，异常可恢复。</em></p>
+<p><em>极大的缓解了stream disconnected before completion的问题。</em></p>
 
 </div>
 
-> **独立发行版。** 本项目基于 [Soju06/codex-lb](https://github.com/Soju06/codex-lb) 独立维护，不是 OpenAI 或上游 Codex 的官方发布版本。上游 MIT 许可证和版权声明均予以保留。
+> **独立发行版。** 本项目基于 [Soju06/codex-lb](https://github.com/Soju06/codex-lb) 独立维护，不是 OpenAI 或上游 Codex 的官方发布版本。
 
 ## 项目简介
 
 Codex LB 是 ChatGPT 账号负载均衡器：聚合多个账号、追踪用量、管理 API Key，并提供 OpenAI 兼容接口和管理仪表盘。
 
-Codex LB Enhanced 保留原版账号池、额度统计、API Key 和路由能力，重点强化长对话连续性：上游 WebSocket 断开、额度耗尽、账号暂停、延迟重试、上下文压缩失败，以及桌面端关闭数小时后恢复，都尽可能交由程序处理。
+Codex LB Enhanced 保留原版账号池、额度统计、API Key 和路由能力，重点强化长对话连续性：上游 WebSocket 断开、额度耗尽、账号暂停、延迟重试、上下文压缩失败，以及桌面端关闭数小时后恢复，都尽可能交由程序自动处理并尽最大可能平顺恢复。
 
 ## 与原版的区别
 
