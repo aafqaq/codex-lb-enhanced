@@ -9,9 +9,9 @@ body:
         Thanks for taking the time to file a bug report! 🙏
 
         Before you continue:
-        - Search [open & closed issues](https://github.com/Soju06/codex-lb/issues?q=is%3Aissue) — your problem may already be known.
-        - For "how do I…?" questions, please use [Discussions](https://github.com/Soju06/codex-lb/discussions) instead.
-        - For security vulnerabilities, use a [private advisory](https://github.com/Soju06/codex-lb/security/advisories/new) — **do not** post them here.
+        - Search [open & closed issues](https://github.com/aafqaq/codex-lb-enhanced/issues?q=is%3Aissue) — your problem may already be known.
+        - For "how do I…?" questions, please use [Discussions](https://github.com/aafqaq/codex-lb-enhanced/discussions) instead.
+        - For security vulnerabilities, use a [private advisory](https://github.com/aafqaq/codex-lb-enhanced/security/advisories/new) — **do not** post them here.
 
   - type: checkboxes
     id: preflight
@@ -43,9 +43,9 @@ body:
       options:
         - uvx (codex-lb)
         - pip install codex-lb
-        - Docker (ghcr.io/Soju06/codex-lb)
+        - Docker (ghcr.io/aafqaq/codex-lb-enhanced)
         - Docker Compose
-        - Helm chart (oci://ghcr.io/soju06/charts/codex-lb)
+        - Helm chart (if enabled for this distribution)
         - From source
         - Other (describe below)
     validations:

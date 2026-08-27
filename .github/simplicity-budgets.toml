@@ -46,6 +46,7 @@ allowed = [
   "Makefile",
   "PRINCIPLES.md",
   "README.md",
+  "README.zh-CN.md",
   "app",
   "config",
   "deploy",
