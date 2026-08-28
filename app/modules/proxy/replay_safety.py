@@ -18,9 +18,7 @@ _TOOL_CALL_TYPE_BY_OUTPUT_TYPE = {
     "apply_patch_call_output": "apply_patch_call",
 }
 _TOOL_CALL_TYPES = frozenset(_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
-_ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
-    {"tool_search_call", "tool_search_output", "web_search_call"}
-)
+_ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset({"tool_search_call", "tool_search_output", "web_search_call"})
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
 _CODEX_CLIENT_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id", "create_time", "content_item_kinds"})
@@ -258,9 +256,7 @@ def _project_account_neutral_replay_item(
         return item
     if item_type == "reasoning":
         return _project_portable_reasoning_item(item)
-    if (
-        item_type in _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES and item.get("status") == "completed"
-    ):
+    if item_type in _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES and item.get("status") == "completed":
         return None
 
     if "id" not in item:
@@ -468,6 +464,12 @@ def responses_input_suffix_retains_prior_output(
                 return False
             fresh_developer_followup_seen = True
             continue
+        # Portable encrypted reasoning is replayable state, not a retained
+        # assistant turn boundary.  It may appear between the stored prefix
+        # and the assistant message in Codex full resends; treat a validated
+        # item as transparent while proving that the prior output is kept.
+        if item_type == "reasoning" and _project_portable_reasoning_item(item) is not None:
+            continue
         return False
     return retained_output_seen and fresh_followup_seen and not pending_suffix_calls
 
@@ -477,7 +479,7 @@ def _account_neutral_turn_id(item: Mapping[str, JsonValue]) -> str | None:
     if not isinstance(metadata, dict):
         return None
     turn_id = metadata.get("turn_id")
-    return turn_id if _is_nonblank_string(turn_id) else None
+    return turn_id if isinstance(turn_id, str) and _is_nonblank_string(turn_id) else None
 
 
 def responses_input_suffix_matches_pending_tool_calls(

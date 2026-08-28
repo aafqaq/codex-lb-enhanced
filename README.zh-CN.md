@@ -95,12 +95,14 @@ Enhanced 保留上游项目成熟的账号管理、API Key 鉴权、负载均衡
 
 ```bash
 docker volume create codex-lb-enhanced-data
+docker network inspect codex-lb-net >/dev/null 2>&1 || docker network create codex-lb-net
 docker run -d --name codex-lb-enhanced \
   --restart unless-stopped \
+  --network codex-lb-net \
   -e CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_AMBIGUOUS_CONTINUATION_RECOVERY_MODE=server_indefinite_recovery \
   -p 2455:2455 -p 1455:1455 \
   -v codex-lb-enhanced-data:/var/lib/codex-lb \
-  ghcr.io/aafqaq/codex-lb-enhanced:1.24.12
+  ghcr.io/aafqaq/codex-lb-enhanced:1.25.0
 ```
 
 打开 [http://localhost:2455](http://localhost:2455)，完成初始化、添加账号并创建 API Key。生产环境请把端口、卷、环境变量和重启策略替换成你的现有配置；升级前保留旧镜像标签以便回滚。
@@ -124,6 +126,15 @@ requires_openai_auth = true
 
 将 `base_url` 换成反向代理地址即可；API Key 使用仪表盘创建的 Key。其他客户端继续使用 `/v1`，无需改变原有 OpenAI SDK 调用方式。
 
+### 从源码运行
+
+源码、Python 包和 Docker 镜像使用同一个应用启动器：
+
+```bash
+uv sync --dev --frozen
+uv run codex-lb
+```
+
 ## 运行、升级与排障
 
 - **数据持久化**：默认 SQLite 位于 `/var/lib/codex-lb/`；可按原项目配置 PostgreSQL。
@@ -134,7 +145,7 @@ requires_openai_auth = true
 
 ## 版本与构建
 
-当前发布版本：**v1.24.12**。`main` 分支的 GitHub Actions 会自动构建测试并发布 GHCR 镜像；正式版本同时发布 GitHub Release。镜像包位于 [GitHub Container Registry](https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced)。
+当前发布版本：**v1.25.0**。每次 `main` 变更都会经过 GitHub Actions 验证并更新 GHCR 滚动镜像；正式版本还会发布带版本号的镜像和 Python 构建产物。生产环境建议使用不可变的 [v1.25.0](https://github.com/aafqaq/codex-lb-enhanced/releases/tag/v1.25.0) 标签，不要直接使用 `latest`。镜像包位于 [GitHub Container Registry](https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced)。
 
 ## 许可证与免责声明
 

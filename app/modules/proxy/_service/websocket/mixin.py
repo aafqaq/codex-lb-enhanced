@@ -2067,7 +2067,8 @@ class _WebSocketMixin:
 
                 transport_failure_account_id = _websocket_transport_failure_account_id(continuity_state)
                 if (
-                    transport_failure_account_id is not None
+                    request_state is not None
+                    and transport_failure_account_id is not None
                     and not request_state.file_required_preferred_account
                     and request_state.preferred_account_id == transport_failure_account_id
                 ):
@@ -2715,16 +2716,12 @@ class _WebSocketMixin:
                                 )
                             request_state.response_create_sent_at = time.monotonic()
                         upstream_payload = _parse_websocket_payload(text_data)
+                        upstream_event_type = upstream_payload.get("type") if upstream_payload is not None else None
                         _maybe_log_upstream_event(
                             kind="request",
                             account_id=account.id if account is not None else None,
                             transport="websocket",
-                            event_type=(
-                                upstream_payload.get("type")
-                                if isinstance(upstream_payload, Mapping)
-                                and isinstance(upstream_payload.get("type"), str)
-                                else None
-                            ),
+                            event_type=upstream_event_type if isinstance(upstream_event_type, str) else None,
                             payload=upstream_payload,
                             raw_text=text_data,
                         )

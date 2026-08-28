@@ -2810,7 +2810,15 @@ def _http_bridge_is_previous_response_owner_unavailable(exc: ProxyResponseError)
     error = payload.get("error")
     if not isinstance(error, dict):
         return False
-    return error.get("code") == "previous_response_owner_unavailable"
+    # The bridge admission path can surface the balancer's structured
+    # continuity-owner code directly (before the HTTP envelope is rewritten
+    # to the public previous-response wording).  Both mean the same thing to
+    # the recovery planner: the anchored owner cannot serve this turn and a
+    # verified full resend may be handed to another account.
+    return error.get("code") in {
+        "previous_response_owner_unavailable",
+        "continuity_owner_unavailable",
+    }
 
 
 def _http_bridge_should_attempt_soft_affinity_reroute(

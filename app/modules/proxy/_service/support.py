@@ -1149,6 +1149,10 @@ class _WebSocketRequestState:
     replay_downstream_response_id: str | None = None
     draining_until_terminal: bool = False
     completed_delivery_scope: _HTTPBridgeCompletedDeliveryScope | None = None
+    # Set while a terminal event has been claimed from the pending queue and
+    # its durable/downstream delivery is still being persisted.  This marker
+    # survives queue revocation so an idle waiter cannot race that work.
+    terminal_delivery_in_progress: bool = False
     # Exactly-once reservation settlement for terminal HTTP bridge events
     # (issue #1594). "claimed" marks a request popped from pending ownership
     # whose in-flight terminal bookkeeping continuation exclusively owns

@@ -1103,8 +1103,16 @@ class _StreamingRetryMixin:
                             # Keep stored-object and file ownership strict. The
                             # verified-fresh replay branch below removes its
                             # anchor before it permits cross-account movement.
-                            fallback_on_preferred_account_unavailable=not (
-                                effective_require_preferred_account or file_required_preferred_account
+                            # A verified full replay is independent of the
+                            # stored response owner.  If that owner is already
+                            # quota-exhausted, let the normal balancer choose
+                            # another account so the replay can be dispatched
+                            # there.  File-backed continuations remain hard
+                            # pinned because their payload can contain
+                            # account-scoped state that cannot be regenerated.
+                            fallback_on_preferred_account_unavailable=(
+                                not (effective_require_preferred_account or file_required_preferred_account)
+                                or (verified_fresh_replay_payload is not None and not file_required_preferred_account)
                             ),
                         )
                     except ProxyResponseError as exc:
@@ -1291,6 +1299,17 @@ class _StreamingRetryMixin:
                                 not effective_require_preferred_account
                                 and payload.previous_response_id is None
                                 and file_preferred_account_id is None
+                                # A Codex session-affinity request can omit
+                                # previous_response_id while still carrying a
+                                # durable goal/turn anchor. Reallocating that
+                                # owner as if this were a fresh first turn can
+                                # silently detach the conversation from its
+                                # recorded account. Only non-session requests
+                                # may use the generic first-turn reallocation;
+                                # session requests must use a verified replay
+                                # or fail closed with the owner-specific
+                                # semantic error.
+                                and not codex_session_affinity
                             ):
                                 hard_affinity_recovery_attempted = True
                                 affinity = replace(affinity, reallocate_sticky=True)
@@ -1304,6 +1323,8 @@ class _StreamingRetryMixin:
                         recovery_error_code = (
                             "previous_response_owner_unavailable"
                             if effective_require_preferred_account or payload.previous_response_id is not None
+                            else "hard_affinity_saturated"
+                            if codex_session_affinity
                             else "upstream_unavailable"
                         )
                         recovery_message = (
