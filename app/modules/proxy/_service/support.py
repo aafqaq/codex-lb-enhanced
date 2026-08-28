@@ -1541,9 +1541,21 @@ def _websocket_request_can_replay_before_visible_output(
         return False
     if request_state.upstream_model_output_seen:
         return False
-    has_retry_safe_fresh_payload = (
-        request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text is not None
+    # A client full-resend snapshot remains portable even when the stricter
+    # same-request retry proof is unavailable.  The latter is intentionally
+    # conservative for delta-only continuations; the former is set only after
+    # the incoming payload was classified as a complete transcript.  Treating
+    # this as replay-safe is what lets quota/owner failures walk A -> B -> C
+    # without first exposing a stale previous_response_id to the client.
+    has_portable_full_resend_payload = (
+        request_state.proxy_injected_previous_response_id
+        and request_state.proxy_injected_anchor_had_full_resend_payload
+        and request_state.fresh_upstream_request_text is not None
     )
+    has_retry_safe_fresh_payload = (
+        request_state.fresh_upstream_request_is_retry_safe
+        and request_state.fresh_upstream_request_text is not None
+    ) or has_portable_full_resend_payload
     precreated_pending = request_state.response_id is None and request_state.awaiting_response_created
     if precreated_pending and request_state.previous_response_id is not None and not has_retry_safe_fresh_payload:
         return False
@@ -1556,6 +1568,30 @@ def _websocket_request_can_replay_before_visible_output(
     if precreated_pending and request_state.response_event_count > 0:
         return False
     return precreated_pending or created_only_pending
+
+
+def _websocket_recovery_source_text(request_state: _WebSocketRequestState) -> str | None:
+    """Return the safest preserved body for an account-neutral recovery.
+
+    Session/durable anchor injection may leave ``request_text`` containing
+    only a suffix.  When the original client payload was classified as a
+    complete resend, ``fresh_upstream_request_text`` is the authoritative
+    portable transcript even if the stricter ambiguous-transport proof is
+    false.  Keeping this policy in one helper prevents the event-reader and
+    reconnect submitter from selecting different bodies during A -> B -> C
+    quota failover.
+    """
+
+    injected_full_resend = (
+        request_state.proxy_injected_previous_response_id
+        and request_state.proxy_injected_anchor_had_full_resend_payload
+        and request_state.fresh_upstream_request_text
+    )
+    if injected_full_resend or (
+        request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
+    ):
+        return request_state.fresh_upstream_request_text
+    return request_state.request_text
 
 
 def _record_websocket_route_metadata(

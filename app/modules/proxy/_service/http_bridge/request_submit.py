@@ -158,6 +158,7 @@ from app.modules.proxy._service.support import (
     _HTTPBridgeRetryCircuitAttemptSelection,
     _HTTPBridgeSession,
     _request_log_client_fields,
+    _websocket_recovery_source_text,
     _websocket_request_can_replay_before_visible_output,
     _WebSocketRequestState,
 )
@@ -3043,12 +3044,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 allow_account_exhaustion_replay=True,
             ):
                 return None
-            source_text = (
-                candidate.fresh_upstream_request_text
-                if candidate.fresh_upstream_request_is_retry_safe and candidate.fresh_upstream_request_text
-                else candidate.request_text
-            )
-            return project_responses_text_for_account_neutral_quota_replay(source_text)
+            return project_responses_text_for_account_neutral_quota_replay(_websocket_recovery_source_text(candidate))
 
         def request_is_retryable(request_state: _WebSocketRequestState) -> bool:
             if _websocket_request_can_replay_before_visible_output(

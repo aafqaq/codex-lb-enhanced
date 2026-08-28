@@ -155,6 +155,7 @@ from app.modules.proxy._service.support import (
     _record_response_event,
     _signal_propagated_capacity_startup_ready,
     _signal_propagated_capacity_startup_wait,
+    _websocket_recovery_source_text,
     _websocket_request_can_replay_before_visible_output,
     _websocket_should_defer_reasoning_prelude,
     _WebSocketReceiveTimeout,
@@ -233,12 +234,7 @@ def _portable_full_resend_text_for_recovery(
     bookkeeping and the stale anchor.
     """
 
-    source_text = (
-        request_state.fresh_upstream_request_text
-        if request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
-        else request_state.request_text
-    )
-    return project_responses_text_for_account_neutral_quota_replay(source_text)
+    return project_responses_text_for_account_neutral_quota_replay(_websocket_recovery_source_text(request_state))
 
 _HTTP_BRIDGE_RECOVERY_SETTLEMENT_RETRY_DELAYS = (
     0.25,
@@ -2596,6 +2592,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             status_request_state.request_text = previous_response_replay_text
             status_request_state.previous_response_id = None
             status_request_state.proxy_injected_previous_response_id = False
+            status_request_state.proxy_injected_anchor_had_full_resend_payload = False
             status_request_state.hard_continuity_anchor = False
             status_request_state.fresh_upstream_request_text = None
             status_request_state.fresh_upstream_request_is_retry_safe = False
@@ -2873,6 +2870,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                 status_request_state.request_text = quota_replay_text
                 status_request_state.previous_response_id = None
                 status_request_state.proxy_injected_previous_response_id = False
+                status_request_state.proxy_injected_anchor_had_full_resend_payload = False
                 status_request_state.fresh_upstream_request_text = None
                 status_request_state.fresh_upstream_request_is_retry_safe = False
                 status_request_state.file_required_preferred_account = False
@@ -3077,8 +3075,21 @@ class _HTTPBridgeUpstreamEventsMixin:
             )
             if status_request_state is not None:
                 setattr(status_request_state, "account_health_error_handled", True)
-            if status_request_state is not None and status_request_state.previous_response_id is None:
-                account_exhaustion_retry = account_exhaustion_retry_code is not None
+            account_exhaustion_retry = account_exhaustion_retry_code is not None
+            quota_replay_text = None
+            if (
+                account_exhaustion_retry
+                and status_request_state is not None
+                and status_request_state.previous_response_id is not None
+                and _websocket_request_can_replay_before_visible_output(
+                    status_request_state,
+                    allow_account_exhaustion_replay=True,
+                )
+            ):
+                quota_replay_text = _portable_full_resend_text_for_recovery(status_request_state)
+            if status_request_state is not None and (
+                status_request_state.previous_response_id is None or quota_replay_text is not None
+            ):
                 if account_exhaustion_retry:
                     await self._release_request_state_account_response_create_lease(status_request_state)
                     status_request_state.excluded_account_ids.add(session.account.id)
@@ -3138,6 +3149,20 @@ class _HTTPBridgeUpstreamEventsMixin:
                     status_request_state.last_account_exhaustion_error_message = (
                         retry_error_message or "The usage limit has been reached"
                     )
+                    if quota_replay_text is not None:
+                        # The upstream acknowledged this attempt but rejected
+                        # it before visible model output.  Remove the stale
+                        # owner-bound anchor and replay the preserved complete
+                        # client transcript on the next selected account.
+                        status_request_state.request_text = quota_replay_text
+                        status_request_state.previous_response_id = None
+                        status_request_state.proxy_injected_previous_response_id = False
+                        status_request_state.proxy_injected_anchor_had_full_resend_payload = False
+                        status_request_state.hard_continuity_anchor = False
+                        status_request_state.fresh_upstream_request_text = None
+                        status_request_state.fresh_upstream_request_is_retry_safe = False
+                        status_request_state.preferred_account_id = None
+                        status_request_state.file_required_preferred_account = False
                 async with session.pending_lock:
                     if status_request_state not in session.pending_requests:
                         session.pending_requests.appendleft(status_request_state)
