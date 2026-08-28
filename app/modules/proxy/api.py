@@ -5804,6 +5804,11 @@ async def _stream_responses(
                     except asyncio.TimeoutError:
                         _record_stream_keepalive("responses_compact")
                         yield SSE_KEEPALIVE_FRAME
+                    except Exception:
+                        # The task completed with an error.  Exit the
+                        # keepalive loop and let the result handler below
+                        # serialize the protocol-level failure event.
+                        break
 
                 try:
                     compact_result = await compact_task
@@ -5855,12 +5860,17 @@ async def _stream_responses(
             finally:
                 if not compact_task.done():
                     compact_task.cancel()
-                try:
-                    await compact_task
-                except BaseException:
-                    # The exception was either serialized above or the client
-                    # disconnected and cancellation is intentional.
-                    pass
+                    try:
+                        await compact_task
+                    except BaseException:
+                        # Client cancellation is intentional; avoid leaking
+                        # the in-flight upstream task into the ASGI server.
+                        pass
+                else:
+                    # ``await task`` raises its exception every time.  The
+                    # result path above already converted it to SSE, so only
+                    # retrieve it here to mark the exception handled.
+                    compact_task.exception()
                 if _responses_origin_may_release_reservation(
                     service_cleanup_ready_event=responses_service_cleanup_ready_event
                 ):
