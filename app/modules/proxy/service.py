@@ -1940,15 +1940,34 @@ class ProxyService(
                         )
                         return preferred_selection
                     excluded_account_ids_set.add(preferred_account_id)
+                # Once the preferred owner has been excluded (quota, transport
+                # failure, or an explicit owner pause), the original affinity
+                # is no longer a selection constraint.  Keeping a prompt-cache
+                # or legacy sticky key here can make the balancer rediscover the
+                # failed owner and return its error instead of walking the pool.
+                # Drop all account-owned affinity for this fallback attempt;
+                # the caller still retains the request payload/continuity proof
+                # and can restore a safe anchor on a subsequent retry.
+                fallback_owner_excluded = (
+                    preferred_account_id is not None
+                    and preferred_account_id in excluded_account_ids_set
+                )
+                fallback_sticky_key = None if fallback_owner_excluded else sticky_key
+                fallback_sticky_kind = None if fallback_owner_excluded else sticky_kind
+                fallback_sticky_source = None if fallback_owner_excluded else sticky_source
+                fallback_legacy_sticky_key = None if fallback_owner_excluded else legacy_sticky_key
+                fallback_legacy_source = None if fallback_owner_excluded else legacy_continuity_source
+                fallback_seed_key = None if fallback_owner_excluded else sticky_seed_key
+                fallback_seed_kind = None if fallback_owner_excluded else sticky_seed_kind
                 selection = await self._load_balancer.select_account(
-                    sticky_key=sticky_key,
-                    sticky_kind=sticky_kind,
-                    reallocate_sticky=(reallocate_sticky or preferred_account_id is not None),
-                    sticky_source=sticky_source,
-                    legacy_sticky_key=legacy_sticky_key,
-                    legacy_continuity_source=legacy_continuity_source,
-                    sticky_seed_key=sticky_seed_key,
-                    sticky_seed_kind=sticky_seed_kind,
+                    sticky_key=fallback_sticky_key,
+                    sticky_kind=fallback_sticky_kind,
+                    reallocate_sticky=(reallocate_sticky or fallback_owner_excluded),
+                    sticky_source=fallback_sticky_source,
+                    legacy_sticky_key=fallback_legacy_sticky_key,
+                    legacy_continuity_source=fallback_legacy_source,
+                    sticky_seed_key=fallback_seed_key,
+                    sticky_seed_kind=fallback_seed_kind,
                     spill_bare_session_on_account_cap=_AffinityPolicy.cap_spillover_allowed(
                         spill_bare_session_on_account_cap,
                         preferred_account_id,
@@ -1980,6 +1999,15 @@ class ProxyService(
                     api_key_id=api_key_id,
                     api_key_stream_fair_share_threshold_pct=api_key_fair_share_threshold_pct,
                 )
+                if fallback_owner_excluded:
+                    logger.info(
+                        "Proxy fallback detached excluded owner affinity request_id=%s kind=%s "
+                        "excluded_owner=%s selected_account_id=%s",
+                        request_id,
+                        kind,
+                        log_account_id(preferred_account_id),
+                        log_account_id(selection.account.id) if selection.account is not None else None,
+                    )
                 if selection.account is not None and selection.account.id in excluded_account_ids_set:
                     logger.warning(
                         "Proxy account selection returned excluded account request_id=%s kind=%s request_stage=%s "
