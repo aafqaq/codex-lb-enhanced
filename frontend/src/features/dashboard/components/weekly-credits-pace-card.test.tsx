@@ -102,6 +102,7 @@ describe("WeeklyCreditsPaceCard", () => {
       />,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: "View suggestions" }));
     expect(screen.getByText("0.53x Pro weekly pool (~1 account)")).toBeInTheDocument();
   });
 
