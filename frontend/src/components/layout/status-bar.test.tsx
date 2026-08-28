@@ -184,7 +184,7 @@ describe("StatusBar", () => {
     expect(link).toHaveAttribute("rel", "noreferrer");
   });
 
-  it("links to release notes when a newer version is available", async () => {
+  it("opens an update dialog with release notes when a newer version is available", async () => {
     server.use(
       http.get("/api/runtime/version", () =>
         HttpResponse.json({
@@ -200,13 +200,16 @@ describe("StatusBar", () => {
 
     renderStatusBar();
 
-    const link = await screen.findByRole("link", {
+    const updateButton = await screen.findByRole("button", {
       name: "New version available: 1.20.0. Open release notes.",
     });
 
-    expect(link).toHaveAttribute("href", "https://github.com/aafqaq/codex-lb-enhanced/releases/latest");
-    expect(link).toHaveAttribute("target", "_blank");
-    expect(link).toHaveAttribute("rel", "noreferrer");
+    await act(async () => updateButton.click());
+    expect(await screen.findByRole("dialog")).toHaveTextContent("Update available");
+    const releaseLink = screen.getByRole("link", { name: "View release notes" });
+    expect(releaseLink).toHaveAttribute("href", "https://github.com/aafqaq/codex-lb-enhanced/releases/latest");
+    expect(releaseLink).toHaveAttribute("target", "_blank");
+    expect(releaseLink).toHaveAttribute("rel", "noreferrer");
   });
 
   it("does not show an update link when the runtime version check fails", async () => {
