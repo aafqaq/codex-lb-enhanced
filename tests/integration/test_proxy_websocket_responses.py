@@ -3090,7 +3090,7 @@ def test_backend_responses_websocket_lite_fresh_replay_drops_marker_after_previo
     assert "previous_response_id" not in replay_payload
     assert replay_payload["input"] == [user_continue, assistant_ok, user_more]
     assert marker not in cast(dict[str, object], replay_payload.get("client_metadata", {}))
-    assert "reasoning" not in replay_payload
+    assert replay_payload["reasoning"] == {"context": "all_turns"}
     after_replay_payload = recovered_payloads[1]
     assert after_replay_payload["previous_response_id"] == "resp_ws_lite_replay"
     assert marker not in cast(dict[str, object], after_replay_payload.get("client_metadata", {}))
@@ -9894,10 +9894,11 @@ def test_backend_responses_websocket_transparently_retries_precreated_usage_limi
     assert first_sent != second_sent
     assert second_sent == third_sent
     assert "_extra" not in second_sent
-    assert second_sent["reasoning"] == {"effort": "high", "summary": "detailed"}
+    assert second_sent["reasoning"] == {"effort": "high", "summary": "detailed", "context": "all_turns"}
     assert "client_metadata" not in second_sent
     assert [item["type"] for item in second_sent["input"]] == [
         "message",
+        "reasoning",
         "custom_tool_call",
         "custom_tool_call_output",
     ]
