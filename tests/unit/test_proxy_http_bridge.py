@@ -20841,6 +20841,15 @@ async def test_process_http_bridge_upstream_text_rebinds_full_resend_after_previ
         },
         separators=(",", ":"),
     )
+    trimmed_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.4",
+            "previous_response_id": "resp_missing_full_resend",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+        },
+        separators=(",", ":"),
+    )
     request_state = proxy_service._WebSocketRequestState(
         request_id="req-prev-miss-full-resend",
         model="gpt-5.4",
@@ -20850,9 +20859,9 @@ async def test_process_http_bridge_upstream_text_rebinds_full_resend_after_previ
         started_at=1.0,
         previous_response_id="resp_missing_full_resend",
         event_queue=asyncio.Queue(),
-        request_text=replay_text,
+        request_text=trimmed_text,
         fresh_upstream_request_text=replay_text,
-        fresh_upstream_request_is_retry_safe=True,
+        fresh_upstream_request_is_retry_safe=False,
         awaiting_response_created=True,
         transport="http",
         skip_request_log=True,
@@ -20920,6 +20929,18 @@ async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    full_resend_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.5",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "earlier"}]},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "prior"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            ],
+        },
+        separators=(",", ":"),
+    )
     request_state = proxy_service._WebSocketRequestState(
         request_id="req-precreated-limit",
         model="gpt-5.5",
@@ -20929,7 +20950,17 @@ async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit(
         started_at=1.0,
         awaiting_response_created=True,
         event_queue=asyncio.Queue(),
-        request_text='{"type":"response.create","model":"gpt-5.5","input":"hello"}',
+        request_text=(
+            '{"type":"response.create","model":"gpt-5.5",'
+            '"previous_response_id":"resp-owner-limit",'
+            '"input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}'
+        ),
+        previous_response_id="resp-owner-limit",
+        preferred_account_id="acc-limited",
+        proxy_injected_previous_response_id=True,
+        proxy_injected_anchor_had_full_resend_payload=True,
+        fresh_upstream_request_text=full_resend_text,
+        fresh_upstream_request_is_retry_safe=False,
         transport="http",
         skip_request_log=True,
     )
@@ -20979,6 +21010,7 @@ async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit(
     handle_stream_error.assert_awaited_once()
     retry_precreated.assert_awaited_once_with(
         session,
+        request_state=request_state,
         allow_account_exhaustion_failover=True,
     )
     finalize.assert_not_awaited()
@@ -20986,6 +21018,9 @@ async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit(
     assert request_state.event_queue.empty()
     assert session.pending_requests == deque([request_state])
     assert session.queued_request_count == 1
+    assert json.loads(request_state.request_text or "{}") == json.loads(full_resend_text)
+    assert request_state.previous_response_id is None
+    assert request_state.excluded_account_ids == {"acc-limited"}
 
 
 @pytest.mark.asyncio
@@ -21076,6 +21111,97 @@ async def test_process_http_bridge_upstream_text_reports_usage_limit_only_after_
     assert request_state.error_http_status_override == 429
     assert session.pending_requests == deque()
     assert session.queued_request_count == 0
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_fails_over_created_only_quota_with_full_resend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quota terminal after response.created must still walk to another account."""
+
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    full_resend_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "earlier"}]},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "prior"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            ],
+        },
+        separators=(",", ":"),
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-created-only-quota",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        response_id="resp-created-only",
+        response_event_count=1,
+        awaiting_response_created=False,
+        event_queue=asyncio.Queue(),
+        request_text=(
+            '{"type":"response.create","model":"gpt-5.6-sol",'
+            '"previous_response_id":"resp-created-only",'
+            '"input":[{"role":"user","content":"continue"}]}'
+        ),
+        previous_response_id="resp-created-only",
+        preferred_account_id="acc-created-only",
+        proxy_injected_previous_response_id=True,
+        proxy_injected_anchor_had_full_resend_payload=True,
+        fresh_upstream_request_text=full_resend_text,
+        fresh_upstream_request_is_retry_safe=False,
+        transport="http",
+        skip_request_log=True,
+    )
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("turn_state_header", "created-only-quota", None),
+        headers={"x-codex-turn-state": "created-only-quota"},
+        affinity=proxy_service._AffinityPolicy(
+            key="created-only-quota",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        ),
+        request_model="gpt-5.6-sol",
+        account=cast(Any, SimpleNamespace(id="acc-created-only", status=AccountStatus.ACTIVE)),
+        upstream=cast(UpstreamWebSocket, SimpleNamespace(close=AsyncMock())),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=1,
+        last_used_at=1.0,
+        idle_ttl_seconds=120.0,
+    )
+    monkeypatch.setattr(service, "_handle_stream_error", AsyncMock())
+    retry_precreated = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", AsyncMock())
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "status": 429,
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "The usage limit has been reached",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    retry_precreated.assert_awaited_once_with(
+        session,
+        allow_account_exhaustion_failover=True,
+    )
+    assert request_state.previous_response_id is None
+    assert request_state.excluded_account_ids == {"acc-created-only"}
+    assert json.loads(request_state.request_text or "{}") == json.loads(full_resend_text)
 
 
 @pytest.mark.asyncio
@@ -26554,6 +26680,24 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
             reallocate_sticky=True,
         ),
     )
+    # Session-level previous_response_id optimization may have reduced the
+    # live payload to a suffix.  A definitive quota response must replay the
+    # preserved complete request, even when the strict fresh-retry proof is
+    # unavailable; otherwise recovery sends only the trimmed suffix.
+    full_request_text = request_state.request_text
+    request_state.request_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "previous_response_id": "resp-quota-created-before-limit",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        },
+        separators=(",", ":"),
+    )
+    request_state.proxy_injected_previous_response_id = True
+    request_state.proxy_injected_anchor_had_full_resend_payload = True
+    request_state.fresh_upstream_request_text = full_request_text
+    request_state.fresh_upstream_request_is_retry_safe = False
     session = _make_bridge_session(
         key=proxy_service._HTTPBridgeSessionKey("session_header", "bridge-quota-walk", None),
         key_value="bridge-quota-walk",

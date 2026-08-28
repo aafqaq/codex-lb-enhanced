@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.24.14] - 2026-08-28
+
+### Fixed
+
+* **http-bridge:** preserve the complete client resend transcript when a
+  session anchor was optimized to a suffix, so definitive quota or rejected
+  anchor responses can fail over A → B → C without exposing a stale owner.
+* **http-bridge:** centralize recovery-source selection and keep the
+  configured account selector authoritative while failed accounts remain
+  excluded for the current turn.
+
 ## [1.24.0](https://github.com/Soju06/codex-lb/compare/v1.23.0...v1.24.0) (2026-08-26)
 
 

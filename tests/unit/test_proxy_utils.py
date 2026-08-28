@@ -28403,6 +28403,59 @@ async def test_process_upstream_websocket_text_maps_previous_response_usage_limi
     assert list(pending_requests) == []
 
 
+def test_portable_recovery_prefers_preserved_full_resend_after_anchor_trim():
+    """A rejected injected anchor must not replay the already-trimmed delta."""
+    full_input = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": f"history-{index}"}],
+        }
+        for index in range(568)
+    ]
+    anchored_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "previous_response_id": "resp-stale",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "new"}]}],
+        },
+        separators=(",", ":"),
+    )
+    full_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "input": full_input,
+        },
+        separators=(",", ":"),
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-anchor-trim-fallback",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        request_text=anchored_text,
+        previous_response_id="resp-stale",
+        proxy_injected_previous_response_id=True,
+        proxy_injected_anchor_had_full_resend_payload=True,
+        fresh_upstream_request_text=full_text,
+        # Session-level anchors intentionally do not have the strict
+        # ambiguous-transport proof; definitive pre-dispatch rejection still
+        # makes the captured full body the correct quota-recovery source.
+        fresh_upstream_request_is_retry_safe=False,
+    )
+
+    replay_text = proxy_http_bridge_upstream_events._portable_full_resend_text_for_recovery(request_state)
+
+    assert replay_text is not None
+    replay_payload = json.loads(replay_text)
+    assert replay_payload.get("previous_response_id") is None
+    assert len(replay_payload["input"]) == 568
+
+
 @pytest.mark.asyncio
 async def test_process_upstream_websocket_text_replays_proxy_verified_anchor_after_owner_quota(
     monkeypatch,
