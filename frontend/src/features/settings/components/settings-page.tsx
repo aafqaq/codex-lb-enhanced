@@ -186,7 +186,7 @@ export function SettingsPage() {
                     <TotpSettings settings={settings} disabled={busy} onSave={handleSave} />
                   </Suspense>
                 ) : null}
-                <div className="lg:col-span-2">
+                <div className="min-w-0 lg:col-span-2">
                   <ApiKeysSection
                     apiKeyAuthEnabled={settings.apiKeyAuthEnabled}
                     hideUpstreamQuotaFromApiKeys={settings.hideUpstreamQuotaFromApiKeys}
@@ -204,7 +204,7 @@ export function SettingsPage() {
 
             {activeTab === "routing" ? (
               <>
-                <div className="lg:col-span-2">
+                <div className="min-w-0 lg:col-span-2">
                   <RoutingSettings
                     key={[
                       settings.openaiCacheAffinityMaxAgeSeconds,
@@ -227,7 +227,7 @@ export function SettingsPage() {
                   />
                 </div>
                 {upstreamProxyQuery.data ? (
-                  <div className="lg:col-span-2">
+                  <div className="min-w-0 lg:col-span-2">
                     <UpstreamProxySettings
                       admin={upstreamProxyQuery.data}
                       busy={controlsDisabled}
@@ -241,7 +241,7 @@ export function SettingsPage() {
                     />
                   </div>
                 ) : null}
-                <div className="lg:col-span-2">
+                <div className="min-w-0 lg:col-span-2">
                   <ModelSourcesSettings disabled={controlsDisabled} />
                 </div>
               </>
@@ -249,13 +249,13 @@ export function SettingsPage() {
 
             {activeTab === "operations" ? (
               <>
-                <div className="lg:col-span-2">
+                <div className="min-w-0 lg:col-span-2">
                   <FirewallSection disabled={controlsDisabled} />
                 </div>
-                <div className="lg:col-span-2">
+                <div className="min-w-0 lg:col-span-2">
                   <QuotaPlannerSection disabled={controlsDisabled} />
                 </div>
-                <div className="lg:col-span-2">
+                <div className="min-w-0 lg:col-span-2">
                   <StickySessionsSection disabled={controlsDisabled} />
                 </div>
                 <div className="lg:col-span-2">
