@@ -103,6 +103,7 @@ describe("api keys flow integration", () => {
   });
 
   it("displays the current api key list on settings", async () => {
+    const user = userEvent.setup();
     window.history.pushState({}, "", "/settings");
     renderWithProviders(<App />);
     await openSecuritySettings(user);
