@@ -3,6 +3,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
+import { ChevronsUpDown } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -17,6 +18,13 @@ import {
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Select,
   SelectContent,
@@ -215,21 +223,32 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
               <label htmlFor="create-api-key-codex-quota-mode" className="text-sm font-medium">
                 {t("apiKeys.form.codexQuotaMode")}
               </label>
-              <Select
-                value={draft.codexQuotaMode}
-                onValueChange={(value) => updateDraft({ codexQuotaMode: value as CodexQuotaMode })}
-              >
-                <SelectTrigger id="create-api-key-codex-quota-mode">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {CODEX_QUOTA_MODES.map((mode) => (
-                    <SelectItem key={mode} value={mode}>
-                      {t(`apiKeys.codexQuotaModes.${mode}`)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    id="create-api-key-codex-quota-mode"
+                    type="button"
+                    variant="outline"
+                    className="w-full justify-between font-normal"
+                    aria-label={t("apiKeys.form.codexQuotaMode")}
+                  >
+                    <span className="truncate text-left">{t(`apiKeys.codexQuotaModes.${draft.codexQuotaMode}`)}</span>
+                    <ChevronsUpDown className="ml-1 size-4 shrink-0 opacity-50" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-[var(--radix-dropdown-menu-trigger-width)]">
+                  <DropdownMenuRadioGroup
+                    value={draft.codexQuotaMode}
+                    onValueChange={(value) => updateDraft({ codexQuotaMode: value as CodexQuotaMode })}
+                  >
+                    {CODEX_QUOTA_MODES.map((mode) => (
+                      <DropdownMenuRadioItem key={mode} value={mode}>
+                        {t(`apiKeys.codexQuotaModes.${mode}`)}
+                      </DropdownMenuRadioItem>
+                    ))}
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <p className="text-xs text-muted-foreground">{t("apiKeys.form.codexQuotaModeHint")}</p>
             </div>
 
@@ -238,7 +257,6 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
                 <label htmlFor="create-api-key-codex-quota-enabled" className="cursor-pointer font-medium">
                   {t("apiKeys.form.codexQuotaPassthrough")}
                 </label>
-                <p className="text-xs text-muted-foreground">{t("apiKeys.form.codexQuotaPassthroughHint")}</p>
               </div>
               <Switch
                 id="create-api-key-codex-quota-enabled"

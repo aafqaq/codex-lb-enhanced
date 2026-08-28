@@ -186,75 +186,91 @@ export function SettingsPage() {
                     <TotpSettings settings={settings} disabled={busy} onSave={handleSave} />
                   </Suspense>
                 ) : null}
-                <ApiKeysSection
-                  apiKeyAuthEnabled={settings.apiKeyAuthEnabled}
-                  hideUpstreamQuotaFromApiKeys={settings.hideUpstreamQuotaFromApiKeys}
-                  disabled={controlsDisabled}
-                  onApiKeyAuthEnabledChange={(enabled) =>
-                    void handleSave(buildSettingsUpdateRequest(settings, { apiKeyAuthEnabled: enabled }))
-                  }
-                  onHideUpstreamQuotaFromApiKeysChange={(enabled) =>
-                    void handleSave(buildSettingsUpdateRequest(settings, { hideUpstreamQuotaFromApiKeys: enabled }))
-                  }
-                />
+                <div className="lg:col-span-2">
+                  <ApiKeysSection
+                    apiKeyAuthEnabled={settings.apiKeyAuthEnabled}
+                    hideUpstreamQuotaFromApiKeys={settings.hideUpstreamQuotaFromApiKeys}
+                    disabled={controlsDisabled}
+                    onApiKeyAuthEnabledChange={(enabled) =>
+                      void handleSave(buildSettingsUpdateRequest(settings, { apiKeyAuthEnabled: enabled }))
+                    }
+                    onHideUpstreamQuotaFromApiKeysChange={(enabled) =>
+                      void handleSave(buildSettingsUpdateRequest(settings, { hideUpstreamQuotaFromApiKeys: enabled }))
+                    }
+                  />
+                </div>
               </>
             ) : null}
 
             {activeTab === "routing" ? (
               <>
-                <RoutingSettings
-                  key={[
-                    settings.openaiCacheAffinityMaxAgeSeconds,
-                    settings.warmupModel,
-                    settings.limitWarmupModel,
-                    settings.limitWarmupPrompt,
-                    settings.limitWarmupExhaustedThresholdPercent,
-                    settings.limitWarmupIdleThresholdPercent,
-                    settings.limitWarmupCooldownSeconds,
-                    settings.proxyAccountResponseCreateLimit,
-                    settings.proxyAccountStreamLimit,
-                    settings.proxyAccountStreamRecoveryReserve,
-                    settings.proxyApiKeyFairShareCongestionThresholdPct,
-                  ].join(":")}
-                  settings={settings}
-                  accounts={accountsQuery.data ?? []}
-                  accountsLoading={accountsQuery.isLoading}
-                  busy={controlsDisabled}
-                  onSave={handleSave}
-                />
-                {upstreamProxyQuery.data ? (
-                  <UpstreamProxySettings
-                    admin={upstreamProxyQuery.data}
+                <div className="lg:col-span-2">
+                  <RoutingSettings
+                    key={[
+                      settings.openaiCacheAffinityMaxAgeSeconds,
+                      settings.warmupModel,
+                      settings.limitWarmupModel,
+                      settings.limitWarmupPrompt,
+                      settings.limitWarmupExhaustedThresholdPercent,
+                      settings.limitWarmupIdleThresholdPercent,
+                      settings.limitWarmupCooldownSeconds,
+                      settings.proxyAccountResponseCreateLimit,
+                      settings.proxyAccountStreamLimit,
+                      settings.proxyAccountStreamRecoveryReserve,
+                      settings.proxyApiKeyFairShareCongestionThresholdPct,
+                    ].join(":")}
+                    settings={settings}
+                    accounts={accountsQuery.data ?? []}
+                    accountsLoading={accountsQuery.isLoading}
                     busy={controlsDisabled}
-                    onSaveSettings={handleSave}
-                    onCreateEndpoint={(payload) => createEndpointMutation.mutateAsync(payload)}
-                    onTestEndpoint={(endpointId) => testEndpointMutation.mutateAsync(endpointId)}
-                    onCreatePool={(payload) => createPoolMutation.mutateAsync(payload)}
-                    onAddPoolMember={(poolId, payload) =>
-                      addPoolMemberMutation.mutateAsync({ poolId, payload })
-                    }
+                    onSave={handleSave}
                   />
+                </div>
+                {upstreamProxyQuery.data ? (
+                  <div className="lg:col-span-2">
+                    <UpstreamProxySettings
+                      admin={upstreamProxyQuery.data}
+                      busy={controlsDisabled}
+                      onSaveSettings={handleSave}
+                      onCreateEndpoint={(payload) => createEndpointMutation.mutateAsync(payload)}
+                      onTestEndpoint={(endpointId) => testEndpointMutation.mutateAsync(endpointId)}
+                      onCreatePool={(payload) => createPoolMutation.mutateAsync(payload)}
+                      onAddPoolMember={(poolId, payload) =>
+                        addPoolMemberMutation.mutateAsync({ poolId, payload })
+                      }
+                    />
+                  </div>
                 ) : null}
-                <ModelSourcesSettings disabled={controlsDisabled} />
+                <div className="lg:col-span-2">
+                  <ModelSourcesSettings disabled={controlsDisabled} />
+                </div>
               </>
             ) : null}
 
             {activeTab === "operations" ? (
               <>
-                <FirewallSection disabled={controlsDisabled} />
-                <QuotaPlannerSection disabled={controlsDisabled} />
-                <StickySessionsSection disabled={controlsDisabled} />
-                <DataRetentionSettings
-                  key={[
-                    settings.requestLogRetentionOverrideDays,
-                    settings.usageHistoryRetentionOverrideDays,
-                    settings.requestLogRetentionDays,
-                    settings.usageHistoryRetentionDays,
-                  ].join(":")}
-                  settings={settings}
-                  busy={controlsDisabled}
-                  onSave={handleSave}
-                />
+                <div className="lg:col-span-2">
+                  <FirewallSection disabled={controlsDisabled} />
+                </div>
+                <div className="lg:col-span-2">
+                  <QuotaPlannerSection disabled={controlsDisabled} />
+                </div>
+                <div className="lg:col-span-2">
+                  <StickySessionsSection disabled={controlsDisabled} />
+                </div>
+                <div className="lg:col-span-2">
+                  <DataRetentionSettings
+                    key={[
+                      settings.requestLogRetentionOverrideDays,
+                      settings.usageHistoryRetentionOverrideDays,
+                      settings.requestLogRetentionDays,
+                      settings.usageHistoryRetentionDays,
+                    ].join(":")}
+                    settings={settings}
+                    busy={controlsDisabled}
+                    onSave={handleSave}
+                  />
+                </div>
               </>
             ) : null}
           </section>
