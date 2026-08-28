@@ -5761,8 +5761,11 @@ async def _stream_responses(
             responses_service_cleanup_ready_event
         )
         try:
-            try:
-                compact_result = await context.service.compact_responses(
+            # Start the upstream request before returning the StreamingResponse.
+            # The task inherits the cleanup-ready context, while resetting the
+            # context variable here keeps the request handler context balanced.
+            compact_task = asyncio.create_task(
+                context.service.compact_responses(
                     compact_payload,
                     effective_headers,
                     codex_session_affinity=codex_session_affinity,
@@ -5773,25 +5776,48 @@ async def _stream_responses(
                     forwarded_request=forwarded_request,
                     forwarded_file_owner_account_id=forwarded_file_owner_account_id,
                 )
-            except NotImplementedError:
-                error = OpenAIErrorEnvelopeModel(
-                    error=OpenAIError(
-                        message="responses/compact is not implemented",
-                        type="server_error",
-                        code="not_implemented",
+            )
+        finally:
+            _reset_propagated_responses_service_cleanup_ready(responses_cleanup_ready_token)
+
+        async def _compact_stream_with_keepalive() -> AsyncIterator[str]:
+            """Keep the response socket alive while remote compaction runs.
+
+            OpenResty can emit an HTML 504 when no response bytes are sent for
+            its read timeout.  Remote compaction is an SSE operation, so send
+            harmless SSE comments during the upstream wait and only then emit
+            the normal synthetic Responses events.
+            """
+            try:
+                interval = get_settings().sse_keepalive_interval_seconds
+                # Flush the HTTP headers immediately.  Without an initial
+                # frame, an intermediary can time out before the first
+                # keepalive interval elapses and return its own HTML 504.
+                _record_stream_keepalive("responses_compact")
+                yield SSE_KEEPALIVE_FRAME
+                while not compact_task.done():
+                    if interval <= 0:
+                        await asyncio.shield(compact_task)
+                        break
+                    try:
+                        await asyncio.wait_for(asyncio.shield(compact_task), timeout=interval)
+                    except asyncio.TimeoutError:
+                        _record_stream_keepalive("responses_compact")
+                        yield SSE_KEEPALIVE_FRAME
+
+                try:
+                    compact_result = await compact_task
+                except NotImplementedError:
+                    stream = _synthetic_compaction_failure_stream(
+                        response_id=get_request_id() or "unknown",
+                        error_code="not_implemented",
+                        error_message="responses/compact is not implemented",
                     )
-                )
-                return _logged_error_json_response(
-                    request,
-                    501,
-                    error.model_dump(mode="json", exclude_none=True),
-                    headers=rate_limit_headers,
-                )
-            except ProxyResponseError as exc:
-                if forwarded_request and responses_service_cleanup_ready_event.is_set():
-                    # Fallback settlement already transferred cleanup. A 502
-                    # would look like a definitive rejection and let origin
-                    # replay a compact that already ran.
+                except ProxyResponseError as exc:
+                    # Once SSE headers have been sent, preserve the wire
+                    # protocol and let the Codex client decide whether to
+                    # retry.  In particular, do not turn a settled bridge
+                    # failure into an HTTP 502 that causes duplicate replay.
                     envelope = _parse_error_envelope(exc.payload)
                     error = envelope.error
                     stream = _synthetic_compaction_failure_stream(
@@ -5803,54 +5829,53 @@ async def _stream_responses(
                             else "Compact request failed after settlement"
                         ),
                     )
-                    return StreamingResponse(
-                        stream,
-                        media_type="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache, no-transform",
-                            "X-Accel-Buffering": "no",
-                            **turn_state_headers,
-                            **rate_limit_headers,
-                        },
+                except Exception:
+                    logger.exception("Remote compaction stream failed after response start")
+                    stream = _synthetic_compaction_failure_stream(
+                        response_id=get_request_id() or "unknown",
+                        error_code="upstream_error",
+                        error_message="Remote compaction failed; retry the logical turn",
                     )
-                return _stream_startup_error_response(
-                    request,
-                    exc,
-                    headers=rate_limit_headers,
-                )
-            compact_item = _compact_response_output_item(compact_result)
-            if compact_item is None:
-                if forwarded_request and responses_service_cleanup_ready_event.is_set():
-                    stream = _synthetic_compaction_failure_stream(response_id=_compact_response_id(compact_result))
                 else:
-                    error = openai_error(
-                        "upstream_error",
-                        "Compact response did not include a compaction output item",
-                        error_type="server_error",
-                    )
-                    return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
-            else:
-                stream = _synthetic_compaction_response_stream(
-                    compact_item,
-                    response_id=_compact_response_id(compact_result),
-                    usage=compact_result.usage,
-                )
-            return StreamingResponse(
-                stream,
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache, no-transform",
-                    "X-Accel-Buffering": "no",
-                    **turn_state_headers,
-                    **rate_limit_headers,
-                },
-            )
-        finally:
-            _reset_propagated_responses_service_cleanup_ready(responses_cleanup_ready_token)
-            if _responses_origin_may_release_reservation(
-                service_cleanup_ready_event=responses_service_cleanup_ready_event
-            ):
-                await reservation_cleanup.release(action="terminal compaction response")
+                    compact_item = _compact_response_output_item(compact_result)
+                    if compact_item is None:
+                        stream = _synthetic_compaction_failure_stream(
+                            response_id=_compact_response_id(compact_result),
+                            error_code="upstream_error",
+                            error_message="Compact response did not include a compaction output item",
+                        )
+                    else:
+                        stream = _synthetic_compaction_response_stream(
+                            compact_item,
+                            response_id=_compact_response_id(compact_result),
+                            usage=compact_result.usage,
+                        )
+                async for chunk in stream:
+                    yield chunk
+            finally:
+                if not compact_task.done():
+                    compact_task.cancel()
+                try:
+                    await compact_task
+                except BaseException:
+                    # The exception was either serialized above or the client
+                    # disconnected and cancellation is intentional.
+                    pass
+                if _responses_origin_may_release_reservation(
+                    service_cleanup_ready_event=responses_service_cleanup_ready_event
+                ):
+                    await reservation_cleanup.release(action="terminal compaction response")
+
+        return StreamingResponse(
+            _compact_stream_with_keepalive(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                **turn_state_headers,
+                **rate_limit_headers,
+            },
+        )
     capacity_wait_event = asyncio.Event()
     capacity_ready_event = _CapacityStartupReadyEvent()
     payload.stream = True
