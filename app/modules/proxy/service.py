@@ -1865,8 +1865,7 @@ class ProxyService(
                         sticky_source=preferred_sticky_inputs[4],
                         legacy_sticky_key=preferred_sticky_inputs[5],
                         legacy_continuity_source=legacy_continuity_source,
-                        # Exact ownership chooses the account; a first-ever thread
-                        # still seeds atomically without overwriting a process default.
+                        # Exact ownership chooses the account.
                         sticky_seed_key=sticky_seed_key,
                         sticky_seed_kind=sticky_seed_kind,
                         abandon_unavailable_legacy_owner=abandon_unavailable_legacy_owner,
@@ -2128,6 +2127,7 @@ class ProxyService(
             code,
             http_status=exc.status_code,
         )
+
 
 def _is_previous_response_not_found_message(message: str | None) -> bool:
     return is_previous_response_not_found_message(message)

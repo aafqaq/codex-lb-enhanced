@@ -5793,7 +5793,6 @@ async def _stream_responses(
                 # Flush the HTTP headers immediately.  Without an initial
                 # frame, an intermediary can time out before the first
                 # keepalive interval elapses and return its own HTML 504.
-                _record_stream_keepalive("responses_compact")
                 yield SSE_KEEPALIVE_FRAME
                 while not compact_task.done():
                     if interval <= 0:
