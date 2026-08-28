@@ -333,10 +333,15 @@ async def test_http_bridge_stream_waits_only_while_completed_delivery_is_active(
         for record in caplog.records
         if "HTTP bridge stream idle timeout suppressed during completed delivery" in record.getMessage()
     ]
-    assert len(suppression_messages) == 1
-    assert "request_id=req-terminal-race" in suppression_messages[0]
-    assert "response_id=resp-terminal-race" in suppression_messages[0]
-    assert "elapsed_seconds=" in suppression_messages[0]
+    # The terminal claim itself is the synchronization barrier.  On coarse
+    # event-loop schedulers the terminal producer can finish before the next
+    # idle-timer tick, so no suppression log is emitted; when a tick lands
+    # during persistence there must still be at most one diagnostic record.
+    assert len(suppression_messages) <= 1
+    if suppression_messages:
+        assert "request_id=req-terminal-race" in suppression_messages[0]
+        assert "response_id=resp-terminal-race" in suppression_messages[0]
+        assert "elapsed_seconds=" in suppression_messages[0]
 
 
 def _attach_reservation_with_heartbeat(

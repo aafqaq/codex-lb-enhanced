@@ -1151,14 +1151,18 @@ def _maybe_log_upstream_event(
     status = event_payload.get("status")
     error = event_payload.get("error")
     if isinstance(error, Mapping):
-        if error_code is None and isinstance(error.get("code"), str):
-            error_code = error["code"]
-        if error_message is None and isinstance(error.get("message"), str):
-            error_message = error["message"]
-    if error_code is None and isinstance(event_payload.get("code"), str):
-        error_code = event_payload["code"]
-    if error_message is None and isinstance(event_payload.get("message"), str):
-        error_message = event_payload["message"]
+        error_code_value = error.get("code")
+        if error_code is None and isinstance(error_code_value, str):
+            error_code = error_code_value
+        error_message_value = error.get("message")
+        if error_message is None and isinstance(error_message_value, str):
+            error_message = error_message_value
+    event_code = event_payload.get("code")
+    if error_code is None and isinstance(event_code, str):
+        error_code = event_code
+    event_message = event_payload.get("message")
+    if error_message is None and isinstance(event_message, str):
+        error_message = event_message
 
     safe_account_id = _trace_hash_identifier(account_id) if isinstance(account_id, str) and account_id else None
     if "upstream_events" in channels:
@@ -1171,7 +1175,7 @@ def _maybe_log_upstream_event(
             transport,
             safe_account_id,
             event_type,
-            _trace_hash_identifier(response_id) if response_id else None,
+            _trace_hash_identifier(response_id) if isinstance(response_id, str) and response_id else None,
             sequence_number,
             status,
             close_code,
@@ -4438,8 +4442,9 @@ class _CompactCommandTransport:
                     # service can fail over/retry instead of logging success
                     # and handing the client a misleading 200/empty result.
                     if (
-                        data.get("object") == "response.compaction"
-                        and _compact_output_item_from_payload(cast(Mapping[str, JsonValue], data)) is None
+                        isinstance(data, Mapping)
+                        and data.get("object") == "response.compaction"
+                        and _compact_output_item_from_payload(data) is None
                     ):
                         error_code = "compact_output_missing"
                         error_message = "Upstream compact response did not include a compaction output item"
@@ -4572,8 +4577,9 @@ class _CompactCommandTransport:
                     # ``response.compaction`` output is a malformed upstream
                     # success and must enter the normal retry/failover path.
                     if (
-                        data.get("object") == "response.compaction"
-                        and _compact_output_item_from_payload(cast(Mapping[str, JsonValue], data)) is None
+                        isinstance(data, Mapping)
+                        and data.get("object") == "response.compaction"
+                        and _compact_output_item_from_payload(data) is None
                     ):
                         error_code = "compact_output_missing"
                         error_message = "Upstream compact response did not include a compaction output item"

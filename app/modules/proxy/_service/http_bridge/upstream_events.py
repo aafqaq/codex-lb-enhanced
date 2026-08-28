@@ -1909,6 +1909,13 @@ class _HTTPBridgeUpstreamEventsMixin:
             # downstream detach backstop only settle requests still in
             # pending ownership, so an abort here would otherwise leak the
             # API-key reservation and its heartbeat forever (issue #1594).
+            if completed_delivery_scope is not None:
+                # Keep the scope active while terminal persistence is being
+                # unwound, then release it before the downstream stream is
+                # allowed to fail closed.
+                completed_delivery_scope.active = False
+                for claimed_request_state in claimed_terminal_request_states:
+                    claimed_request_state.terminal_delivery_in_progress = False
             await self._settle_aborted_http_bridge_terminal_states(
                 session,
                 claimed_terminal_request_states,
@@ -1917,12 +1924,14 @@ class _HTTPBridgeUpstreamEventsMixin:
         else:
             for claimed_request_state in claimed_terminal_request_states:
                 claimed_request_state.terminal_settlement_phase = None
+            if completed_delivery_scope is not None:
+                completed_delivery_scope.active = False
+                for claimed_request_state in claimed_terminal_request_states:
+                    claimed_request_state.terminal_delivery_in_progress = False
         finally:
             if processing_request_state is not None:
                 processing_request_state.upstream_event_processing = False
                 processing_request_state.upstream_event_processing_started_at = None
-            if completed_delivery_scope is not None:
-                completed_delivery_scope.active = False
 
     async def _settle_aborted_http_bridge_terminal_states(
         self: Any,
@@ -2229,6 +2238,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                     if completed_event_queue is not None and completed_delivery_scope is not None:
                         completed_delivery_scope.active = True
                         terminal_request_state.completed_delivery_scope = completed_delivery_scope
+                        terminal_request_state.terminal_delivery_in_progress = True
 
             # Every request popped from pending ownership above is now owned
             # exclusively by this bookkeeping continuation. Record the claim
@@ -3188,11 +3198,22 @@ class _HTTPBridgeUpstreamEventsMixin:
                         _websocket_event_error_type(event_type, payload) or status_request_state.error_code_override
                     )
                     original_rate_limit_metadata: dict[str, JsonValue] = {}
-                    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
-                        for metadata_key in ("plan_type", "resets_at", "resets_in_seconds"):
-                            metadata_value = payload["error"].get(metadata_key)
-                            if isinstance(metadata_value, (str, int, float)):
-                                original_rate_limit_metadata[metadata_key] = metadata_value
+                    if isinstance(payload, dict):
+                        # Upstream variants put reset metadata either beside
+                        # the top-level ``error`` event or inside its nested
+                        # error object.  Preserve both forms when the pool
+                        # has no replacement, otherwise the client loses the
+                        # real retry window while we normalize the terminal
+                        # event to the Responses schema.
+                        metadata_sources: tuple[dict[str, JsonValue], ...] = (payload,)
+                        nested_error = payload.get("error")
+                        if isinstance(nested_error, dict):
+                            metadata_sources = (cast(dict[str, JsonValue], nested_error), payload)
+                        for metadata_source in metadata_sources:
+                            for metadata_key in ("plan_type", "resets_at", "resets_in_seconds"):
+                                metadata_value = metadata_source.get(metadata_key)
+                                if isinstance(metadata_value, (str, int, float)):
+                                    original_rate_limit_metadata[metadata_key] = metadata_value
                     payload = cast(
                         dict[str, JsonValue],
                         dict(

@@ -9067,9 +9067,17 @@ async def test_backend_responses_projects_retained_encrypted_reasoning_before_re
     assert len(alternate_upstream.sent_text) == 1
     replay_payload = json.loads(alternate_upstream.sent_text[0])
     assert "previous_response_id" not in replay_payload
-    assert all(item.get("type") not in {"reasoning", "web_search_call"} for item in replay_payload["input"])
+    assert all(item.get("type") != "web_search_call" for item in replay_payload["input"])
+    replay_reasoning = [item for item in replay_payload["input"] if item.get("type") == "reasoning"]
+    assert replay_reasoning == [
+        {
+            "type": "reasoning",
+            "encrypted_content": "owner-scoped-ciphertext",
+            "summary": [],
+        }
+    ]
     assert all("id" not in item for item in replay_payload["input"])
-    assert "encrypted_content" not in alternate_upstream.sent_text[0]
+    assert "owner-scoped-ciphertext" in alternate_upstream.sent_text[0]
     assert degraded_reasons == []
 
 

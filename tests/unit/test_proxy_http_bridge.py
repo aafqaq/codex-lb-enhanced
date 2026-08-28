@@ -21310,7 +21310,16 @@ async def test_process_http_bridge_upstream_text_preserves_raw_error_but_finaliz
             kind=proxy_service.StickySessionKind.CODEX_SESSION,
         ),
         request_model="gpt-5.5",
-        account=cast(Any, SimpleNamespace(id="acc-raw-error", status=AccountStatus.ACTIVE)),
+        account=cast(
+            Any,
+            SimpleNamespace(
+                id="acc-raw-error",
+                status=AccountStatus.ACTIVE,
+                plan_type="plus",
+                blocked_at=None,
+                deactivation_reason=None,
+            ),
+        ),
         upstream=cast(UpstreamWebSocket, SimpleNamespace(close=AsyncMock())),
         upstream_control=proxy_service._WebSocketUpstreamControl(),
         pending_requests=deque([request_state]),
@@ -21322,6 +21331,7 @@ async def test_process_http_bridge_upstream_text_preserves_raw_error_but_finaliz
     )
     finalize = AsyncMock()
     monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize)
+    monkeypatch.setattr(service._load_balancer, "mark_rate_limit", AsyncMock())
 
     raw_payload = {
         "type": "error",
@@ -21337,7 +21347,12 @@ async def test_process_http_bridge_upstream_text_preserves_raw_error_but_finaliz
 
     event_queue = request_state.event_queue
     assert event_queue is not None
-    assert await event_queue.get() == f"event: error\ndata: {raw_text}\n\n"
+    normalized_event = await event_queue.get()
+    assert normalized_event.startswith("event: response.failed\n")
+    normalized_payload = proxy_service.parse_sse_data_json(normalized_event)
+    assert isinstance(normalized_payload, dict)
+    assert normalized_payload["response"]["error"]["code"] == "rate_limit_exceeded"
+    assert normalized_payload["response"]["error"]["resets_in_seconds"] == 14555
     assert await event_queue.get() is None
     finalize.assert_awaited_once()
     finalize_call = finalize.await_args
@@ -21471,7 +21486,7 @@ async def test_http_bridge_replays_proxy_verified_full_resend_after_owner_quota(
             kind=proxy_service.StickySessionKind.CODEX_SESSION,
         ),
     )
-    account = cast(Any, SimpleNamespace(id="acc-limited", status=AccountStatus.ACTIVE))
+    account = cast(Any, SimpleNamespace(id="acc-limited", status=AccountStatus.ACTIVE, blocked_at=None))
     session = proxy_service._HTTPBridgeSession(
         key=proxy_service._HTTPBridgeSessionKey(
             "turn_state_header",
@@ -21503,7 +21518,7 @@ async def test_http_bridge_replays_proxy_verified_full_resend_after_owner_quota(
         assert session.downstream_turn_state is None
         assert request_state.previous_response_id is None
         assert request_state.preferred_account_id is None
-        assert request_state.request_text == fresh_text
+        assert json.loads(request_state.request_text) == json.loads(fresh_text)
         assert request_state.excluded_account_ids == {account.id}
         assert request_state.affinity_policy.reallocate_sticky is True
         assert list(session.pending_requests) == [request_state]
@@ -24685,8 +24700,10 @@ async def test_create_http_bridge_session_does_not_classify_post_selection_failu
 
 @pytest.mark.asyncio
 async def test_stream_via_http_bridge_fails_closed_before_file_affinity_when_previous_response_owner_misses(
+    _reset_db_state,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    del _reset_db_state
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     await service._pin_file_account("file_from_other_account", "acc-file")
     payload = proxy_service.ResponsesRequest.model_validate(
@@ -25124,6 +25141,11 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
             "internal_chat_message_metadata_passthrough": owner_metadata,
         },
         {
+            "type": "reasoning",
+            "encrypted_content": "encrypted-owner-scoped-reasoning",
+            "summary": [],
+        },
+        {
             "type": "function_call",
             "call_id": "call_old",
             "name": "lookup",
@@ -25150,7 +25172,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
             "internal_chat_message_metadata_passthrough": {"turn_id": "turn-next"},
         },
     ]
-    assert "encrypted_content" not in captured_text_data[0]
+    assert replay_payload["input"][1]["encrypted_content"] == "encrypted-owner-scoped-reasoning"
     assert all("id" not in item for item in replay_payload["input"])
     account_neutral_classifier.assert_called_once()
 
@@ -26723,10 +26745,11 @@ async def test_retry_http_bridge_account_exhaustion_can_walk_past_generic_replay
     assert request_state.excluded_account_ids == {"acc-quota-a", "acc-quota-b", "acc-quota-c"}
     replay_payload = json.loads(cast(AsyncMock, session.upstream.send_text).await_args.args[0])
     assert "_extra" not in replay_payload
-    assert replay_payload["reasoning"] == {"effort": "high"}
+    assert replay_payload["reasoning"] == {"effort": "high", "context": "all_turns"}
     assert replay_payload["client_metadata"] == {"codex_lb_operation_id": "op-quota-rebind"}
     assert [item["type"] for item in replay_payload["input"]] == [
         "message",
+        "reasoning",
         "custom_tool_call",
         "custom_tool_call_output",
     ]

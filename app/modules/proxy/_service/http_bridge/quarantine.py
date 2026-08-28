@@ -98,7 +98,19 @@ def _http_bridge_session_key_quarantined(service: Any, key: _HTTPBridgeSessionKe
     now = time.monotonic()
     _prune_http_bridge_quarantine_registry(registry, now)
     entry = registry.get(key)
-    return entry is not None and entry.quarantined_until > now
+    if entry is not None and entry.quarantined_until > now:
+        return True
+    # Canonicalization can recreate an equivalent key with a different
+    # derived ``strength`` value (for example an alias promoted from soft to
+    # hard).  Quarantine is scoped by affinity identity and API-key scope, not
+    # by that derived metadata, so retain the marker across the promotion.
+    return any(
+        candidate.affinity_kind == key.affinity_kind
+        and candidate.affinity_key == key.affinity_key
+        and candidate.api_key_id == key.api_key_id
+        and candidate_entry.quarantined_until > now
+        for candidate, candidate_entry in registry.items()
+    )
 
 
 def _quarantine_http_bridge_session(service: Any, session: _HTTPBridgeSession, *, reason: str) -> None:
@@ -113,7 +125,13 @@ def _quarantine_http_bridge_session(service: Any, session: _HTTPBridgeSession, *
     already_quarantined = entry.quarantined_until > now
     entry.quarantined_until = max(entry.quarantined_until, now + _HTTP_BRIDGE_QUARANTINE_TTL_SECONDS)
     entry.last_touched_monotonic = now
-    entry.reason = reason
+    # Preserve the first diagnostic cause for a quarantine window.  A single
+    # failed request can satisfy more than one detector (for example a wedged
+    # reattach also carries a full-resend anchor); overwriting the original
+    # reason makes the dashboard appear nondeterministic and hides the more
+    # specific first observation.
+    if not already_quarantined or entry.reason is None:
+        entry.reason = reason
     _prune_http_bridge_quarantine_registry(registry, now)
     session.quarantined = True
     if already_quarantined:

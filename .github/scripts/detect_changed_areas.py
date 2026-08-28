@@ -128,11 +128,15 @@ def _push_files(event: dict[str, Any]) -> list[str]:
                 flush=True,
             )
         else:
-            compared_files = [
-                item["filename"]
-                for item in payload.get("files", [])
-                if isinstance(item, dict) and isinstance(item.get("filename"), str)
-            ] if isinstance(payload, dict) else []
+            compared_files = (
+                [
+                    item["filename"]
+                    for item in payload.get("files", [])
+                    if isinstance(item, dict) and isinstance(item.get("filename"), str)
+                ]
+                if isinstance(payload, dict)
+                else []
+            )
             if compared_files:
                 return list(dict.fromkeys(compared_files))
 

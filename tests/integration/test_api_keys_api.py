@@ -4118,6 +4118,9 @@ async def test_rate_limit_header_failure_releases_reservation_once(
         "/api/api-keys/",
         json={
             "name": f"header-failure-{surface}",
+            # Exercise the pooled-header path: API-key quota display mode
+            # legitimately bypasses ``ProxyService.rate_limit_headers``.
+            "codex_quota_mode": "pool",
             "limits": [
                 {"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 50_000},
             ],

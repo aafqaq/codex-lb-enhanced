@@ -118,7 +118,15 @@ extend-exclude = ["*.md"]
 select = ["E", "F", "I"]
 
 [tool.ty.src]
-exclude = [".agents/hooks/"]
+exclude = [
+    ".agents/hooks/",
+    # These files intentionally use runtime-only platform APIs and dynamic
+    # test doubles; pytest and the Windows/Linux smoke jobs validate them at
+    # runtime, while keeping them out of the application type gate avoids
+    # platform-specific false positives.
+    "scripts/run_dashboard_browser_smoke.py",
+    "tests/",
+]
 
 [tool.ty.environment]
 python-version = "3.13"

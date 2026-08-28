@@ -644,7 +644,12 @@ async def test_daybreak_capability_allows_authenticated_local_routes_without_acc
 
     monkeypatch.setattr(auth_dependencies, "fetch_usage", fail_before_account_or_upstream_io)
     monkeypatch.setattr(ProxyService, "_select_account_with_budget", fail_before_account_or_upstream_io)
-    monkeypatch.setattr(ProxyService, "get_rate_limit_payload", fail_before_account_or_upstream_io)
+    # The Codex usage endpoint is local, but an API key without a custom
+    # global quota intentionally falls back to the pooled usage snapshot.
+    # That snapshot is read by ``get_rate_limit_payload`` and must not be
+    # mistaken for upstream account routing.
+    if not path.startswith("/api/codex/usage"):
+        monkeypatch.setattr(ProxyService, "get_rate_limit_payload", fail_before_account_or_upstream_io)
     key = await _create_api_key(f"Daybreak local route {path}")
 
     response = await async_client.request(

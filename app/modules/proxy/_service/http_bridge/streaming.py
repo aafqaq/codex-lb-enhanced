@@ -2177,7 +2177,8 @@ class _HTTPBridgeStreamingMixin:
                     defer_account_health_writes=request_state.api_key_reservation is not None,
                 )
             except ProxyResponseError as exc:
-                if not owner_unavailable_allows_account_neutral_replay(exc):
+                owner_replay_allowed = owner_unavailable_allows_account_neutral_replay(exc)
+                if not owner_replay_allowed:
                     exc_code, _exc_message = _proxy_error_code_message(exc)
                     if not unanchored_fork_spill_attempted and _http_bridge_unanchored_fork_can_spill_on_cap(
                         error_code=exc_code,
@@ -2671,6 +2672,29 @@ class _HTTPBridgeStreamingMixin:
                             session.last_used_at = _service_time().monotonic()
                 return
         session = session_or_forward
+        # Re-check after durable canonicalization/session lookup.  A failed
+        # attach may quarantine the canonical key while this request was
+        # resolving an alias; checking only the pre-lookup key would let the
+        # session-level anchor injection below resurrect the same wedged
+        # ``previous_response_id`` on the very next full resend.
+        if (
+            payload_looks_like_full_resend
+            and not fresh_reattach_anchor_suppressed_quarantined
+            and (
+                _http_bridge_session_key_quarantined(self, bridge_session_key)
+                or _http_bridge_session_key_quarantined(self, session.key)
+            )
+        ):
+            fresh_reattach_anchor_suppressed_quarantined = True
+            _log_http_bridge_event(
+                "fresh_reattach_anchor_skipped_quarantined",
+                session.key,
+                account_id=session.account.id,
+                model=effective_payload.model,
+                detail="response_id=post_lookup_recheck",
+                cache_key_family=session.key.affinity_kind,
+                model_class=_extract_model_class(effective_payload.model) if effective_payload.model else None,
+            )
         if (
             # A quarantine-suppressed anchor (#1534) must not be rehydrated
             # into the session either: doing so would let the session-level
@@ -2907,6 +2931,35 @@ class _HTTPBridgeStreamingMixin:
             elif client_full_resend_fresh_upstream_request_text is not None:
                 request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
                 request_state.fresh_upstream_request_is_retry_safe = True
+        if (
+            fresh_reattach_anchor_suppressed_quarantined
+            and payload_looks_like_full_resend
+            and request_state.previous_response_id is not None
+        ):
+            # A late recovery branch may have reintroduced the durable anchor
+            # while resolving an alias.  Quarantine is an explicit promise
+            # that this full client resend must be sent genuinely unanchored;
+            # strip the stale ID at the final serialization boundary as a
+            # last defence against rebuilding the known wedge.
+            unanchored_payload = _http_bridge_payload_without_previous_response_id(untrimmed_effective_payload)
+            request_state, text_data = prepare_bridge_request(unanchored_payload)
+            request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
+            request_state.affinity_policy = affinity
+            _apply_http_bridge_downstream_turn_state(
+                request_state,
+                downstream_turn_state=downstream_turn_state,
+                incoming_turn_state_header=incoming_turn_state_header,
+            )
+            request_state.transport = _REQUEST_TRANSPORT_HTTP
+            request_state.request_stage = _http_bridge_request_stage(
+                headers=headers,
+                payload=unanchored_payload,
+                durable_lookup=durable_lookup,
+            )
+            request_state.preferred_account_id = None
+            request_state.excluded_account_ids.update(fresh_replay_excluded_account_ids)
+            effective_payload = unanchored_payload
+            proxy_injected_previous_response_id = False
         initial_handoff_session = session
         initial_handoff_scope_id = ensure_request_scope_id() if original_request_unanchored else None
         if initial_handoff_scope_id is not None:
@@ -4125,8 +4178,13 @@ class _HTTPBridgeStreamingMixin:
 
                 async with session.pending_lock:
                     completed_delivery_scope = request_state.completed_delivery_scope
-                    completed_delivery_owns_queue = completed_delivery_scope is not None and (
-                        completed_delivery_scope.active or completed_delivery_scope.terminal_enqueued
+                    completed_delivery_owns_queue = (
+                        (
+                            completed_delivery_scope is not None
+                            and (completed_delivery_scope.active or completed_delivery_scope.terminal_enqueued)
+                        )
+                        or request_state.terminal_settlement_phase == "claimed"
+                        or request_state.terminal_delivery_in_progress
                     )
                     if completed_delivery_owns_queue:
                         keepalive_count = 0
