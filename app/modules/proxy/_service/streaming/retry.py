@@ -82,7 +82,10 @@ from app.modules.proxy.helpers import (
     upstream_usage_limit_error_code,
 )
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
-from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
+from app.modules.proxy.replay_safety import (
+    project_responses_payload_for_account_neutral_quota_replay,
+    responses_payload_is_account_neutral_fresh_replay,
+)
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
 _REQUEST_TRANSPORT_HTTP = "http"
@@ -187,6 +190,38 @@ def _verified_cross_transport_fresh_replay(
     return fresh_payload
 
 
+def _client_full_resend_replay(
+    payload: ResponsesRequest,
+    *,
+    enabled: bool,
+) -> ResponsesRequest | None:
+    """Project a complete client resend when the old owner cannot be used.
+
+    Codex resends the full Responses transcript together with an old
+    ``previous_response_id`` after reconnects.  The response id is account
+    scoped, but the transcript is portable once the normal replay-safety
+    projector has removed response-owned anchors and metadata.  This fallback
+    is deliberately enabled only by the explicit server recovery mode; the
+    default deployment remains fail-closed for ambiguous continuations.
+    """
+
+    if not enabled or payload.previous_response_id is None or not isinstance(payload.input, list):
+        return None
+    if len(payload.input) <= 1 or extract_input_file_ids(payload.input):
+        return None
+    projected = project_responses_payload_for_account_neutral_quota_replay(payload.to_replay_safety_payload())
+    if projected is None or not responses_payload_is_account_neutral_fresh_replay(
+        projected,
+        allow_file_references=True,
+    ):
+        return None
+    try:
+        replay = ResponsesRequest.model_validate(projected)
+    except (TypeError, ValueError):
+        return None
+    return replay if responses_payload_is_account_neutral_fresh_replay(replay.to_replay_safety_payload()) else None
+
+
 def _effective_http_downstream_transport_policy(
     api_key: ApiKeyData | None,
     dashboard_settings: Any,
@@ -289,6 +324,10 @@ class _StreamingRetryMixin:
         start = time.monotonic()
         base_settings = _facade().get_settings()
         settings = await _facade().get_settings_cache().get()
+        server_indefinite_recovery = (
+            getattr(settings, "http_responses_session_bridge_ambiguous_continuation_recovery_mode", "fail_closed")
+            == "server_indefinite_recovery"
+        )
         concurrency_caps = _facade().effective_account_concurrency_caps(settings)
         deadline = start + _facade()._stream_request_budget_seconds(
             base_settings,
@@ -429,6 +468,34 @@ class _StreamingRetryMixin:
             headers=headers,
             api_key=api_key,
         )
+        if verified_fresh_replay_payload is None:
+            verified_fresh_replay_payload = _client_full_resend_replay(
+                payload,
+                enabled=server_indefinite_recovery,
+            )
+            if verified_fresh_replay_payload is not None:
+                # A full client resend is structurally verified, but it may
+                # arrive with a stale raw session row from an older process.
+                # Do not let that row recreate the very owner conflict this
+                # replay is meant to recover from. The preferred response
+                # owner is still attempted first; this only affects fallback.
+                affinity = replace(
+                    affinity,
+                    key=None,
+                    kind=None,
+                    codex_session_source=None,
+                    legacy_codex_session_key=None,
+                    legacy_continuity_source=None,
+                    seed_selection_key=None,
+                    seed_selection_kind=None,
+                    require_unambiguous_account=False,
+                    reallocate_sticky=True,
+                )
+                logger.info(
+                    "Prepared structurally verified client full-resend recovery request_id=%s input_items=%s",
+                    request_id,
+                    len(cast(list[Any], payload.input)),
+                )
 
         async def _release_tracked_stream_lease(lease: AccountLease | None) -> None:
             if lease is None:
@@ -994,55 +1061,85 @@ class _StreamingRetryMixin:
                 # soft prompt-cache affinity key. A different account may have a
                 # warmer cache, but it cannot safely resolve the stored response.
                 if preferred_account_id is None:
-                    selection_inputs = await proxy._load_balancer._load_selection_inputs(
-                        model=payload.model,
-                        additional_limit_name=None,
-                        account_ids=None,
-                    )
-                    if len(selection_inputs.accounts) != 1:
-                        message = "Previous response owner account is unavailable; retry later."
-                        _record_continuity_fail_closed(
-                            surface="http_stream",
-                            reason="owner_account_unavailable",
-                            previous_response_id=payload.previous_response_id,
-                            session_id=previous_response_lookup_session_id,
-                            upstream_error_code="owner_lookup_miss",
+                    if verified_fresh_replay_payload is not None:
+                        payload = verified_fresh_replay_payload
+                        verified_fresh_replay_payload = None
+                        require_preferred_account = False
+                        turn_state_owner_account_id = None
+                        affinity = replace(affinity, reallocate_sticky=True)
+                        logger.warning(
+                            "Recovering previous-response owner lookup miss with client full resend request_id=%s",
+                            request_id,
                         )
-                        event = response_failed_event(
-                            "previous_response_owner_unavailable",
-                            message,
-                            response_id=request_id,
-                        )
-                        yield format_sse_event(event)
-                        await proxy._write_request_log(
-                            account_id=None,
-                            api_key=api_key,
-                            request_id=request_id,
+                    else:
+                        selection_inputs = await proxy._load_balancer._load_selection_inputs(
                             model=payload.model,
-                            latency_ms=int((time.monotonic() - start) * 1000),
-                            status="error",
-                            error_code="previous_response_owner_unavailable",
-                            error_message=message,
-                            reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
-                            transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
-                            service_tier=payload.service_tier,
-                            requested_service_tier=payload.service_tier,
-                            useragent=useragent,
-                            useragent_group=useragent_group,
-                            conversation_id=conversation_id,
-                            client_ip=client_ip,
+                            additional_limit_name=None,
+                            account_ids=None,
                         )
-                        return
+                        if len(selection_inputs.accounts) == 1:
+                            pass
+                        else:
+                            message = "Previous response owner account is unavailable; retry later."
+                            _record_continuity_fail_closed(
+                                surface="http_stream",
+                                reason="owner_account_unavailable",
+                                previous_response_id=payload.previous_response_id,
+                                session_id=previous_response_lookup_session_id,
+                                upstream_error_code="owner_lookup_miss",
+                            )
+                            event = response_failed_event(
+                                "previous_response_owner_unavailable",
+                                message,
+                                response_id=request_id,
+                            )
+                            yield format_sse_event(event)
+                            await proxy._write_request_log(
+                                account_id=None,
+                                api_key=api_key,
+                                request_id=request_id,
+                                model=payload.model,
+                                latency_ms=int((time.monotonic() - start) * 1000),
+                                status="error",
+                                error_code="previous_response_owner_unavailable",
+                                error_message=message,
+                                reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+                                transport=request_transport,
+                                upstream_transport=upstream_stream_transport,
+                                service_tier=payload.service_tier,
+                                requested_service_tier=payload.service_tier,
+                                useragent=useragent,
+                                useragent_group=useragent_group,
+                                conversation_id=conversation_id,
+                                client_ip=client_ip,
+                            )
+                            return
             # File and previous-response ownership are peers, not fallback
             # preferences. Resolve both before selection so a conflict cannot
             # be hidden by whichever source happened to run first. A hard turn
             # state is checked against this required owner by the balancer.
-            preferred_account_id = resolve_required_account_id(
-                ("turn state", turn_state_owner_account_id),
-                ("previous response", preferred_account_id),
-                ("input file", rewritten_file_account_id),
-            )
+            try:
+                preferred_account_id = resolve_required_account_id(
+                    ("turn state", turn_state_owner_account_id),
+                    ("previous response", preferred_account_id),
+                    ("input file", rewritten_file_account_id),
+                )
+            except ProxyResponseError:
+                # A structurally verified full resend no longer depends on
+                # either account-owned continuity source. Clear both anchors
+                # and let the normal pool selector choose a replacement.
+                if verified_fresh_replay_payload is None or rewritten_file_account_id is not None:
+                    raise
+                payload = verified_fresh_replay_payload
+                verified_fresh_replay_payload = None
+                preferred_account_id = None
+                turn_state_owner_account_id = None
+                require_preferred_account = False
+                affinity = replace(affinity, reallocate_sticky=True)
+                logger.warning(
+                    "Recovering continuity owner conflict with client full resend request_id=%s",
+                    request_id,
+                )
             require_preferred_account = require_preferred_account or turn_state_owner_account_id is not None
             file_required_preferred_account = rewritten_file_account_id is not None
             for attempt in count():
