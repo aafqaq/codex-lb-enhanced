@@ -2237,9 +2237,7 @@ def _should_fallback_to_http_after_websocket_handshake_error(
 
 
 def _should_fallback_to_http_after_websocket_status(transport_mode: str, status: int | None) -> bool:
-    return transport_mode == "auto" and (
-        status in _AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES or (status or 0) >= 500
-    )
+    return transport_mode == "auto" and (status in _AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES or (status or 0) >= 500)
 
 
 def _should_fallback_to_http_after_websocket_transport_error(

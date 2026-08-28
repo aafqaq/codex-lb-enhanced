@@ -236,6 +236,7 @@ def _portable_full_resend_text_for_recovery(
 
     return project_responses_text_for_account_neutral_quota_replay(_websocket_recovery_source_text(request_state))
 
+
 _HTTP_BRIDGE_RECOVERY_SETTLEMENT_RETRY_DELAYS = (
     0.25,
     0.5,
@@ -388,8 +389,7 @@ async def _mark_http_bridge_operation_failed_for_rebind(
         # Keep recovery alive; a durable failure is handled fail-closed by the
         # submit path instead of silently dispatching an unfenced duplicate.
         logger.warning(
-            "Failed to mark HTTP bridge previous-response operation failed before account failover "
-            "operation_id=%s",
+            "Failed to mark HTTP bridge previous-response operation failed before account failover operation_id=%s",
             operation_id,
             exc_info=True,
         )
@@ -1853,8 +1853,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             )
             matched_request_state = _match_websocket_request_state_for_anonymous_event(
                 session.pending_requests,
-                prefer_previous_response_not_found=is_previous_response_not_found_event
-                or is_missing_tool_output_event,
+                prefer_previous_response_not_found=is_previous_response_not_found_event or is_missing_tool_output_event,
                 previous_response_id_hint=_previous_response_id_from_not_found_message(error_message),
                 error_message=error_message,
                 allow_unanchored_previous_response_error=is_previous_response_not_found_event,
@@ -2847,11 +2846,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                 if status_request_state is not None
                 else None
             )
-            if (
-                quota_replay_text is not None
-                and status_request_state is not None
-                and not has_other_pending_requests
-            ):
+            if quota_replay_text is not None and status_request_state is not None and not has_other_pending_requests:
                 # The client supplied a full transcript, but its stale
                 # previous_response_id is tied to the exhausted owner.  A
                 # definitive pre-dispatch quota response makes this safe to
@@ -2915,9 +2910,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                         session.queued_request_count = max(0, session.queued_request_count - 1)
                 status_request_state.error_http_status_override = 429
                 status_request_state.error_code_override = owner_pinned_quota_error
-                status_request_state.error_message_override = (
-                    retry_error_message or "The usage limit has been reached"
-                )
+                status_request_state.error_message_override = retry_error_message or "The usage limit has been reached"
                 status_request_state.error_type_override = (
                     _websocket_event_error_type(event_type, payload) or owner_pinned_quota_error
                 )
@@ -3189,12 +3182,10 @@ class _HTTPBridgeUpstreamEventsMixin:
                         retry_error_code or terminal_account_exhaustion_code or USAGE_LIMIT_REACHED
                     )
                     status_request_state.error_message_override = (
-                        status_request_state.last_account_exhaustion_error_message
-                        or "The usage limit has been reached"
+                        status_request_state.last_account_exhaustion_error_message or "The usage limit has been reached"
                     )
                     status_request_state.error_type_override = (
-                        _websocket_event_error_type(event_type, payload)
-                        or status_request_state.error_code_override
+                        _websocket_event_error_type(event_type, payload) or status_request_state.error_code_override
                     )
                     original_rate_limit_metadata: dict[str, JsonValue] = {}
                     if isinstance(payload, dict) and isinstance(payload.get("error"), dict):

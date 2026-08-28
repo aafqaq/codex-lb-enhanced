@@ -2222,9 +2222,7 @@ class _HTTPBridgeMixin(
                     selection,
                     account=None,
                     error_code=(
-                        USAGE_LIMIT_REACHED
-                        if request_state.account_exhaustion_replay_count > 0
-                        else "no_accounts"
+                        USAGE_LIMIT_REACHED if request_state.account_exhaustion_replay_count > 0 else "no_accounts"
                     ),
                     error_message=(
                         request_state.last_account_exhaustion_error_message

@@ -1238,8 +1238,7 @@ async def _process_upstream_websocket_transport_end(
     # application errors arrive as text frames and never enter this branch;
     # peer-authored close frames retain the existing account-health semantics.
     account_neutral = is_account_neutral_websocket_error_code(message_error_code) or (
-        getattr(message, "kind", None) in {"close", "error"}
-        and getattr(message, "close_code", None) in {None, 1006}
+        getattr(message, "kind", None) in {"close", "error"} and getattr(message, "close_code", None) in {None, 1006}
     )
     replay_request_state = await _pop_replayable_precreated_websocket_request_state(
         reader_owned,
@@ -3991,8 +3990,7 @@ class _WebSocketMixin:
             selection = AccountSelection(
                 account=None,
                 error_message=(
-                    request_state.last_account_exhaustion_error_message
-                    or "The usage limit has been reached"
+                    request_state.last_account_exhaustion_error_message or "The usage limit has been reached"
                 ),
                 error_code=USAGE_LIMIT_REACHED,
                 resets_at=selection.resets_at,
@@ -5698,9 +5696,7 @@ class _WebSocketMixin:
                 has_other_pending_requests=has_other_pending_requests,
             )
         retry_error_message = _websocket_event_error_message(event_type, payload)
-        account_exhaustion_retry = (
-            upstream_usage_limit_error_code(retry_error_code, retry_error_message) is not None
-        )
+        account_exhaustion_retry = upstream_usage_limit_error_code(retry_error_code, retry_error_message) is not None
         terminal_account_exhaustion_code = upstream_usage_limit_error_code(
             _normalize_error_code(
                 _websocket_event_error_code(event_type, payload),

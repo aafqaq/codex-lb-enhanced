@@ -1520,11 +1520,15 @@ def _websocket_request_can_replay_before_visible_output(
         return False
     if request_state.transport == _REQUEST_TRANSPORT_WEBSOCKET and request_state.response_create_sent_at is None:
         return False
-    if request_state.replay_count >= 1 and not allow_account_exhaustion_replay and not (
-        allow_clean_close_retry
-        and request_state.replay_count == 1
-        and request_state.response_event_count == 0
-        and request_state.clean_close_replay_count == 0
+    if (
+        request_state.replay_count >= 1
+        and not allow_account_exhaustion_replay
+        and not (
+            allow_clean_close_retry
+            and request_state.replay_count == 1
+            and request_state.response_event_count == 0
+            and request_state.clean_close_replay_count == 0
+        )
     ):
         return False
     sequenced_created_only_prewarm = (
@@ -1553,8 +1557,7 @@ def _websocket_request_can_replay_before_visible_output(
         and request_state.fresh_upstream_request_text is not None
     )
     has_retry_safe_fresh_payload = (
-        request_state.fresh_upstream_request_is_retry_safe
-        and request_state.fresh_upstream_request_text is not None
+        request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text is not None
     ) or has_portable_full_resend_payload
     precreated_pending = request_state.response_id is None and request_state.awaiting_response_created
     if precreated_pending and request_state.previous_response_id is not None and not has_retry_safe_fresh_payload:
