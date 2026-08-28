@@ -101,3 +101,25 @@ def test_detect_changed_areas_reads_push_commit_paths(monkeypatch) -> None:
     assert files == ["frontend/src/App.tsx", "README.md", "docs/old.md"]
     assert any(detect_changed_areas._matches(path, detect_changed_areas.FILTERS["frontend"]) for path in files)
     assert not any(detect_changed_areas._matches(path, detect_changed_areas.FILTERS["backend"]) for path in files)
+
+
+def test_detect_changed_areas_compares_push_when_commit_list_is_missing(monkeypatch) -> None:
+    detect_changed_areas = _load_script_module("detect_changed_areas")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+
+    def fake_request_json(url: str):
+        assert url.endswith("/compare/111...222")
+        return {"files": [{"filename": "frontend/src/App.tsx"}]}, None
+
+    monkeypatch.setattr(detect_changed_areas, "request_json", fake_request_json)
+
+    files = detect_changed_areas._changed_files(
+        {
+            "commits": [],
+            "before": "111",
+            "after": "222",
+            "repository": {"full_name": "aafqaq/codex-lb-enhanced"},
+        }
+    )
+
+    assert files == ["frontend/src/App.tsx"]

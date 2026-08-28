@@ -112,9 +112,39 @@ def _push_files(event: dict[str, Any]) -> list[str]:
             paths = commit.get(key)
             if isinstance(paths, list):
                 files.extend(path for path in paths if isinstance(path, str))
-    if not files:
-        raise SystemExit("push payload did not contain changed files")
-    return files
+    if files:
+        return list(dict.fromkeys(files))
+
+    repository = event.get("repository")
+    repository_name = repository.get("full_name") if isinstance(repository, dict) else None
+    before = event.get("before")
+    after = event.get("after")
+    if isinstance(repository_name, str) and isinstance(before, str) and isinstance(after, str):
+        try:
+            payload, _ = request_json(f"https://api.github.com/repos/{repository_name}/compare/{before}...{after}")
+        except GitHubApiError as exc:
+            print(
+                f"warning: GitHub push comparison failed; falling back to the full CI suite: {exc}",
+                flush=True,
+            )
+        else:
+            compared_files = [
+                item["filename"]
+                for item in payload.get("files", [])
+                if isinstance(item, dict) and isinstance(item.get("filename"), str)
+            ] if isinstance(payload, dict) else []
+            if compared_files:
+                return list(dict.fromkeys(compared_files))
+
+    # GitHub can omit the commit list for oversized or synthetic push events.
+    # Keep the safety property that an unknown change runs the complete suite.
+    return [
+        "frontend/__github_push_files_unavailable__",
+        "app/__github_push_files_unavailable__",
+        "deploy/helm/__github_push_files_unavailable__",
+        "Dockerfile",
+        "app/db/alembic/__github_push_files_unavailable__",
+    ]
 
 
 def _changed_files(event: dict[str, Any]) -> list[str]:
