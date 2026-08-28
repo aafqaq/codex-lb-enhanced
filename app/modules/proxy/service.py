@@ -1940,17 +1940,11 @@ class ProxyService(
                             preferred_selection.error_message,
                         )
                         return preferred_selection
-                    # The preferred owner was explicitly checked and found
-                    # unavailable (most commonly an exhausted quota).  Keep
-                    # it out of the fallback selection for this logical
-                    # request; otherwise a sticky load-balancer policy can
-                    # immediately select the same account again.
                     excluded_account_ids_set.add(preferred_account_id)
-                    reallocate_sticky = True
                 selection = await self._load_balancer.select_account(
                     sticky_key=sticky_key,
                     sticky_kind=sticky_kind,
-                    reallocate_sticky=reallocate_sticky,
+                    reallocate_sticky=(reallocate_sticky or preferred_account_id is not None),
                     sticky_source=sticky_source,
                     legacy_sticky_key=legacy_sticky_key,
                     legacy_continuity_source=legacy_continuity_source,
@@ -2134,7 +2128,6 @@ class ProxyService(
             code,
             http_status=exc.status_code,
         )
-
 
 def _is_previous_response_not_found_message(message: str | None) -> bool:
     return is_previous_response_not_found_message(message)
