@@ -29,7 +29,11 @@ _CODEX_CLIENT_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset(
 _ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "namespace", "web_search", "web_search_preview"})
 _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS = {
     "custom": frozenset({"description", "format", "name", "type"}),
-    "function": frozenset({"description", "name", "parameters", "strict", "type"}),
+    # Codex Desktop includes ``output_schema`` (usually ``null``) on its
+    # function declarations.  It is a declaration-time schema, not an
+    # account-owned response reference, so rejecting it made an otherwise
+    # portable full transcript fail the quota failover projector.
+    "function": frozenset({"description", "name", "output_schema", "parameters", "strict", "type"}),
     # Codex desktop sends its built-in tool bundles as namespace declarations
     # nested inside an ``additional_tools`` input item.  The namespace itself
     # carries no account state; validate every nested declaration recursively.
@@ -259,11 +263,16 @@ def _project_account_neutral_replay_item(
         projected_item = dict(item)
         projected_item.pop("id")
     metadata = projected_item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
-    if isinstance(metadata, dict) and _internal_chat_message_metadata_is_account_neutral(metadata):
-        # create_time/content_item_kinds are Codex client bookkeeping, not
-        # portable model context. Keep only the stable turn boundary in a
-        # cross-account replay payload.
-        projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
+    if isinstance(metadata, dict):
+        # Rich Codex tool-result metadata may contain executed command
+        # arguments and other client-only fields.  It is not model context and
+        # must never be copied to a replacement account.  Keep only the stable
+        # turn boundary when present; malformed metadata is dropped entirely.
+        turn_id = metadata.get("turn_id")
+        if _is_nonblank_string(turn_id):
+            projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": turn_id}
+        else:
+            projected_item.pop(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD, None)
     return projected_item
 
 
@@ -912,12 +921,125 @@ def project_responses_text_for_account_neutral_quota_replay(
         return None
     projected_payload = project_responses_payload_for_account_neutral_quota_replay(source_payload)
     if projected_payload is None:
-        return None
+        # A full client resend with no ``previous_response_id`` is already a
+        # fresh Responses request.  Codex Desktop legitimately sends rich
+        # tool declarations and historical item metadata that our strict
+        # cross-account proof cannot classify yet (new client fields should
+        # not turn a definitive quota response into a user-visible failure).
+        # Keep the request portable at the top level while preserving the
+        # exact input/tool transcript; the normal send boundary rewrites the
+        # selected account's installation metadata.  Never use this fallback
+        # for an anchored continuation: without the old response object its
+        # context cannot be proven portable.
+        if source_payload.get("previous_response_id") not in (None, ""):
+            return None
+        projected_payload = _fallback_fresh_responses_payload(source_payload)
+        if projected_payload is None:
+            return None
     return json.dumps(
         {"type": "response.create", **projected_payload},
         separators=(",", ":"),
         ensure_ascii=False,
     )
+
+
+def _fallback_fresh_responses_payload(
+    payload: Mapping[str, JsonValue],
+) -> dict[str, JsonValue] | None:
+    """Build a conservative raw fresh replay for an unanchored client resend.
+
+    This is intentionally narrower than a generic ``dict(payload)`` copy:
+    proxy-only fields, stale anchors, cache/metadata controls and encrypted
+    response retrieval hints must not follow a request to another account.
+    Input items and tool declarations are retained because they are the
+    client's explicit stateless conversation transcript; dropping them would
+    silently remove tool calls or user messages.  Response item ids and rich
+    client metadata are stripped, while the upstream's normal request
+    validation remains the final authority for any newly introduced
+    account-scoped item type.
+    """
+
+    allowed = _RESPONSES_PAYLOAD_FIELDS_WITH_DEDICATED_VALIDATION - {
+        "conversation",
+        "previous_response_id",
+        "prompt",
+        "metadata",
+        "prompt_cache_key",
+        "include",
+    }
+    projected: dict[str, JsonValue] = {}
+    for key in allowed:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if key == "reasoning":
+            if isinstance(value, dict):
+                reasoning = {
+                    field: field_value
+                    for field, field_value in value.items()
+                    if field in _ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS
+                }
+                if reasoning:
+                    projected[key] = reasoning
+            continue
+        if key == "client_metadata":
+            if isinstance(value, dict):
+                metadata = _fresh_replay_client_metadata(value)
+                if metadata:
+                    projected[key] = metadata
+            continue
+        if key == "input" and isinstance(value, list):
+            projected[key] = [_sanitize_fresh_replay_item(item) for item in value]
+            continue
+        projected[key] = value
+    if "input" not in projected:
+        # The API accepts an omitted input, but a retry without the client's
+        # actual prompt would not preserve the operation's semantics.
+        return None
+    return projected
+
+
+def _fresh_replay_client_metadata(value: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    """Keep client routing metadata without the previous account identity."""
+
+    metadata: dict[str, JsonValue] = {}
+    for field, field_value in value.items():
+        if field not in _ACCOUNT_NEUTRAL_CLIENT_METADATA_FIELDS or not isinstance(field_value, str):
+            continue
+        # The selected account's installation id is injected at the final
+        # upstream send boundary.  Keeping the old value here would bind a
+        # replay to the exhausted account when that account has no explicit
+        # installation id of its own.
+        if field == "x-codex-installation-id":
+            continue
+        if field == "x-codex-turn-metadata":
+            try:
+                turn_metadata = json.loads(field_value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(turn_metadata, dict):
+                turn_metadata.pop("installation_id", None)
+                metadata[field] = json.dumps(turn_metadata, ensure_ascii=True, separators=(",", ":"))
+            continue
+        metadata[field] = field_value
+    return metadata
+
+
+def _sanitize_fresh_replay_item(item: JsonValue) -> JsonValue:
+    """Remove response-owned identity from a permissive fresh-replay item."""
+
+    if not isinstance(item, dict):
+        return item
+    sanitized = dict(item)
+    sanitized.pop("id", None)
+    metadata = sanitized.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    if isinstance(metadata, dict):
+        turn_id = metadata.get("turn_id")
+        if _is_nonblank_string(turn_id):
+            sanitized[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": turn_id}
+        else:
+            sanitized.pop(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD, None)
+    return sanitized
 
 
 def _reasoning_config_is_account_neutral(reasoning: JsonValue | None) -> bool:
@@ -998,8 +1120,11 @@ def _tool_declaration_is_account_neutral(tool: Mapping[str, JsonValue]) -> bool:
     if tool_type == "namespace":
         return _is_nonblank_string(tool.get("name")) and _tools_are_account_neutral(tool.get("tools"))
     if tool_type == "function":
-        return (tool.get("parameters") is None or isinstance(tool.get("parameters"), dict)) and (
-            tool.get("strict") is None or isinstance(tool.get("strict"), bool)
+        output_schema = tool.get("output_schema")
+        return (
+            (tool.get("parameters") is None or isinstance(tool.get("parameters"), dict))
+            and (tool.get("strict") is None or isinstance(tool.get("strict"), bool))
+            and (output_schema is None or isinstance(output_schema, dict))
         )
     if tool_type == "custom":
         return _custom_tool_format_is_account_neutral(tool.get("format"))

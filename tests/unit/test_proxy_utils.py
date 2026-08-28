@@ -27964,8 +27964,13 @@ async def test_process_upstream_websocket_text_does_not_retry_after_exposed_sequ
     assert downstream_text == upstream_text
     finalize_request_state.assert_awaited_once()
     handle_stream_error.assert_not_awaited()
-    assert upstream_control.reconnect_requested is False
-    assert upstream_control.suppress_downstream_event is False
+    # Once a sequenced frame was already visible, replaying inside the proxy
+    # could duplicate text or tool side effects. Suppress the account-local
+    # quota terminal and close the downstream transport so the client resends
+    # its complete turn history, matching an interrupted upstream stream.
+    assert upstream_control.reconnect_requested is True
+    assert upstream_control.suppress_downstream_event is True
+    assert upstream_control.close_downstream_for_client_retry is True
     assert upstream_control.replay_request_state is None
     assert pending_request.replay_count == 0
     assert pending_request.previous_response_id == "resp_proxy_anchor"
@@ -28044,6 +28049,101 @@ async def test_process_upstream_websocket_text_transparently_retries_precreated_
     assert pending_request.error_code_override is None
     assert pending_request.error_message_override is None
     assert pending_request.error_http_status_override is None
+    assert list(pending_requests) == []
+
+
+@pytest.mark.asyncio
+async def test_process_upstream_websocket_text_walks_past_second_quota_with_rich_full_resend(
+    monkeypatch,
+):
+    """A client full resend must remain replayable after A and B both exhaust."""
+
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    finalize_request_state = AsyncMock()
+    handle_stream_error = AsyncMock()
+    account_b = _make_account("acc_ws_second_quota_rich_transcript")
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize_request_state)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "future_codex_item",
+                "id": "response-owned-item-id",
+                "payload": {"text": "complete conversation history"},
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn-rich",
+                    "executed_tool_calls": [{"name": "exec", "arguments": {"cmd": "pwd"}}],
+                },
+            }
+        ],
+        "client_metadata": {
+            "x-codex-installation-id": "installation-account-b",
+            "x-codex-window-id": "thread-rich:1",
+        },
+        "prompt_cache_key": "thread-rich",
+        "include": ["reasoning.encrypted_content"],
+    }
+    pending_request = proxy_service._WebSocketRequestState(
+        request_id="ws_req_second_quota_rich_transcript",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort="xhigh",
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=True,
+        request_text=json.dumps(request_payload, separators=(",", ":")),
+        fresh_upstream_request_text=json.dumps(request_payload, separators=(",", ":")),
+        fresh_upstream_request_is_retry_safe=True,
+        excluded_account_ids={"acc_ws_first_quota"},
+        account_exhaustion_replay_count=1,
+    )
+    pending_requests = deque([pending_request])
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+    upstream_payload = {
+        "type": "error",
+        "status": 429,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+        },
+    }
+    upstream_text = json.dumps(upstream_payload, separators=(",", ":"))
+
+    downstream_text = await service._process_upstream_websocket_text(
+        upstream_text,
+        account=account_b,
+        account_id_value=account_b.id,
+        pending_requests=pending_requests,
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=upstream_control,
+        response_create_gate=asyncio.Semaphore(1),
+    )
+
+    assert downstream_text == upstream_text
+    finalize_request_state.assert_not_awaited()
+    handle_stream_error.assert_awaited_once()
+    assert upstream_control.reconnect_requested is True
+    assert upstream_control.suppress_downstream_event is True
+    assert upstream_control.replay_request_state is pending_request
+    assert pending_request.account_exhaustion_replay_count == 2
+    assert pending_request.excluded_account_ids == {"acc_ws_first_quota", account_b.id}
+    replay_payload = json.loads(pending_request.request_text or "{}")
+    assert replay_payload["input"] == [
+        {
+            "type": "future_codex_item",
+            "payload": {"text": "complete conversation history"},
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn-rich"},
+        }
+    ]
+    assert "prompt_cache_key" not in replay_payload
+    assert "include" not in replay_payload
+    assert replay_payload["client_metadata"] == {"x-codex-window-id": "thread-rich:1"}
     assert list(pending_requests) == []
 
 
@@ -29282,7 +29382,9 @@ async def test_proxy_responses_websocket_transparent_replay_strips_socket_turn_s
     assert connect_calls[0]["reallocate_sticky"] is expected_reallocate
     assert connect_calls[1]["sticky_key"] == expected_sticky_key
     assert connect_calls[1]["sticky_kind"] == expected_sticky_kind
-    assert connect_calls[1]["reallocate_sticky"] is expected_reallocate
+    # A definitive quota terminal must override the existing turn-state
+    # affinity; otherwise the reconnect can select the exhausted owner again.
+    assert connect_calls[1]["reallocate_sticky"] is True
     if client_turn_state is None:
         assert "x-codex-turn-state" not in connect_headers[0]
         assert "x-codex-turn-state" not in connect_headers[1]

@@ -5708,6 +5708,34 @@ class _WebSocketMixin:
             ),
             _websocket_event_error_message(event_type, payload),
         )
+        if terminal_account_exhaustion_code is not None and not account_exhaustion_retry:
+            # Keep the quota signal visible when a safety gate (for example a
+            # concurrent pending response) prevented classification.  Without
+            # this diagnostic the dashboard only showed a generic stream
+            # failure and it was impossible to distinguish a blocked failover
+            # from a missing upstream quota event.
+            _facade().logger.warning(
+                "websocket quota failover classification blocked "
+                "request_id=%s account_id=%s event_type=%s error_code=%s "
+                "has_other_pending=%s response_id=%s response_events=%s "
+                "awaiting_created=%s downstream_visible=%s upstream_output=%s "
+                "last_sequence=%s previous_response_id=%s preferred_account_id=%s "
+                "request_bytes=%s",
+                request_state.request_log_id or request_state.request_id,
+                account.id,
+                event_type,
+                terminal_account_exhaustion_code,
+                has_other_pending_requests,
+                request_state.response_id,
+                request_state.response_event_count,
+                request_state.awaiting_response_created,
+                request_state.downstream_visible,
+                request_state.upstream_model_output_seen,
+                request_state.last_downstream_sequence_number,
+                request_state.previous_response_id,
+                request_state.preferred_account_id,
+                len(request_state.request_text or ""),
+            )
         account_exhaustion_after_visible_output = bool(
             terminal_account_exhaustion_code is not None
             and request_state is not None
@@ -5858,6 +5886,28 @@ class _WebSocketMixin:
                         allow_quota_projection=True,
                     )
                     if retry_text is None:
+                        _facade().logger.warning(
+                            "websocket quota failover replay unavailable "
+                            "request_id=%s exhausted_account_id=%s "
+                            "has_other_pending=%s response_id=%s response_events=%s "
+                            "awaiting_created=%s downstream_visible=%s upstream_output=%s "
+                            "last_sequence=%s previous_response_id=%s preferred_account_id=%s "
+                            "fresh_retry_safe=%s fresh_bytes=%s request_bytes=%s",
+                            request_state.request_log_id or request_state.request_id,
+                            account.id,
+                            has_other_pending_requests,
+                            request_state.response_id,
+                            request_state.response_event_count,
+                            request_state.awaiting_response_created,
+                            request_state.downstream_visible,
+                            request_state.upstream_model_output_seen,
+                            request_state.last_downstream_sequence_number,
+                            request_state.previous_response_id,
+                            request_state.preferred_account_id,
+                            request_state.fresh_upstream_request_is_retry_safe,
+                            len(request_state.fresh_upstream_request_text or ""),
+                            len(request_state.request_text or ""),
+                        )
                         retry_error_code = None
                     else:
                         await proxy._release_request_state_account_response_create_lease(request_state)

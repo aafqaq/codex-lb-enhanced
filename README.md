@@ -102,7 +102,7 @@ docker run -d --name codex-lb-enhanced \
   -e CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_AMBIGUOUS_CONTINUATION_RECOVERY_MODE=server_indefinite_recovery \
   -p 2455:2455 -p 1455:1455 \
   -v codex-lb-enhanced-data:/var/lib/codex-lb \
-  ghcr.io/aafqaq/codex-lb-enhanced:1.24.12
+  ghcr.io/aafqaq/codex-lb-enhanced:1.24.13
 ```
 
 Open [http://localhost:2455](http://localhost:2455), complete initialization, add accounts, and create an API key. For production, keep your existing ports, volume, environment, network, and restart policy; pin a versioned image and back up the data volume before upgrades.
@@ -136,7 +136,7 @@ Replace `base_url` with your reverse-proxy address and use an API key created in
 
 ## Release and image
 
-Current release: **v1.24.12**. GitHub Actions builds the `main` branch and publishes the Docker image to [GitHub Container Registry](https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced); versioned releases are published through GitHub Releases.
+Current release: **v1.24.13**. GitHub Actions builds the `main` branch and publishes the Docker image to [GitHub Container Registry](https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced); versioned releases are published through GitHub Releases.
 
 ## License and disclaimer
 

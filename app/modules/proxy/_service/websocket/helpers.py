@@ -546,9 +546,18 @@ def _prepare_websocket_request_state_for_account_switch(
         if request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
         else request_state.request_text
     )
+    strict_source_replay = _websocket_request_text_is_account_neutral_fresh_replay(source_text)
     replay_text = project_responses_text_for_account_neutral_quota_replay(source_text)
     if replay_text is None:
         return None
+    if not strict_source_replay:
+        _facade().logger.info(
+            "websocket quota replay used permissive fresh transcript "
+            "request_id=%s input_bytes=%s previous_response_id=%s",
+            request_state.request_log_id or request_state.request_id,
+            len(source_text or ""),
+            request_state.previous_response_id,
+        )
     # A definitive quota terminal before visible model output proves that the
     # operation was not accepted by this account.  Codex clients may still
     # include response-owned bookkeeping in an otherwise complete transcript;
