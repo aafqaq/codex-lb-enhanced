@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowRightLeft, ArrowUpCircle, Tag } from "lucide-react";
+import { ArrowRightLeft, ArrowUpCircle, CheckCircle2, ExternalLink, Tag } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
@@ -11,6 +11,15 @@ import { getRuntimeVersion } from "@/features/runtime/api";
 import { getSettings } from "@/features/settings/api";
 import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { formatTimeLong } from "@/utils/formatters";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 const GITHUB_REPOSITORY_URL = "https://github.com/aafqaq/codex-lb-enhanced";
 const STATUS_REFRESH_INTERVAL_MS = 60_000;
@@ -116,10 +125,13 @@ export function StatusBar({ onHeightChange }: StatusBarProps = {}) {
     queryFn: getRuntimeVersion,
     retry: false,
     staleTime: 6 * 60 * 60 * 1000,
+    refetchInterval: 6 * 60 * 60 * 1000,
+    refetchOnWindowFocus: true,
   });
   const dateDisplayFormat = useDateDisplayFormatStore((state) => state.dateDisplayFormat);
   const lastSync = formatTimeLong(lastSyncAt, dateDisplayFormat);
   const [isUsageSynced, setIsUsageSynced] = useState(false);
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   useEffect(() => {
     function check() {
       setIsUsageSynced(
@@ -211,16 +223,16 @@ export function StatusBar({ onHeightChange }: StatusBarProps = {}) {
             <Tag className="h-3 w-3" aria-hidden="true" />
             <span className="font-medium">{t("statusBar.version")}</span> {currentVersion}
             {showUpdateAvailable ? (
-              <a
+              <button
+                type="button"
                 aria-label={updateLabel}
-                className="inline-flex h-4 w-4 items-center justify-center rounded-full text-amber-500 transition-colors hover:text-amber-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/60 focus-visible:ring-offset-2"
-                href={runtimeVersion.releaseUrl}
-                rel="noreferrer"
-                target="_blank"
+                className="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600 transition-colors hover:bg-amber-500/20 hover:text-amber-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/60 focus-visible:ring-offset-2 dark:text-amber-300"
+                onClick={() => setUpdateDialogOpen(true)}
                 title={updateLabel}
               >
-                <ArrowUpCircle className="h-3.5 w-3.5" aria-hidden="true" />
-              </a>
+                <ArrowUpCircle className="h-3 w-3" aria-hidden="true" />
+                {t("statusBar.updateButton")}
+              </button>
             ) : null}
           </span>
         </div>
@@ -237,6 +249,61 @@ export function StatusBar({ onHeightChange }: StatusBarProps = {}) {
           </svg>
         </a>
       </div>
+      {runtimeVersion && showUpdateAvailable ? (
+        <Dialog open={updateDialogOpen} onOpenChange={setUpdateDialogOpen}>
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <ArrowUpCircle className="h-5 w-5 text-amber-500" aria-hidden="true" />
+                {t("statusBar.updateDialog.title")}
+              </DialogTitle>
+              <DialogDescription>
+                {t("statusBar.updateDialog.description", { current: currentVersion, version: latestVersion })}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-2 rounded-lg border bg-muted/30 p-3 text-sm">
+                <div>
+                  <p className="text-xs text-muted-foreground">{t("statusBar.updateDialog.current")}</p>
+                  <p className="mt-1 font-semibold">{currentVersion}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-muted-foreground">{t("statusBar.updateDialog.latest")}</p>
+                  <p className="mt-1 font-semibold text-emerald-600 dark:text-emerald-400">{latestVersion}</p>
+                </div>
+              </div>
+              <ol className="space-y-2 text-sm text-muted-foreground">
+                {["backup", "pull", "restart"].map((step, index) => (
+                  <li key={step} className="flex gap-3">
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
+                      {index + 1}
+                    </span>
+                    <span>{t(`statusBar.updateDialog.steps.${step}`)}</span>
+                  </li>
+                ))}
+              </ol>
+              <div className="rounded-lg border bg-slate-950 p-3 text-xs text-slate-100 shadow-inner dark:bg-black">
+                <code className="break-all">docker pull ghcr.io/aafqaq/codex-lb-enhanced:{latestVersion}</code>
+              </div>
+              <p className="flex items-start gap-2 text-xs text-muted-foreground">
+                <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" aria-hidden="true" />
+                {t("statusBar.updateDialog.preserveConfig")}
+              </p>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" asChild>
+                <a href={runtimeVersion.releaseUrl} rel="noreferrer" target="_blank">
+                  <ExternalLink aria-hidden="true" />
+                  {t("statusBar.updateDialog.releaseNotes")}
+                </a>
+              </Button>
+              <Button type="button" onClick={() => setUpdateDialogOpen(false)}>
+                {t("common.actions.close")}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
     </footer>
   );
 }

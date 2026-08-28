@@ -157,7 +157,7 @@ export function SettingsPage() {
             id={`settings-panel-${activeTab}`}
             role="tabpanel"
             aria-labelledby={`settings-tab-${activeTab}`}
-            className="grid min-w-0 animate-fade-in-up grid-cols-1 gap-4 lg:grid-cols-2"
+            className="grid min-w-0 animate-fade-in-up auto-rows-max content-start items-start grid-cols-1 gap-4 lg:grid-cols-2"
           >
             {activeTab === "general" ? (
               <>
