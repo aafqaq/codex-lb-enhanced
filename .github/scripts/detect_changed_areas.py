@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detect CI areas changed by a pull request with retrying GitHub API reads."""
+"""Detect CI areas changed by a pull request or push event."""
 
 from __future__ import annotations
 
@@ -31,14 +31,12 @@ FILTERS = {
         "pyproject.toml",
         "uv.lock",
         "Makefile",
-        ".github/workflows/ci.yml",
         "docs/reference/settings.md",
         ".env.example",
     ],
     "helm": [
         "deploy/helm/**",
         "Makefile",
-        ".github/workflows/ci.yml",
     ],
     "docker": [
         "Dockerfile",
@@ -51,13 +49,11 @@ FILTERS = {
         "scripts/**",
         "pyproject.toml",
         "uv.lock",
-        ".github/workflows/ci.yml",
     ],
     "migrations": [
         "app/db/alembic/**",
         "pyproject.toml",
         "uv.lock",
-        ".github/workflows/ci.yml",
     ],
 }
 
@@ -102,12 +98,38 @@ def _pull_request_files(event: dict[str, Any]) -> list[str]:
     return files
 
 
+def _push_files(event: dict[str, Any]) -> list[str]:
+    """Return paths changed by commits included in a push payload."""
+    commits = event.get("commits")
+    if not isinstance(commits, list):
+        raise SystemExit("push.commits missing from event payload")
+
+    files: list[str] = []
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        for key in ("added", "modified", "removed"):
+            paths = commit.get(key)
+            if isinstance(paths, list):
+                files.extend(path for path in paths if isinstance(path, str))
+    if not files:
+        raise SystemExit("push payload did not contain changed files")
+    return files
+
+
+def _changed_files(event: dict[str, Any]) -> list[str]:
+    event_name = os.environ.get("GITHUB_EVENT_NAME")
+    if event_name == "push" or "commits" in event:
+        return _push_files(event)
+    return _pull_request_files(event)
+
+
 def _matches(path: str, patterns: list[str]) -> bool:
     return any(fnmatch(path, pattern) for pattern in patterns)
 
 
 def main() -> int:
-    files = _pull_request_files(_event())
+    files = _changed_files(_event())
     outputs = {name: any(_matches(path, patterns) for path in files) for name, patterns in FILTERS.items()}
     output_path = os.environ.get("GITHUB_OUTPUT")
     lines = [f"{name}={'true' if matched else 'false'}" for name, matched in outputs.items()]

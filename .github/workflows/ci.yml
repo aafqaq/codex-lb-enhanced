@@ -25,7 +25,8 @@ permissions:
 
 jobs:
   # Detect changed areas so PRs can skip unrelated expensive jobs.
-  # Pushes to main and merge queue events still run the full suite.
+  # Merge queue events run the full suite. Pushes use the commit file list so
+  # a frontend-only change does not create unrelated backend failures.
   changes:
     name: Detect changes
     runs-on: ubuntu-24.04
@@ -47,7 +48,7 @@ jobs:
       - name: Detect full-suite events
         id: force
         run: |
-          if [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "merge_group" ]]; then
+          if [[ "${{ github.event_name }}" == "merge_group" ]]; then
             echo "full_suite=true" >> "$GITHUB_OUTPUT"
           else
             echo "full_suite=" >> "$GITHUB_OUTPUT"

@@ -83,3 +83,21 @@ def test_detect_changed_areas_falls_back_to_full_suite_after_github_outage(monke
         any(detect_changed_areas._matches(path, patterns) for path in files)
         for patterns in detect_changed_areas.FILTERS.values()
     )
+
+
+def test_detect_changed_areas_reads_push_commit_paths(monkeypatch) -> None:
+    detect_changed_areas = _load_script_module("detect_changed_areas")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+
+    files = detect_changed_areas._changed_files(
+        {
+            "commits": [
+                {"added": ["frontend/src/App.tsx"], "modified": [], "removed": []},
+                {"added": [], "modified": ["README.md"], "removed": ["docs/old.md"]},
+            ]
+        }
+    )
+
+    assert files == ["frontend/src/App.tsx", "README.md", "docs/old.md"]
+    assert any(detect_changed_areas._matches(path, detect_changed_areas.FILTERS["frontend"]) for path in files)
+    assert not any(detect_changed_areas._matches(path, detect_changed_areas.FILTERS["backend"]) for path in files)
