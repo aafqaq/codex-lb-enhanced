@@ -932,11 +932,7 @@ async def test_stream_mid_stream_quota_uses_native_client_retry(async_client, mo
         assert retry_resp.status_code == 200
         retry_lines = [line async for line in retry_resp.aiter_lines() if line]
 
-    retry_events = [
-        event
-        for event in _extract_events(retry_lines)
-        if event.get("type") != "codex.keepalive"
-    ]
+    retry_events = [event for event in _extract_events(retry_lines) if event.get("type") != "codex.keepalive"]
     assert [event.get("type") for event in retry_events] == ["response.completed"]
     assert seen_account_ids == ["acc_midstream_a", "acc_midstream_b"]
 
@@ -1018,11 +1014,7 @@ async def test_stream_http_429_after_text_ends_for_native_client_retry_on_next_a
         assert retry_resp.status_code == 200
         retry_lines = [line async for line in retry_resp.aiter_lines() if line]
 
-    retry_events = [
-        event
-        for event in _extract_events(retry_lines)
-        if event.get("type") != "codex.keepalive"
-    ]
+    retry_events = [event for event in _extract_events(retry_lines) if event.get("type") != "codex.keepalive"]
     assert [event.get("type") for event in retry_events] == ["response.completed"]
     assert seen_account_ids == ["acc_midtext_429_a", "acc_midtext_429_b"]
 

@@ -21304,8 +21304,7 @@ async def test_select_websocket_connect_account_switches_after_owner_quota_with_
         fresh_upstream_request_text=fresh_text,
         fresh_upstream_request_is_retry_safe=True,
         request_text=(
-            '{"type":"response.create","model":"gpt-5.1",'
-            '"previous_response_id":"resp_owner","input":"continue"}'
+            '{"type":"response.create","model":"gpt-5.1","previous_response_id":"resp_owner","input":"continue"}'
         ),
     )
     replacement = _make_account("acc_replacement")
@@ -23993,10 +23992,7 @@ def test_websocket_transport_failure_marker_is_short_lived_and_account_neutral(
         account_id="acc_transport_failed",
     )
 
-    assert (
-        websocket_helpers_module._websocket_transport_failure_account_id(continuity_state)
-        == "acc_transport_failed"
-    )
+    assert websocket_helpers_module._websocket_transport_failure_account_id(continuity_state) == "acc_transport_failed"
     assert continuity_state.last_completed_response_id is None
 
     now[0] += proxy_support._WEBSOCKET_TRANSPORT_FAILURE_EXCLUSION_TTL_SECONDS + 0.01
@@ -25527,9 +25523,7 @@ async def test_websocket_terminal_health_write_fails_closed_on_unowned_prerequis
     handle_stream_error.assert_not_awaited()
     assert upstream_control.reconnect_requested is True
     assert (
-        service._websocket_previous_response_account_index[
-            ("resp_ws_terminal_health_prerequisite", None, None)
-        ]
+        service._websocket_previous_response_account_index[("resp_ws_terminal_health_prerequisite", None, None)]
         == account.id
     )
     assert any(message.startswith(expected_warning) for message in caplog.messages)

@@ -9682,7 +9682,7 @@ def test_backend_responses_websocket_reconnects_after_account_health_failure(app
                 "store": False,
                 "include": [],
                 "type": "response.create",
-            }
+            },
         ],
     )
 

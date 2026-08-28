@@ -1929,10 +1929,10 @@ def test_full_resend_accepts_and_normalizes_codex_client_turn_metadata() -> None
         {
             "type": "message",
             "role": "developer",
-                "internal_chat_message_metadata_passthrough": {
-                    **metadata,
-                    "content_item_kinds": ["environments.environment_context"],
-                },
+            "internal_chat_message_metadata_passthrough": {
+                **metadata,
+                "content_item_kinds": ["environments.environment_context"],
+            },
             "content": [{"type": "input_text", "text": "environment"}],
         },
     ]

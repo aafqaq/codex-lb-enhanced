@@ -252,6 +252,7 @@ async def _rebind_http_bridge_affinity_after_account_failover(
         or session.key.affinity_kind == "thread_header"
     )
 
+
 logger = logging.getLogger("app.modules.proxy.service")
 
 _HTTP_BRIDGE_CLEAN_CLOSE_RETRY_MAX_COUNT = 1
@@ -3086,10 +3087,7 @@ class _HTTPBridgeRequestSubmitMixin:
                         candidate.previous_response_id is None
                         and (
                             not candidate.hard_continuity_anchor
-                            or (
-                                quota_replay_text is not None
-                                and candidate.operation_rebind_required
-                            )
+                            or (quota_replay_text is not None and candidate.operation_rebind_required)
                         )
                         and not candidate.proxy_injected_previous_response_id
                         and not candidate.file_required_preferred_account
@@ -3155,9 +3153,7 @@ class _HTTPBridgeRequestSubmitMixin:
             close_generation = session.last_upstream_close_generation
             hard_session_affinity = session.key.strength == "hard"
             quota_replay_text = quota_failover_replay_text(request_state)
-            quota_hard_account_switch = (
-                quota_replay_text is not None and request_state.operation_rebind_required
-            )
+            quota_hard_account_switch = quota_replay_text is not None and request_state.operation_rebind_required
             if quota_replay_text is not None:
                 request_state.fresh_upstream_request_text = quota_replay_text
                 request_state.fresh_upstream_request_is_retry_safe = True
@@ -3241,9 +3237,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 # into an account-bound replay.  ``upstream_events`` marks the
                 # operation rebind-required before entering this retry path.
                 quota_replay_candidate = (
-                    allow_account_exhaustion_failover
-                    and quota_hard_account_switch
-                    and quota_replay_text is not None
+                    allow_account_exhaustion_failover and quota_hard_account_switch and quota_replay_text is not None
                 )
                 candidate_portable = (
                     request_state.operation_id is None
@@ -3253,8 +3247,7 @@ class _HTTPBridgeRequestSubmitMixin:
                         and request_state.operation_rebind_required
                     )
                 ) and (
-                    _websocket_request_text_is_account_neutral_fresh_replay(candidate_text)
-                    or quota_replay_candidate
+                    _websocket_request_text_is_account_neutral_fresh_replay(candidate_text) or quota_replay_candidate
                 )
                 request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
                 if request_text is None or request_text != candidate_text:

@@ -1980,9 +1980,7 @@ class _HTTPBridgeStreamingMixin:
             allowed = _http_bridge_is_previous_response_owner_unavailable(exc) or owner_quota_exhausted
             if allowed:
                 owner_failure_reason = "owner_quota_exhausted" if owner_quota_exhausted else "owner_unavailable"
-            return (
-                allowed and durable_full_resend_allows_account_neutral_replay()
-            )
+            return allowed and durable_full_resend_allows_account_neutral_replay()
 
         def switch_to_account_neutral_replay() -> None:
             nonlocal owner_failure_reason
@@ -2032,10 +2030,7 @@ class _HTTPBridgeStreamingMixin:
                 bridge_session_key,
                 account_id=failed_owner_id,
                 model=payload.model,
-                detail=(
-                    "outcome=projected_plaintext_full_resend_without_anchor;"
-                    f"reason={owner_failure_reason}"
-                ),
+                detail=(f"outcome=projected_plaintext_full_resend_without_anchor;reason={owner_failure_reason}"),
                 cache_key_family=bridge_session_key.affinity_kind,
                 model_class=_extract_model_class(payload.model) if payload.model else None,
             )

@@ -23,9 +23,7 @@ _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
 )
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
-_CODEX_CLIENT_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset(
-    {"turn_id", "create_time", "content_item_kinds"}
-)
+_CODEX_CLIENT_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id", "create_time", "content_item_kinds"})
 _ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "namespace", "web_search", "web_search_preview"})
 _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS = {
     "custom": frozenset({"description", "format", "name", "type"}),
@@ -335,8 +333,7 @@ def _internal_chat_message_metadata_is_account_neutral(value: JsonValue | None) 
         return False
     content_item_kinds = value.get("content_item_kinds")
     return content_item_kinds is None or (
-        isinstance(content_item_kinds, list)
-        and all(_is_nonblank_string(kind) for kind in content_item_kinds)
+        isinstance(content_item_kinds, list) and all(_is_nonblank_string(kind) for kind in content_item_kinds)
     )
 
 
@@ -426,10 +423,7 @@ def responses_input_suffix_retains_prior_output(
                 or not fresh_followup_is_user_message
                 or (
                     not retained_output_is_final_answer
-                    and (
-                        fresh_followup_turn_id is None
-                        or developer_turn_id != fresh_followup_turn_id
-                    )
+                    and (fresh_followup_turn_id is None or developer_turn_id != fresh_followup_turn_id)
                 )
                 or pending_suffix_calls
             ):
@@ -1346,9 +1340,7 @@ def _mapping_has_account_scoped_reference(
     allow_file_references: bool = False,
 ) -> bool:
     reference_keys = (
-        ("container_id", "vector_store_id")
-        if allow_file_references
-        else ("file_id", "container_id", "vector_store_id")
+        ("container_id", "vector_store_id") if allow_file_references else ("file_id", "container_id", "vector_store_id")
     )
     for key in reference_keys:
         if value.get(key) not in (None, ""):

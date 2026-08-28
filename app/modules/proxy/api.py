@@ -1608,9 +1608,7 @@ async def v1_usage(
     # view.  In pool mode an empty aggregate result must stay empty instead of
     # silently exposing API-key rules; this keeps `/v1/usage` consistent with
     # the Codex headers and `/api/codex/usage`.
-    visible_limits = (
-        upstream_limits if api_key.codex_quota_mode == CODEX_QUOTA_MODE_POOL else own_limits
-    )
+    visible_limits = upstream_limits if api_key.codex_quota_mode == CODEX_QUOTA_MODE_POOL else own_limits
     if not api_key.codex_quota_passthrough_enabled:
         # Keep accounting totals available, but make the quota-display switch
         # consistent across the official headers and the /v1/usage view.
@@ -1624,9 +1622,7 @@ async def v1_usage(
         cached_input_tokens=usage.cached_input_tokens,
         total_cost_usd=usage.total_cost_usd,
         limits=(
-            visible_limits
-            if api_key.codex_quota_mode == CODEX_QUOTA_MODE_POOL
-            else visible_limits or upstream_limits
+            visible_limits if api_key.codex_quota_mode == CODEX_QUOTA_MODE_POOL else visible_limits or upstream_limits
         ),
         upstream_limits=upstream_limits,
         account_pool_usage=account_pool_usage,
@@ -2301,9 +2297,7 @@ def _select_codex_usage_limit(
     candidates = [
         limit
         for limit in limits
-        if limit.limit_window == window
-        and limit.model_filter is None
-        and limit.limit_type in type_priority
+        if limit.limit_window == window and limit.model_filter is None and limit.limit_type in type_priority
     ]
     return min(candidates, key=lambda limit: type_priority[limit.limit_type]) if candidates else None
 
