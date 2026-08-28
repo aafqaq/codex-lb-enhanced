@@ -937,12 +937,13 @@ describe("buildDashboardView", () => {
     });
 
     const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
-    const burn = view.stats[3];
+    const burn = view.stats.find((stat) => stat.label.includes("Account burn"));
+    expect(burn).toBeDefined();
 
-    expect(burn.label).toBe("Account burn projection (5h/7d)");
-    expect(burn.value).toBe("0.7 / 0.8");
-    expect(burn.meta).toBe("Projected account-equivalents: 0.7/5h · 0.8/7d");
-    expect(view.stats[4]?.label).toBe("Error rate (7d)");
+    expect(burn?.label).toBe("Account burn projection (5h/7d)");
+    expect(burn?.value).toBe("0.7 / 0.8");
+    expect(burn?.meta).toBe("Projected account-equivalents: 0.7/5h · 0.8/7d");
+    expect(view.stats.find((stat) => stat.label.includes("Error rate"))?.label).toBe("Error rate (7d)");
   });
 
   it("can hide the account burn rate card", () => {
@@ -954,7 +955,7 @@ describe("buildDashboardView", () => {
     });
 
     expect(view.stats.map((stat) => stat.label)).not.toContain("Account burn projection (5h/7d)");
-    expect(view.stats).toHaveLength(4);
+    expect(view.stats).toHaveLength(3);
   });
 
   it("counts quota-exceeded secondary windows as fully burned", () => {
@@ -977,10 +978,10 @@ describe("buildDashboardView", () => {
     });
 
     const view = buildDashboardView(overview, createDefaultRequestLogs(), false);
-    const burn = view.stats[3];
+    const burn = view.stats.find((stat) => stat.label.includes("Account burn"));
 
-    expect(burn.value).toBe("0.0 / 1.0");
-    expect(burn.meta).toBe("Projected account-equivalents: 0.0/5h · 1.0/7d");
+    expect(burn?.value).toBe("0.0 / 1.0");
+    expect(burn?.meta).toBe("Projected account-equivalents: 0.0/5h · 1.0/7d");
   });
 
   it.skip("shows only the averaged cost text on the estimated cost card", () => {
@@ -1104,9 +1105,9 @@ describe("buildDashboardView", () => {
       false,
     );
 
-    expect(view.stats[0]?.comparison).toEqual({ text: "▲ 50%", tone: "positive" });
-    expect(view.stats[1]?.comparison).toEqual({ text: "▼ 50%", tone: "negative" });
-    expect(view.stats[2]?.comparison).toEqual({ text: "▲ 50%", tone: "positive" });
+    expect(view.stats.find((stat) => stat.label.includes("Requests"))?.comparison).toEqual({ text: "▲ 50%", tone: "positive" });
+    expect(view.stats.find((stat) => stat.label.includes("Tokens"))?.comparison).toEqual({ text: "▼ 50%", tone: "negative" });
+    expect(view.stats.find((stat) => stat.label.includes("Conversations"))?.comparison).toBeUndefined();
     expect(view.stats[view.stats.length - 1]?.comparison).toBeUndefined();
   });
 
@@ -1201,7 +1202,7 @@ describe("buildDashboardView", () => {
     expect(zeroPreviousView.stats[2]?.comparison).toBeUndefined();
   });
 
-  it("places Conversations stat after Est. API Cost and before optional burn-rate/Error Rate", () => {
+  it("places Conversations stat before optional burn-rate and Error Rate", () => {
     const overview = createDashboardOverview({
       summary: {
         primaryWindow: {
@@ -1228,23 +1229,19 @@ describe("buildDashboardView", () => {
 
     const viewWithoutBurn = buildDashboardView(overview, createDefaultRequestLogs(), false);
 
-    const costIdx = viewWithoutBurn.stats.findIndex((s) => s.label.includes("Est. API Cost"));
     const convIdx = viewWithoutBurn.stats.findIndex((s) => s.label.includes("Conversations"));
     const errorIdx = viewWithoutBurn.stats.findIndex((s) => s.label.includes("Error rate"));
 
-    expect(convIdx).toBeGreaterThan(costIdx);
     expect(convIdx).toBeGreaterThan(-1);
     expect(errorIdx).toBeGreaterThan(convIdx);
 
     // With burn-rate enabled, conversation should still be between cost and burn-rate
     const viewWithBurn = buildDashboardView(overview, createDefaultRequestLogs(), { isDark: false, showAccountBurnrate: true });
 
-    const costIdxB = viewWithBurn.stats.findIndex((s) => s.label.includes("Est. API Cost"));
     const convIdxB = viewWithBurn.stats.findIndex((s) => s.label.includes("Conversations"));
     const burnIdxB = viewWithBurn.stats.findIndex((s) => s.label.includes("Account burn"));
     const errorIdxB = viewWithBurn.stats.findIndex((s) => s.label.includes("Error rate"));
 
-    expect(convIdxB).toBeGreaterThan(costIdxB);
     expect(burnIdxB).toBeGreaterThan(convIdxB);
     expect(errorIdxB).toBeGreaterThan(burnIdxB);
   });

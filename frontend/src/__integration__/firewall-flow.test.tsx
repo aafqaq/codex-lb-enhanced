@@ -47,8 +47,7 @@ describe("firewall flow integration", () => {
     window.history.pushState({}, "", "/settings");
     renderWithProviders(<App />);
 
-    // Firewall lives in the collapsed-by-default Advanced group.
-    await user.click(await screen.findByRole("button", { name: "Show advanced settings" }));
+    await user.click(await screen.findByRole("tab", { name: "Operations" }));
 
     const firewallHeading = await screen.findByRole("heading", { name: "Firewall" });
     expect(firewallHeading).toBeInTheDocument();
@@ -82,6 +81,6 @@ describe("firewall flow integration", () => {
     expect(window.location.search).toBe("?advanced=1");
     expect(window.location.hash).toBe("#firewall");
     expect(await screen.findByRole("heading", { name: "Firewall" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Hide advanced settings" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Operations" })).toHaveAttribute("aria-selected", "true");
   });
 });

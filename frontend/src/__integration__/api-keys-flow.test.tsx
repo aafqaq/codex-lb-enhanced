@@ -16,6 +16,10 @@ async function openRowActions(user: ReturnType<typeof userEvent.setup>, row: HTM
   await user.click(actionsButton);
 }
 
+async function openSecuritySettings(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("tab", { name: "Access & security" }));
+}
+
 describe("api keys flow integration", () => {
   it("creates, shows plain key dialog, edits, and deletes an api key", async () => {
     const user = userEvent.setup();
@@ -24,6 +28,7 @@ describe("api keys flow integration", () => {
 
     window.history.pushState({}, "", "/settings");
     renderWithProviders(<App />);
+    await openSecuritySettings(user);
 
     const createButton = await screen.findByRole("button", { name: "Create key" });
     expect(createButton).toBeInTheDocument();
@@ -72,6 +77,7 @@ describe("api keys flow integration", () => {
 
     window.history.pushState({}, "", "/settings");
     renderWithProviders(<App />);
+    await openSecuritySettings(user);
 
     await user.click(await screen.findByRole("button", { name: "Create key" }));
     await user.type(screen.getByLabelText("Name"), "Scoped Integration Key");
@@ -99,6 +105,7 @@ describe("api keys flow integration", () => {
   it("displays the current api key list on settings", async () => {
     window.history.pushState({}, "", "/settings");
     renderWithProviders(<App />);
+    await openSecuritySettings(user);
 
     expect(await screen.findByRole("columnheader", { name: "Name" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Prefix" })).toBeInTheDocument();
@@ -129,6 +136,7 @@ describe("api keys flow integration", () => {
 
     window.history.pushState({}, "", "/settings");
     renderWithProviders(<App />);
+    await openSecuritySettings(user);
 
     expect(await screen.findByText("Default key")).toBeInTheDocument();
     const defaultKeyRow = getParentRow(screen.getByText("Default key"));
