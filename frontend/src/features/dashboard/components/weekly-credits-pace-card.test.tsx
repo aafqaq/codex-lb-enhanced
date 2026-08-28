@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { WeeklyCreditsPaceCard } from "@/features/dashboard/components/weekly-credits-pace-card";
@@ -46,6 +46,7 @@ describe("WeeklyCreditsPaceCard", () => {
     expect(screen.getByText("50%")).toBeInTheDocument();
     expect(screen.getByText("14%")).toBeInTheDocument();
     expect(screen.getByText("24% over planned usage")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View suggestions" }));
     expect(screen.getByText("Recommendations")).toBeInTheDocument();
     expect(screen.getByText("Pause")).toBeInTheDocument();
     expect(screen.getByText("2d 12h until reset")).toBeInTheDocument();
@@ -83,7 +84,7 @@ describe("WeeklyCreditsPaceCard", () => {
       />,
     );
 
-    expect(screen.queryByText("Recommendations")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "View suggestions" })).not.toBeInTheDocument();
     expect(screen.queryByText("No pause needed")).not.toBeInTheDocument();
     expect(screen.getByText("8% below planned usage")).toBeInTheDocument();
     expect(screen.queryByText("80K credits projected low-water mark")).not.toBeInTheDocument();
@@ -128,6 +129,7 @@ describe("WeeklyCreditsPaceCard", () => {
       />,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: "View suggestions" }));
     expect(screen.getByText("Recommendations")).toBeInTheDocument();
     expect(screen.queryByText("Pause")).not.toBeInTheDocument();
     expect(screen.queryByText("3h to return to schedule")).not.toBeInTheDocument();

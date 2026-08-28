@@ -233,7 +233,6 @@
   "apiKeys.form.codexQuotaMode": "Codex quota display",
   "apiKeys.form.codexQuotaModeHint": "Codex 클라이언트에 API 키 제한 또는 계정 풀 추정치를 표시합니다.",
   "apiKeys.form.codexQuotaPassthrough": "Codex quota emulation 사용",
-  "apiKeys.form.codexQuotaPassthroughHint": "Codex 호환 quota 헤더를 전송합니다.",
   "apiKeys.codexQuotaModes.api_key": "API 키 제한",
   "apiKeys.codexQuotaModes.pool": "계정 풀 quota",
   "apiKeys.limitRule.creditsGlobal": "Credits Global",

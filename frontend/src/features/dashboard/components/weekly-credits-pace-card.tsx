@@ -1,6 +1,16 @@
+import { useState } from "react";
 import { Gauge } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import type { WeeklyCreditPace } from "@/features/dashboard/utils";
 import { cn } from "@/lib/utils";
 import { formatCompactNumber } from "@/utils/formatters";
@@ -131,6 +141,7 @@ function throttleLine(pace: WeeklyCreditPace, t: ReturnType<typeof useTranslatio
 
 export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
   const { t } = useTranslation();
+  const [recommendationsOpen, setRecommendationsOpen] = useState(false);
   if (!pace) {
     return null;
   }
@@ -160,9 +171,22 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
 
   return (
     <section className="rounded-xl border bg-card p-5" aria-label={t("dashboard.weeklyPace.title")}>
-      <div className="mb-4 flex justify-between gap-3">
+      <div className="mb-4 flex items-center justify-between gap-3">
         <div>
-	          <h3 className="text-sm font-semibold">{t("dashboard.weeklyPace.title")}</h3>
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-semibold">{t("dashboard.weeklyPace.title")}</h3>
+            {showRecommendations ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 px-2.5 text-xs"
+                onClick={() => setRecommendationsOpen(true)}
+              >
+                {t("dashboard.weeklyPace.recommendations.open")}
+              </Button>
+            ) : null}
+          </div>
         </div>
         <div className={cn("flex h-9 w-9 items-center justify-center rounded-lg", statusClass)}>
           <Gauge className="h-4 w-4" aria-hidden="true" />
@@ -208,32 +232,37 @@ export function WeeklyCreditsPaceCard({ pace }: WeeklyCreditsPaceCardProps) {
           </div>
         </div>
 
-        {showRecommendations ? (
-          <div className="rounded-lg border bg-background/60 px-3 py-2 text-xs">
-	            <p className="font-medium">{t("dashboard.weeklyPace.recommendations.title")}</p>
-            <div className="mt-2 grid gap-1.5">
-              {breakEven ? (
-                <div className="flex items-baseline justify-between gap-3">
-	                  <span className="shrink-0 text-muted-foreground">{t("dashboard.weeklyPace.recommendations.pause")}</span>
-                  <span className="min-w-0 text-right tabular-nums">{breakEven}</span>
-                </div>
-              ) : null}
-              {throttle ? (
-                <div className="flex items-baseline justify-between gap-3">
-	                  <span className="shrink-0 text-muted-foreground">{t("dashboard.weeklyPace.recommendations.throttleLabel")}</span>
-                  <span className="min-w-0 text-right tabular-nums">{throttle}</span>
-                </div>
-              ) : null}
-              {proAccounts ? (
-                <div className="flex items-baseline justify-between gap-3">
-	                  <span className="shrink-0 text-muted-foreground">{t("dashboard.weeklyPace.recommendations.addCapacity")}</span>
-                  <span className="min-w-0 text-right tabular-nums">{proAccounts}</span>
-                </div>
-              ) : null}
-            </div>
-          </div>
-        ) : null}
       </div>
+
+      <Dialog open={recommendationsOpen} onOpenChange={setRecommendationsOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("dashboard.weeklyPace.recommendations.title")}</DialogTitle>
+            <DialogDescription>{t("dashboard.weeklyPace.recommendations.description")}</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-2 text-sm">
+            {breakEven ? (
+              <div className="flex items-baseline justify-between gap-3 rounded-lg border bg-muted/20 px-3 py-2">
+                <span className="shrink-0 text-muted-foreground">{t("dashboard.weeklyPace.recommendations.pause")}</span>
+                <span className="min-w-0 text-right tabular-nums">{breakEven}</span>
+              </div>
+            ) : null}
+            {throttle ? (
+              <div className="flex items-baseline justify-between gap-3 rounded-lg border bg-muted/20 px-3 py-2">
+                <span className="shrink-0 text-muted-foreground">{t("dashboard.weeklyPace.recommendations.throttleLabel")}</span>
+                <span className="min-w-0 text-right tabular-nums">{throttle}</span>
+              </div>
+            ) : null}
+            {proAccounts ? (
+              <div className="flex items-baseline justify-between gap-3 rounded-lg border bg-muted/20 px-3 py-2">
+                <span className="shrink-0 text-muted-foreground">{t("dashboard.weeklyPace.recommendations.addCapacity")}</span>
+                <span className="min-w-0 text-right tabular-nums">{proAccounts}</span>
+              </div>
+            ) : null}
+          </div>
+          <DialogFooter showCloseButton />
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }
