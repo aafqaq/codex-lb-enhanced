@@ -19,7 +19,7 @@ _TOOL_CALL_TYPE_BY_OUTPUT_TYPE = {
 }
 _TOOL_CALL_TYPES = frozenset(_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
 _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
-    {"reasoning", "tool_search_call", "tool_search_output", "web_search_call"}
+    {"tool_search_call", "tool_search_output", "web_search_call"}
 )
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
@@ -47,6 +47,7 @@ _ACCOUNT_NEUTRAL_MESSAGE_ROLES = frozenset({"assistant", "developer", "system", 
 _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = frozenset(
     {
         "additional_tools",
+        "reasoning",
         "apply_patch_call",
         "apply_patch_call_output",
         "custom_tool_call",
@@ -75,6 +76,11 @@ _ACCOUNT_NEUTRAL_CONTENT_FIELDS = {
 }
 _ACCOUNT_NEUTRAL_INPUT_ITEM_FIELDS = {
     "additional_tools": frozenset({"role", "tools", "type"}),
+    # OpenAI documents that ``store:false`` continuations must replay the
+    # encrypted reasoning items returned by the previous response.  The
+    # response id is account-owned and is removed during projection, while
+    # the encrypted reasoning payload itself is portable model context.
+    "reasoning": frozenset({"encrypted_content", "id", "status", "summary", "type"}),
     "apply_patch_call": frozenset(
         {
             "call_id",
@@ -110,7 +116,7 @@ _ACCOUNT_NEUTRAL_APPLY_PATCH_OPERATION_FIELDS = {
     "delete_file": frozenset({"path", "type"}),
     "update_file": frozenset({"diff", "path", "type"}),
 }
-_ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS = frozenset({"effort", "summary"})
+_ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS = frozenset({"context", "effort", "summary"})
 _ACCOUNT_NEUTRAL_CLIENT_METADATA_FIELDS = frozenset(
     {
         "ws_request_header_x_openai_internal_codex_responses_lite",
@@ -250,7 +256,9 @@ def _project_account_neutral_replay_item(
         return item
     if item_type is not None and not isinstance(item_type, str):
         return item
-    if item_type == "reasoning" or (
+    if item_type == "reasoning":
+        return _project_portable_reasoning_item(item)
+    if (
         item_type in _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES and item.get("status") == "completed"
     ):
         return None
@@ -272,6 +280,36 @@ def _project_account_neutral_replay_item(
         else:
             projected_item.pop(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD, None)
     return projected_item
+
+
+def _project_portable_reasoning_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    """Keep the encrypted reasoning state required by ``store:false`` replay.
+
+    Reasoning response ids belong to the account that issued them and must not
+    be sent to a replacement account.  The encrypted content, however, is the
+    portable reasoning state explicitly intended for manual history replay by
+    the Responses API.  Keep only the documented reasoning fields and require
+    a non-empty encrypted payload so malformed/account-bound items fail closed.
+    """
+
+    encrypted_content = item.get("encrypted_content")
+    if not _is_nonblank_string(encrypted_content):
+        return None
+    projected: dict[str, JsonValue] = {
+        "type": "reasoning",
+        "encrypted_content": encrypted_content,
+    }
+    summary = item.get("summary")
+    if summary is not None:
+        if not isinstance(summary, list):
+            return None
+        projected["summary"] = summary
+    status = item.get("status")
+    if status is not None:
+        if status not in _ACCOUNT_NEUTRAL_ITEM_STATUSES:
+            return None
+        projected["status"] = status
+    return projected
 
 
 def responses_input_items_are_self_contained_fresh_replay(input_items: list[JsonValue]) -> bool:
@@ -809,11 +847,12 @@ def project_responses_payload_for_account_neutral_quota_replay(
     """Build a portable fresh request after a definitive pre-dispatch quota error.
 
     Codex Desktop includes proxy/client bookkeeping in a full continuation
-    frame (for example ``_extra``, encrypted reasoning items and rich
-    ``client_metadata``).  Those values are either account-scoped or rejected
-    by a different upstream account.  A quota response is definitive before
-    any response event is emitted, so it is safe to replay only the portable
-    conversation/tool transcript on another account.
+    frame (for example ``_extra`` and rich ``client_metadata``).  Most of
+    those values are account-scoped or rejected by a different upstream
+    account; encrypted reasoning content is the documented exception and is
+    retained without its account-owned item id.  A quota response is
+    definitive before any response event is emitted, so it is safe to replay
+    the complete portable conversation/tool transcript on another account.
     """
 
     if not isinstance(payload, Mapping):
@@ -827,12 +866,19 @@ def project_responses_payload_for_account_neutral_quota_replay(
         "prompt",
         "metadata",
         "prompt_cache_key",
-        "include",
     }
+    responses_lite = _payload_requests_responses_lite(payload)
     for key in _RESPONSES_PAYLOAD_FIELDS_WITH_DEDICATED_VALIDATION:
         if key in omitted or key not in payload:
             continue
         value = payload[key]
+        if key == "include":
+            # Keep the response-side encrypted reasoning contract for Lite
+            # requests.  Other include values may contain account-specific
+            # retrieval hints and are intentionally omitted on failover.
+            if responses_lite and isinstance(value, list) and "reasoning.encrypted_content" in value:
+                projected[key] = ["reasoning.encrypted_content"]
+            continue
         if key == "reasoning":
             if isinstance(value, dict):
                 reasoning = {
@@ -882,6 +928,15 @@ def project_responses_payload_for_account_neutral_quota_replay(
             projected[key] = value
         else:
             projected[key] = value
+    if responses_lite:
+        reasoning = projected.get("reasoning")
+        normalized_reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
+        # The internal Responses-Lite contract rejects a fresh replay without
+        # this explicit context mode, even though GPT-5.6 normally defaults to
+        # it.  A cross-account replay has no previous response object, so make
+        # the effective mode explicit at the serialization boundary.
+        normalized_reasoning["context"] = "all_turns"
+        projected["reasoning"] = normalized_reasoning
     if "input" not in projected:
         return None
     # A pre-dispatch quota response proves the operation was not accepted by
@@ -948,7 +1003,8 @@ def _fallback_fresh_responses_payload(
     Input items and tool declarations are retained because they are the
     client's explicit stateless conversation transcript; dropping them would
     silently remove tool calls or user messages.  Response item ids and rich
-    client metadata are stripped, while the upstream's normal request
+    client metadata are stripped, while portable encrypted reasoning content
+    is retained for ``store:false`` replay and the upstream's normal request
     validation remains the final authority for any newly introduced
     account-scoped item type.
     """
@@ -959,13 +1015,17 @@ def _fallback_fresh_responses_payload(
         "prompt",
         "metadata",
         "prompt_cache_key",
-        "include",
     }
+    responses_lite = _payload_requests_responses_lite(payload)
     projected: dict[str, JsonValue] = {}
     for key in allowed:
         if key not in payload:
             continue
         value = payload[key]
+        if key == "include":
+            if responses_lite and isinstance(value, list) and "reasoning.encrypted_content" in value:
+                projected[key] = ["reasoning.encrypted_content"]
+            continue
         if key == "reasoning":
             if isinstance(value, dict):
                 reasoning = {
@@ -986,11 +1046,35 @@ def _fallback_fresh_responses_payload(
             projected[key] = [_sanitize_fresh_replay_item(item) for item in value]
             continue
         projected[key] = value
+    if responses_lite:
+        reasoning = projected.get("reasoning")
+        normalized_reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
+        normalized_reasoning["context"] = "all_turns"
+        projected["reasoning"] = normalized_reasoning
     if "input" not in projected:
         # The API accepts an omitted input, but a retry without the client's
         # actual prompt would not preserve the operation's semantics.
         return None
     return projected
+
+
+def _payload_requests_responses_lite(payload: Mapping[str, JsonValue]) -> bool:
+    """Detect the Responses-Lite contract before account-neutral projection."""
+
+    client_metadata = payload.get("client_metadata")
+    if isinstance(client_metadata, dict):
+        for key, value in client_metadata.items():
+            if (
+                isinstance(key, str)
+                and key.lower() == "ws_request_header_x_openai_internal_codex_responses_lite"
+                and isinstance(value, str)
+                and value.strip().lower() == "true"
+            ):
+                return True
+    input_value = payload.get("input")
+    return isinstance(input_value, list) and any(
+        isinstance(item, dict) and item.get("type") == "additional_tools" for item in input_value
+    )
 
 
 def _fresh_replay_client_metadata(value: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
@@ -1225,6 +1309,10 @@ def _input_items_have_valid_account_neutral_shape(input_items: list[JsonValue]) 
         if not isinstance(item, dict):
             return False
         item_type = item.get("type")
+        if item_type == "reasoning":
+            if _project_portable_reasoning_item(item) is None:
+                return False
+            continue
         if item_type in {"input_file", "input_image", "input_text"}:
             if not _input_content_part_is_self_contained(item, allow_output=False):
                 return False
@@ -1311,6 +1399,13 @@ def _contains_account_scoped_input_state(
         current = pending.pop()
         if isinstance(current, dict):
             item_type = current.get("type")
+            # ``encrypted_content`` is deliberately portable reasoning state
+            # for store:false history replay.  Validate its shape separately
+            # instead of treating it as a generic account-scoped reference.
+            if item_type == "reasoning":
+                if _project_portable_reasoning_item(current) is None:
+                    return True
+                continue
             if isinstance(item_type, str) and item_type in _ACCOUNT_SCOPED_HOSTED_INPUT_TYPES:
                 return True
             if isinstance(item_type, str) and item_type.startswith("mcp_"):

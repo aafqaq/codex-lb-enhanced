@@ -37,6 +37,7 @@ from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
     ProxyResponseError,
     UpstreamProxyRouteTrace,
     _as_image_fetch_session,
+    _finalize_responses_lite_reasoning_context,
     _inline_content_images,
     _inline_input_image_urls,
     _maybe_log_downstream_websocket_event,
@@ -79,6 +80,7 @@ from app.core.openai.parsing import (
     parse_sse_event_payload,
 )
 from app.core.openai.requests import (
+    ResponsesReasoning,
     ResponsesRequest,
 )
 from app.core.resilience.network_recovery import (
@@ -1237,9 +1239,15 @@ async def _process_upstream_websocket_transport_end(
     # not attach one of its synthetic network codes.  Structured upstream
     # application errors arrive as text frames and never enter this branch;
     # peer-authored close frames retain the existing account-health semantics.
-    account_neutral = is_account_neutral_websocket_error_code(message_error_code) or (
-        getattr(message, "kind", None) in {"close", "error"} and getattr(message, "close_code", None) in {None, 1006}
-    )
+    # A routed adapter reports a reset/timeout as a synthetic ``error`` frame
+    # (often without a close code).  Treating that frame as account-neutral
+    # leaves the sticky owner eligible for the next turn, so a dead or
+    # exhausted account is selected again and the client sees the same
+    # ``stream disconnected`` failure indefinitely.  Only an explicit
+    # account-neutral classification is exempt from health accounting; raw
+    # close/error transport failures must flow through the normal penalty and
+    # failover path.
+    account_neutral = is_account_neutral_websocket_error_code(message_error_code)
     replay_request_state = await _pop_replayable_precreated_websocket_request_state(
         reader_owned,
         pending_lock=anyio.Lock(),
@@ -3142,6 +3150,16 @@ class _WebSocketMixin:
         )
         if client_metadata is not None or "client_metadata" in normalized_payload:
             responses_payload = responses_payload.model_copy(update={"client_metadata": client_metadata})
+        # Direct WebSocket requests are serialized to text before they reach
+        # the core client transport.  Apply the same Responses-Lite reasoning
+        # contract here as the HTTP/SSE path so account failover and ordinary
+        # requests cannot advertise the Lite marker without ``all_turns``.
+        if body_uses_responses_lite or trusted_incremental_responses_lite:
+            lite_payload = dict(responses_payload.to_payload())
+            _finalize_responses_lite_reasoning_context(lite_payload, responses_lite=True)
+            responses_payload = responses_payload.model_copy(
+                update={"reasoning": ResponsesReasoning.model_validate(lite_payload["reasoning"])}
+            )
         previous_response_trimmed_input_count: int | None = None
         previous_response_trimmed_input_fingerprint: str | None = None
         client_full_resend_payload: ResponsesRequest | None = None
@@ -5280,6 +5298,23 @@ class _WebSocketMixin:
                 error_code="stream_incomplete",
                 error_message=str(exc),
             )
+            # A routed transport can raise directly from ``receive()`` (for
+            # example ConnectionResetError) instead of producing a structured
+            # transport-end frame.  Treat that as account health evidence so
+            # the normal balancer quarantine/failover path is engaged; merely
+            # failing the pending request leaves the sticky owner selected for
+            # the next attempt and causes repeated reconnect failures.
+            try:
+                await proxy._handle_stream_error(
+                    account,
+                    {"message": str(exc) or "Upstream websocket receive failed"},
+                    "stream_incomplete",
+                )
+            except Exception:
+                _facade().logger.debug(
+                    "Failed to record upstream websocket reader failure for account health",
+                    exc_info=True,
+                )
             await proxy._fail_pending_websocket_requests(
                 account=account,
                 account_id_value=account_id_value,

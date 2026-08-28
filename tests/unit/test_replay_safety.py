@@ -56,15 +56,47 @@ def test_quota_replay_projection_strips_codex_account_bound_bookkeeping() -> Non
 
     assert projected is not None
     assert "_extra" not in projected
-    assert projected["reasoning"] == {"effort": "xhigh", "summary": "detailed"}
+    assert projected["reasoning"] == {"effort": "xhigh", "summary": "detailed", "context": "all_turns"}
     assert "client_metadata" not in projected
     assert responses_payload_is_account_neutral_fresh_replay(projected)
     assert [item["type"] for item in projected["input"] if isinstance(item, dict)] == [
         "message",
+        "reasoning",
         "custom_tool_call",
         "custom_tool_call_output",
     ]
     assert all("id" not in item for item in projected["input"] if isinstance(item, dict))
+
+
+def test_quota_replay_lite_request_forces_all_turns_and_preserves_encrypted_reasoning() -> None:
+    payload: dict[str, JsonValue] = {
+        "model": "gpt-5.6-sol",
+        "include": ["reasoning.encrypted_content", "unsupported.account_state"],
+        "client_metadata": {"ws_request_header_x_openai_internal_codex_responses_lite": "true"},
+        "input": [
+            {
+                "type": "reasoning",
+                "id": "rs_old_account",
+                "encrypted_content": "portable-ciphertext",
+                "summary": [],
+                "status": "completed",
+            },
+            {"type": "message", "role": "user", "content": "continue"},
+        ],
+    }
+
+    replay = project_responses_text_for_account_neutral_quota_replay(json.dumps(payload))
+
+    assert replay is not None
+    replay_payload = json.loads(replay)
+    assert replay_payload["reasoning"] == {"context": "all_turns"}
+    assert replay_payload["include"] == ["reasoning.encrypted_content"]
+    assert replay_payload["input"][0] == {
+        "type": "reasoning",
+        "encrypted_content": "portable-ciphertext",
+        "summary": [],
+        "status": "completed",
+    }
 
 
 def test_quota_replay_projection_accepts_codex_empty_trailing_tool_output_part() -> None:
@@ -419,13 +451,18 @@ def test_account_neutral_replay_projection_removes_response_owned_bookkeeping() 
     projection = project_responses_input_for_account_neutral_fresh_replay(input_items, stored_count=3)
 
     assert projection is not None
-    assert projection.stored_prefix_count == 2
+    assert projection.stored_prefix_count == 3
     assert projection.input_items == [
         {
             "type": "message",
             "role": "user",
             "content": [{"type": "input_text", "text": "first question"}],
             "internal_chat_message_metadata_passthrough": metadata,
+        },
+        {
+            "type": "reasoning",
+            "encrypted_content": "owner-a-ciphertext",
+            "summary": [],
         },
         {
             "type": "custom_tool_call",
@@ -2433,7 +2470,6 @@ def test_full_resend_tool_loop_manifest_rejects_call_id_reused_from_unsupported_
         {"conversation": "conv_1", "input": []},
         {"previous_response_id": "resp_1", "input": []},
         {"prompt": {"id": "pmpt_1"}, "input": []},
-        {"input": [{"type": "reasoning", "encrypted_content": "ciphertext"}]},
         {"input": [{"type": "reasoning", "encrypted_content": 123}]},
         {"input": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "plan"}]}]},
         {"input": [{"type": "input_file", "file_id": "file_1"}]},

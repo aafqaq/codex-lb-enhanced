@@ -22904,7 +22904,7 @@ async def test_websocket_lite_fresh_replay_strips_trusted_marker(monkeypatch):
     assert "previous_response_id" not in replay_payload
     assert replay_payload["input"] == trusted_payload["input"]
     assert replay_payload["client_metadata"] == {"keep": "yes"}
-    assert replay_payload["reasoning"] == {"context": "last_turn", "effort": "high"}
+    assert replay_payload["reasoning"] == {"context": "all_turns", "effort": "high"}
     # The marker-stripped fresh body is non-Lite, so swapping to it for a
     # transparent replay must also clear the Lite acceptance flag.
     assert trusted.request_state.responses_lite_model == "gpt-5.6-sol"
