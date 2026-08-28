@@ -497,6 +497,36 @@ class _StreamingRetryMixin:
                     len(cast(list[Any], payload.input)),
                 )
 
+        def _detach_account_affinity_for_failover(*, account_id: str, outcome: str) -> None:
+            """Detach stale account-owned routing state for this retry walk.
+
+            Sticky rows are useful for normal locality, but they are not a
+            recovery policy.  Once an account has produced a definitive quota
+            or unavailable-owner result, retaining its prompt-cache/session
+            key can make the next selection resolve the same dead owner.  The
+            request's payload and continuity proof remain unchanged; only the
+            current retry's selection is unbound from the failed account.
+            """
+            nonlocal affinity
+            affinity = replace(
+                affinity,
+                key=None,
+                kind=None,
+                reallocate_sticky=False,
+                codex_session_source=None,
+                legacy_codex_session_key=None,
+                legacy_continuity_source=None,
+                seed_selection_key=None,
+                seed_selection_kind=None,
+                require_unambiguous_account=False,
+            )
+            logger.info(
+                "Detached account affinity for recovery request_id=%s account_id=%s outcome=%s",
+                request_id,
+                account_id,
+                outcome,
+            )
+
         async def _release_tracked_stream_lease(lease: AccountLease | None) -> None:
             if lease is None:
                 return
@@ -2525,11 +2555,27 @@ class _StreamingRetryMixin:
                                     action,
                                 )
                                 if action == "failover_next":
+                                    if upstream_usage_limit_error_code(code, error_message) is not None:
+                                        # Quota failover is a finite walk over
+                                        # the eligible pool, not the ordinary
+                                        # three-attempt transport budget.
+                                        account_exhaustion_walk_active = True
                                     last_transient_exc = tex
                                     transient_failed_account_id = account.id
                                     await _release_tracked_stream_lease(current_account_lease)
                                     current_account_lease = None
                                     excluded_account_ids.add(account.id)
+                                    if (
+                                        upstream_usage_limit_error_code(code, error_message) is not None
+                                        or (
+                                            not require_preferred_account
+                                            and file_preferred_account_id is None
+                                        )
+                                    ):
+                                        _detach_account_affinity_for_failover(
+                                            account_id=account.id,
+                                            outcome="previsible_failover",
+                                        )
                                     _move_verified_fresh_replay_from_owner(
                                         account_id=account.id,
                                         outcome="owner_previsible_failure",
@@ -2672,6 +2718,17 @@ class _StreamingRetryMixin:
                         await _release_tracked_stream_lease(current_account_lease)
                         current_account_lease = None
                         excluded_account_ids.add(account.id)
+                        if (
+                            upstream_usage_limit_error_code(exc.code, exc.error.get("message")) is not None
+                            or (
+                                not require_preferred_account
+                                and file_preferred_account_id is None
+                            )
+                        ):
+                            _detach_account_affinity_for_failover(
+                                account_id=account.id,
+                                outcome="retryable_account_failure",
+                            )
                     _move_verified_fresh_replay_from_owner(
                         account_id=account.id,
                         outcome="owner_previsible_retryable_failure",
@@ -3127,6 +3184,8 @@ class _StreamingRetryMixin:
                                 action,
                             )
                             if action == "failover_next":
+                                if upstream_usage_limit_error_code(current_error_code, error_message) is not None:
+                                    account_exhaustion_walk_active = True
                                 await proxy._handle_stream_error(
                                     account,
                                     current_error_payload,
@@ -3141,6 +3200,17 @@ class _StreamingRetryMixin:
                                     outcome="owner_post_refresh_failure",
                                 )
                                 excluded_account_ids.add(account.id)
+                                if (
+                                    upstream_usage_limit_error_code(current_error_code, error_message) is not None
+                                    or (
+                                        not require_preferred_account
+                                        and file_preferred_account_id is None
+                                    )
+                                ):
+                                    _detach_account_affinity_for_failover(
+                                        account_id=account.id,
+                                        outcome="post_refresh_failover",
+                                    )
                                 continue
                             health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)
                             if health_write_allowed:
