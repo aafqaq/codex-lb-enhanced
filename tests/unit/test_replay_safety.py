@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.core.openai.requests import ResponsesRequest
@@ -110,6 +112,100 @@ def test_quota_replay_text_builder_is_single_portable_response_create_frame() ->
     assert replay.startswith('{"type":"response.create"')
     assert "previous_response_id" not in replay
     assert '"input"' in replay
+
+
+def test_quota_replay_text_builder_falls_back_for_unanchored_rich_client_transcript() -> None:
+    # Codex Desktop may add a newly introduced item type before the strict
+    # projector knows how to classify it.  With no previous-response anchor,
+    # the client supplied a complete stateless transcript and it is safe to
+    # preserve that input while stripping stale routing controls.
+    source = {
+        "type": "response.create",
+        "model": "gpt-5.6-sol",
+        "previous_response_id": None,
+        "prompt_cache_key": "session-cache-key",
+        "include": ["reasoning.encrypted_content"],
+        "client_metadata": {
+            "x-codex-installation-id": "old-account-installation",
+            "x-codex-window-id": "thread:1",
+            "x-codex-turn-metadata": '{"installation_id":"old-account-installation","turn_id":"turn-1"}',
+            "unsupported": "drop-me",
+        },
+        "input": [
+            {
+                "type": "future_codex_item",
+                "id": "item-from-client-transcript",
+                "payload": {"text": "keep the client's complete context"},
+            }
+        ],
+    }
+
+    replay = project_responses_text_for_account_neutral_quota_replay(json.dumps(source))
+
+    assert replay is not None
+    replay_payload = json.loads(replay)
+    assert replay_payload["input"] == [{"type": "future_codex_item", "payload": source["input"][0]["payload"]}]
+    assert "previous_response_id" not in replay_payload
+    assert "prompt_cache_key" not in replay_payload
+    assert "include" not in replay_payload
+    assert replay_payload["client_metadata"] == {
+        "x-codex-window-id": "thread:1",
+        "x-codex-turn-metadata": '{"turn_id":"turn-1"}',
+    }
+
+
+def test_quota_replay_projection_accepts_codex_function_output_schema() -> None:
+    payload: dict[str, JsonValue] = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "exec",
+                        "description": "Run a command",
+                        "parameters": {"type": "object"},
+                        "output_schema": None,
+                        "strict": False,
+                    }
+                ],
+            }
+        ],
+    }
+
+    projected = project_responses_payload_for_account_neutral_quota_replay(payload)
+
+    assert projected is not None
+    assert responses_payload_is_account_neutral_fresh_replay(projected)
+
+
+def test_quota_replay_projection_strips_rich_codex_tool_metadata() -> None:
+    payload: dict[str, JsonValue] = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_1",
+                "call_id": "call_1",
+                "output": "done",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn_1",
+                    "create_time": 123.0,
+                    "executed_tool_calls": [{"name": "exec", "arguments": {"cmd": "secret"}}],
+                },
+            },
+        ],
+    }
+
+    # An output without its call is not a valid strict transcript and should
+    # therefore use the raw fresh fallback rather than being silently dropped.
+    replay = project_responses_text_for_account_neutral_quota_replay(json.dumps(payload))
+
+    assert replay is not None
+    replay_payload = json.loads(replay)
+    assert replay_payload["input"][0]["internal_chat_message_metadata_passthrough"] == {"turn_id": "turn_1"}
 
 
 @pytest.mark.parametrize(
