@@ -542,8 +542,8 @@ describe("ApiKeyEditDialog", () => {
       />,
     );
 
-    await user.click(screen.getByRole("combobox", { name: /codex quota display/i }));
-    await user.click(await screen.findByRole("option", { name: /pooled account quota/i }));
+    await user.click(screen.getByRole("button", { name: /codex quota display/i }));
+    await user.click(await screen.findByRole("menuitemradio", { name: /pooled account quota/i }));
     await user.click(screen.getByRole("switch", { name: /enable codex quota emulation/i }));
     await user.click(screen.getByRole("button", { name: "Save" }));
 
