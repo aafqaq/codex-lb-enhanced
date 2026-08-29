@@ -6,6 +6,8 @@
 
 **[English](README.md) | 简体中文**
 
+<p><strong>号池账号切换问题仍在持续修复中。</strong>我原本以为已经解决，但经过高强度测试，偶尔仍会出现无法恢复的情况。不过不用担心，我正在尝试解决这个问题；如果你有好的想法，欢迎提交 PR。</p>
+
 <p>
   <a href="https://github.com/aafqaq/codex-lb-enhanced/actions/workflows/build-custom-image.yml"><img src="https://github.com/aafqaq/codex-lb-enhanced/actions/workflows/build-custom-image.yml/badge.svg?branch=main" alt="构建状态"></a>
   <a href="https://github.com/aafqaq/codex-lb-enhanced/releases"><img src="https://img.shields.io/github/v/release/aafqaq/codex-lb-enhanced?display_name=tag&sort=semver&color=8b7cf6" alt="最新版本"></a>

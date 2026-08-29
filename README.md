@@ -6,6 +6,8 @@
 
 **English | [简体中文](README.zh-CN.md)**
 
+<p><strong>Account-pool switching is still being improved.</strong> I originally thought this issue was solved, but extensive testing shows that it can still occasionally fail to recover. Don't worry—I’m working on it; if you have a good idea, please open a PR.</p>
+
 <p>
   <a href="https://github.com/aafqaq/codex-lb-enhanced/actions/workflows/build-custom-image.yml"><img src="https://github.com/aafqaq/codex-lb-enhanced/actions/workflows/build-custom-image.yml/badge.svg?branch=main" alt="Build status"></a>
   <a href="https://github.com/aafqaq/codex-lb-enhanced/releases"><img src="https://img.shields.io/github/v/release/aafqaq/codex-lb-enhanced?display_name=tag&sort=semver&color=8b7cf6" alt="Latest release"></a>
