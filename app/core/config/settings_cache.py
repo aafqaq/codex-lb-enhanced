@@ -5,6 +5,7 @@ import time
 import anyio
 
 from app.core.cache.invalidation import NAMESPACE_SETTINGS, get_cache_invalidation_poller
+from app.core.config.trace import refresh_runtime_trace_channels
 from app.db.models import DashboardSettings
 from app.db.session import SessionLocal
 from app.modules.settings.repository import SettingsRepository
@@ -33,6 +34,14 @@ class SettingsCache:
                 settings = await SettingsRepository(session).get_or_create()
                 self._cached_settings = settings
                 self._cached_at = now
+                # Trace toggles are read from synchronous, per-frame logging
+                # paths that cannot await this cache, so publish them to the
+                # process-wide override here. Every settings write invalidates
+                # the cache, so the next load re-publishes within the TTL.
+                refresh_runtime_trace_channels(
+                    settings.verbose_logging_enabled,
+                    settings.verbose_logging_include_payloads,
+                )
                 return settings
 
     async def invalidate(self, *, propagate: bool = True) -> None:

@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 
 from app.core.config.settings import get_settings
+from app.core.config.trace import effective_verbose_logging
 from app.modules.settings.repository import SettingsRepository
 from app.modules.usage.additional_quota_keys import (
     canonicalize_additional_quota_key,
@@ -14,6 +15,8 @@ from app.modules.usage.additional_quota_keys import (
 @dataclass(frozen=True, slots=True)
 class DashboardSettingsData:
     sticky_threads_enabled: bool
+    verbose_logging_enabled: bool
+    verbose_logging_include_payloads: bool
     upstream_stream_transport: str
     prohibit_fast_mode: bool
     http_downstream_transport_policy: str
@@ -69,6 +72,8 @@ class DashboardSettingsData:
 @dataclass(frozen=True, slots=True)
 class DashboardSettingsUpdateData:
     sticky_threads_enabled: bool
+    verbose_logging_enabled: bool | None
+    verbose_logging_include_payloads: bool | None
     upstream_stream_transport: str
     prohibit_fast_mode: bool
     http_downstream_transport_policy: str
@@ -126,8 +131,14 @@ class SettingsService:
 
     async def get_settings(self) -> DashboardSettingsData:
         row = await self._repository.get_or_create()
+        verbose_enabled, verbose_payloads = effective_verbose_logging(
+            row.verbose_logging_enabled,
+            row.verbose_logging_include_payloads,
+        )
         return DashboardSettingsData(
             sticky_threads_enabled=row.sticky_threads_enabled,
+            verbose_logging_enabled=verbose_enabled,
+            verbose_logging_include_payloads=verbose_payloads,
             upstream_stream_transport=row.upstream_stream_transport,
             prohibit_fast_mode=row.prohibit_fast_mode,
             http_downstream_transport_policy=row.http_downstream_transport_policy,
@@ -202,6 +213,8 @@ class SettingsService:
         row = await self._repository.update(
             expected_version=expected_version,
             sticky_threads_enabled=payload.sticky_threads_enabled,
+            verbose_logging_enabled=payload.verbose_logging_enabled,
+            verbose_logging_include_payloads=payload.verbose_logging_include_payloads,
             upstream_stream_transport=payload.upstream_stream_transport,
             prohibit_fast_mode=payload.prohibit_fast_mode,
             http_downstream_transport_policy=payload.http_downstream_transport_policy,
@@ -256,8 +269,14 @@ class SettingsService:
             clear_request_log_retention=payload.clear_request_log_retention_override,
             clear_usage_history_retention=payload.clear_usage_history_retention_override,
         )
+        verbose_enabled, verbose_payloads = effective_verbose_logging(
+            row.verbose_logging_enabled,
+            row.verbose_logging_include_payloads,
+        )
         return DashboardSettingsData(
             sticky_threads_enabled=row.sticky_threads_enabled,
+            verbose_logging_enabled=verbose_enabled,
+            verbose_logging_include_payloads=verbose_payloads,
             upstream_stream_transport=row.upstream_stream_transport,
             prohibit_fast_mode=row.prohibit_fast_mode,
             http_downstream_transport_policy=row.http_downstream_transport_policy,

@@ -48,6 +48,7 @@ from app.core.clients.codex import (
 from app.core.clients.codex_version import get_codex_version_cache
 from app.core.clients.http import acquire_http_client, lease_http_session
 from app.core.config.settings import Settings, get_settings
+from app.core.config.trace import effective_trace_channels
 from app.core.conversation_archive import archive_json, archive_text
 from app.core.errors import (
     OpenAIErrorDetail,
@@ -1007,7 +1008,7 @@ def _maybe_log_upstream_request_start(
     payload_json: str | None = None,
     privacy_policy: CodexControlRequestPrivacyPolicy = CodexControlRequestPrivacyPolicy.STANDARD,
 ) -> None:
-    trace_channels = get_settings().trace_channels
+    trace_channels = effective_trace_channels(get_settings().trace_channels)
     if "upstream_summary" not in trace_channels and "upstream_payload" not in trace_channels:
         return
 
@@ -1058,7 +1059,7 @@ def _maybe_log_upstream_request_complete(
     retryable_same_contract: bool | None = None,
     privacy_policy: CodexControlRequestPrivacyPolicy = CodexControlRequestPrivacyPolicy.STANDARD,
 ) -> None:
-    if "upstream_summary" not in get_settings().trace_channels:
+    if "upstream_summary" not in effective_trace_channels(get_settings().trace_channels):
         return
 
     level = logging.INFO
@@ -1136,7 +1137,7 @@ def _maybe_log_upstream_event(
     the selected account id, not upstream headers.
     """
 
-    channels = get_settings().trace_channels
+    channels = effective_trace_channels(get_settings().trace_channels)
     if "upstream_events" not in channels and "upstream_event_payload" not in channels:
         return
 
@@ -1211,7 +1212,7 @@ def _maybe_log_downstream_websocket_event(
 ) -> None:
     """Trace client-originated websocket frames without logging credentials."""
 
-    channels = get_settings().trace_channels
+    channels = effective_trace_channels(get_settings().trace_channels)
     if "client_events" not in channels and "client_event_payload" not in channels:
         return
     if event_type is None and isinstance(payload, Mapping):
@@ -3671,7 +3672,7 @@ async def _stream_responses_with_session(
         headers=upstream_headers,
         method=method,
         payload_summary=_summarize_json_payload(payload_dict),
-        payload_json=payload_json if "upstream_payload" in settings.trace_channels else None,
+        payload_json=payload_json if "upstream_payload" in effective_trace_channels(settings.trace_channels) else None,
     )
     if transport == "http":
         archive_json(
@@ -3734,7 +3735,9 @@ async def _stream_responses_with_session(
             headers=upstream_headers,
             method=method,
             payload_summary=_summarize_json_payload(payload_dict),
-            payload_json=payload_json if "upstream_payload" in settings.trace_channels else None,
+            payload_json=(
+                payload_json if "upstream_payload" in effective_trace_channels(settings.trace_channels) else None
+            ),
         )
         archive_json(
             direction="codex_to_server",
@@ -4332,7 +4335,7 @@ class _CompactCommandTransport:
             method="POST",
             payload_summary=_summarize_json_payload(payload_dict),
             payload_json=json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
-            if "upstream_payload" in settings.trace_channels
+            if "upstream_payload" in effective_trace_channels(settings.trace_channels)
             else None,
         )
         archive_json(
@@ -4873,7 +4876,7 @@ async def thread_goal_request(
         method=request_method,
         payload_summary=_summarize_json_payload(payload_dict),
         payload_json=json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
-        if "upstream_payload" in settings.trace_channels
+        if "upstream_payload" in effective_trace_channels(settings.trace_channels)
         else None,
     )
     try:
@@ -5104,7 +5107,9 @@ async def codex_control_request(
         ),
         payload_json=(
             payload.decode("utf-8", errors="replace")
-            if not sensitive_realtime_payload and payload is not None and "upstream_payload" in settings.trace_channels
+            if not sensitive_realtime_payload
+            and payload is not None
+            and "upstream_payload" in effective_trace_channels(settings.trace_channels)
             else None
         ),
         privacy_policy=effective_privacy_policy,
@@ -5342,7 +5347,7 @@ async def _transcribe_audio_with_session(
         method="POST",
         payload_summary=json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
         payload_json=json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
-        if "upstream_payload" in settings.trace_channels
+        if "upstream_payload" in effective_trace_channels(settings.trace_channels)
         else None,
     )
     try:

@@ -384,6 +384,11 @@ class Settings(BaseSettings):
     # diagnostics), and ``client_event_payload`` (truncated raw downstream
     # websocket frames). Interactive incident use only, not steady-state
     # config; the payload channels may contain user prompts and model output.
+    #
+    # Settings -> Operations -> Diagnostic logging exposes the same thing as two
+    # switches and takes precedence once used: this variable then applies only
+    # while no operator decision has been recorded, so an existing deployment
+    # keeps its behaviour across an upgrade. See app/core/config/trace.py.
     trace: str = ""
     conversation_archive_enabled: bool = False
     conversation_archive_dir: Path = DEFAULT_CONVERSATION_ARCHIVE_DIR

@@ -120,7 +120,7 @@ export function TotpSettings({ settings, disabled = false, onSave }: TotpSetting
   };
 
   return (
-    <section className="rounded-xl border bg-card p-5">
+    <section className="h-full rounded-xl border bg-card p-5">
       <div className="space-y-3">
         {/* Status row */}
         <div className="flex items-center justify-between">

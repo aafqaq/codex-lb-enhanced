@@ -28,7 +28,13 @@ async def test_settings_cache_ttl_and_invalidate(monkeypatch) -> None:
 
         async def get_or_create(self):
             state["calls"] += 1
-            return SimpleNamespace(version=state["calls"])
+            # The cache publishes the trace override from every load, so the
+            # stub row has to carry those columns like the real ORM object.
+            return SimpleNamespace(
+                version=state["calls"],
+                verbose_logging_enabled=None,
+                verbose_logging_include_payloads=None,
+            )
 
     monkeypatch.setattr(settings_cache_module, "SessionLocal", lambda: _FakeSessionContext())
     monkeypatch.setattr(settings_cache_module, "SettingsRepository", _FakeRepository)

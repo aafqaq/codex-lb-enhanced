@@ -741,10 +741,20 @@ class _CompactMixin:
             *((source, owner_account_id) for source, owner_account_id, _session_id in owner_refs)
         )
         if resolved_owner is not None:
+            # Only compare identities minted in the same namespace. A live
+            # session that has not completed durable registration reports
+            # ``live:<index key>``, which can never equal the durable alias's
+            # ``durable:<session id>`` even when both name the same session on
+            # the same account -- comparing across namespaces would fail a
+            # healthy turn closed on every request. Both refs already agree on
+            # the account by this point; the identity check exists to catch two
+            # genuinely distinct durable sessions claiming one turn-state.
             session_identities = {
                 session_identity
                 for _source, owner_account_id, session_identity in owner_refs
-                if owner_account_id == resolved_owner and session_identity is not None
+                if owner_account_id == resolved_owner
+                and session_identity is not None
+                and session_identity.startswith("durable:")
             }
             if len(session_identities) > 1:
                 sources = ", ".join(source for source, _account_id, _session_id in owner_refs)

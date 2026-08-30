@@ -54,6 +54,8 @@ const WeeklyPaceSmoothingMinutesSchema = z.union([
 export const DashboardSettingsSchema = z
   .object({
     stickyThreadsEnabled: z.boolean(),
+    verboseLoggingEnabled: z.boolean().optional().default(false),
+    verboseLoggingIncludePayloads: z.boolean().optional().default(false),
     upstreamStreamTransport:
       UpstreamStreamTransportSchema.optional().default("default"),
     prohibitFastMode: z.boolean().optional().default(false),
@@ -166,6 +168,8 @@ export const SettingsUpdateRequestSchema = z
   .object({
     expectedVersion: z.number().int().min(1).optional(),
     stickyThreadsEnabled: z.boolean().optional(),
+    verboseLoggingEnabled: z.boolean().optional(),
+    verboseLoggingIncludePayloads: z.boolean().optional(),
     upstreamStreamTransport: UpstreamStreamTransportSchema.optional(),
     prohibitFastMode: z.boolean().optional(),
     httpDownstreamTransportPolicy: HttpDownstreamTransportPolicySchema.optional(),
