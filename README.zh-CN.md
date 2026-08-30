@@ -104,7 +104,7 @@ docker run -d --name codex-lb-enhanced \
   -e CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_AMBIGUOUS_CONTINUATION_RECOVERY_MODE=server_indefinite_recovery \
   -p 2455:2455 -p 1455:1455 \
   -v codex-lb-enhanced-data:/var/lib/codex-lb \
-  ghcr.io/aafqaq/codex-lb-enhanced:1.25.0
+  ghcr.io/aafqaq/codex-lb-enhanced:1.25.1
 ```
 
 打开 [http://localhost:2455](http://localhost:2455)，完成初始化、添加账号并创建 API Key。生产环境请把端口、卷、环境变量和重启策略替换成你的现有配置；升级前保留旧镜像标签以便回滚。
@@ -147,7 +147,7 @@ uv run codex-lb
 
 ## 版本与构建
 
-当前发布版本：**v1.25.0**。每次 `main` 变更都会经过 GitHub Actions 验证并更新 GHCR 滚动镜像；正式版本还会发布带版本号的镜像和 Python 构建产物。生产环境建议使用不可变的 [v1.25.0](https://github.com/aafqaq/codex-lb-enhanced/releases/tag/v1.25.0) 标签，不要直接使用 `latest`。镜像包位于 [GitHub Container Registry](https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced)。
+当前发布版本：**v1.25.1**。每次 `main` 变更都会经过 GitHub Actions 验证并更新 GHCR 滚动镜像；正式版本还会发布带版本号的镜像和 Python 构建产物。生产环境建议使用不可变的 [v1.25.1](https://github.com/aafqaq/codex-lb-enhanced/releases/tag/v1.25.1) 标签，不要直接使用 `latest`。镜像包位于 [GitHub Container Registry](https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced)。
 
 ## 许可证与免责声明
 

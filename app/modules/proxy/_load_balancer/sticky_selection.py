@@ -6,7 +6,7 @@ import time
 from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Generic, Literal, Protocol, TypeVar
+from typing import Any, Generic, Literal, Protocol, TypeVar, cast
 
 from app.core.balancer import (
     HEALTH_TIER_DRAINING,
@@ -236,6 +236,10 @@ class StickySelectionRequest(Generic[SelectionInputsT]):
     reload_inputs: Callable[[], Awaitable[SelectionInputsT]]
     record_account_cap_rejection: AccountCapRejectionCallback
     allow_usage_exhaustion_error: bool = True
+    # Effective candidate pool captured before this request's exclusions;
+    # quota exhaustion must be evaluated against it, not only the remaining
+    # replacement candidates.
+    usage_exhaustion_accounts: list[Account] | None = None
     api_key_id: str | None = None
     api_key_stream_fair_share_threshold_pct: int = 0
     # First-iteration owner read performed by the caller inside its shared
@@ -314,6 +318,7 @@ async def run_sticky_selection_path(
     allow_usage_exhaustion_error = request.allow_usage_exhaustion_error
     api_key_id = request.api_key_id
     fair_share_threshold_pct = request.api_key_stream_fair_share_threshold_pct
+    usage_exhaustion_accounts = request.usage_exhaustion_accounts
 
     selected_snapshot: Account | None = None
     selected_lease: AccountLease | None = None
@@ -420,6 +425,20 @@ async def run_sticky_selection_path(
                 required_account_id=required_account_id,
                 redact_sensitive_details=redact_sensitive_details,
             )
+            usage_exhaustion_states = states
+            if usage_exhaustion_accounts is not None:
+                # ``SelectionInputsT`` is bound to a Protocol, so the
+                # checker cannot see the concrete dataclass every caller
+                # actually passes; ``replace`` is correct at runtime.
+                usage_inputs = replace(
+                    cast(Any, selection_inputs),
+                    accounts=[_clone_account(account) for account in usage_exhaustion_accounts],
+                )
+                usage_exhaustion_states, _ = owner._prepare_sticky_selection_states(
+                    usage_inputs,
+                    required_account_id=None,
+                    redact_sensitive_details=redact_sensitive_details,
+                )
             if retired_legacy_owner_account_ids:
                 # Retirement is authoritative even when this selector loaded a
                 # pre-retirement account snapshot (or another replica still has
@@ -643,7 +662,7 @@ async def run_sticky_selection_path(
                 ignore_standard_quota=False,
                 routing_costs_by_account_id=effective_routing_costs,
                 allow_usage_exhaustion_error=allow_usage_exhaustion_error,
-                usage_exhaustion_states=states,
+                usage_exhaustion_states=usage_exhaustion_states,
             )
             if result.account is None:
                 selection_error_code = "hard_affinity_saturated"
@@ -686,7 +705,7 @@ async def run_sticky_selection_path(
                         ignore_standard_quota=False,
                         routing_costs_by_account_id=effective_routing_costs,
                         allow_usage_exhaustion_error=allow_usage_exhaustion_error,
-                        usage_exhaustion_states=states,
+                        usage_exhaustion_states=usage_exhaustion_states,
                         sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
                     )
                     result = sticky_outcome.selection

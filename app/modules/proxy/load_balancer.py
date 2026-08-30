@@ -573,8 +573,16 @@ class LoadBalancer:
         scoped_account_ids = None if account_ids is None else set(account_ids)
         owner_restricted_selection = required_account_is_ownership_constraint or required_continuity_owner
         sticky_selection_may_resolve_owner = sticky_key is not None and sticky_kind == StickySessionKind.CODEX_SESSION
+        # Keep an immutable snapshot of the effective candidate pool before
+        # this request's exclusion ledger is applied.  The normal selector
+        # must exclude accounts that already failed in this logical turn, but
+        # pool-wide quota reporting still needs to inspect those accounts so a
+        # true A->B->C exhaustion ends with usage_limit_reached rather than a
+        # misleading "no available accounts" error.
+        usage_exhaustion_accounts: list[Account] | None = None
 
         async def load_selection_inputs() -> _SelectionInputs:
+            nonlocal usage_exhaustion_accounts
             selection_inputs = await self._load_selection_inputs(
                 model=model,
                 service_tier=service_tier,
@@ -639,6 +647,8 @@ class LoadBalancer:
                         selection_inputs.quota_admitted_catalog_omission_account_ids
                     ),
                 )
+            if usage_exhaustion_accounts is None:
+                usage_exhaustion_accounts = [_clone_account(account) for account in selection_inputs.accounts]
             if excluded_ids and selection_inputs.accounts:
                 filtered_accounts = [account for account in selection_inputs.accounts if account.id not in excluded_ids]
                 if require_security_work_authorized and not filtered_accounts:
@@ -843,6 +853,7 @@ class LoadBalancer:
                     reload_inputs=load_selection_inputs,
                     record_account_cap_rejection=_record_account_cap_rejection,
                     allow_usage_exhaustion_error=allow_usage_exhaustion_error,
+                    usage_exhaustion_accounts=usage_exhaustion_accounts,
                 ),
             )
             selection_inputs = unbound_outcome.selection_inputs
@@ -917,6 +928,7 @@ class LoadBalancer:
                     reload_inputs=load_selection_inputs,
                     record_account_cap_rejection=_record_account_cap_rejection,
                     allow_usage_exhaustion_error=allow_usage_exhaustion_error,
+                    usage_exhaustion_accounts=usage_exhaustion_accounts,
                     initial_sticky_owner_lookup=initial_sticky_owner_lookup,
                 ),
             )

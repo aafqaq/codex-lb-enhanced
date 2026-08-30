@@ -23,6 +23,7 @@ from app.core.clients.proxy import (
     pop_stream_timeout_overrides,
 )
 from app.core.errors import openai_error, response_failed_event
+from app.core.openai.failover import OpenAIFailoverState, OpenAIFailure, OpenAIFailureClass
 from app.core.openai.requests import ResponsesRequest, extract_input_file_ids
 from app.core.resilience.network_recovery import (
     NetworkRecoveryDecision,
@@ -57,7 +58,9 @@ from app.modules.proxy._service.support import (
     _WebSocketUpstreamControl,
 )
 from app.modules.proxy._service.websocket.helpers import (
+    _record_websocket_quota_failure,
     _websocket_input_items_are_self_contained_fresh_replay,
+    _websocket_quota_failure_account_id,
 )
 from app.modules.proxy.affinity import (
     _is_synthesized_turn_state,
@@ -77,12 +80,13 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
     _upstream_error_from_openai,
+    account_exhaustion_code_for_failover,
     classify_upstream_failure,
     is_upstream_model_capacity_error,
-    upstream_usage_limit_error_code,
 )
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
 from app.modules.proxy.replay_safety import (
+    project_durable_transcript_for_account_neutral_quota_replay,
     project_responses_payload_for_account_neutral_quota_replay,
     responses_payload_is_account_neutral_fresh_replay,
 )
@@ -324,10 +328,25 @@ class _StreamingRetryMixin:
         start = time.monotonic()
         base_settings = _facade().get_settings()
         settings = await _facade().get_settings_cache().get()
-        server_indefinite_recovery = (
-            getattr(settings, "http_responses_session_bridge_ambiguous_continuation_recovery_mode", "fail_closed")
-            == "server_indefinite_recovery"
-        )
+        # HTTP/SSE and direct WebSocket requests share the logical continuity
+        # index.  Recover the marker written by a prior quota/transport
+        # failure so a client reconnect does not immediately resolve the same
+        # exhausted/stale owner.
+        continuity_state = None
+        continuity_key = _websocket_continuity_key_from_headers(headers)
+        if continuity_key is not None:
+            continuity_state = proxy._websocket_continuity_index.get(
+                (continuity_key, api_key.id if api_key is not None else None)
+            )
+        if continuity_state is None:
+            matching_continuity_states = [
+                state
+                for (_key, continuity_api_key_id), state in proxy._websocket_continuity_index.items()
+                if continuity_api_key_id == (api_key.id if api_key is not None else None)
+            ]
+            if len(matching_continuity_states) == 1:
+                continuity_state = matching_continuity_states[0]
+
         concurrency_caps = _facade().effective_account_concurrency_caps(settings)
         deadline = start + _facade()._stream_request_budget_seconds(
             base_settings,
@@ -437,7 +456,71 @@ class _StreamingRetryMixin:
         account_model_replay_attempted = False
         current_account_lease: AccountLease | None = None
         last_security_work_retry_error: _RetryableStreamError | None = None
-        excluded_account_ids: set[str] = set()
+        # Sub2API-style request-scoped failover state.  The balancer still
+        # owns ordering/rotation policy; this state only carries the accounts
+        # already tried by this logical request across retries.
+        quota_recovery_account_id = _websocket_quota_failure_account_id(continuity_state)
+        failover_state = OpenAIFailoverState(max_switches=max(int(max_attempts), 1))
+        excluded_account_ids: set[str] = failover_state.failed_account_ids
+        if quota_recovery_account_id is not None:
+            failover_state.record_failure(
+                quota_recovery_account_id,
+                OpenAIFailure(
+                    failure_class=OpenAIFailureClass.QUOTA_EXHAUSTED,
+                    code="usage_limit_reached",
+                    message="The usage limit has been reached",
+                    retry_next_account=True,
+                    safe_full_replay=True,
+                ),
+            )
+
+        def _remember_quota_failure(account_id: str) -> None:
+            """Persist quota evidence and feed the shared failover ledger."""
+
+            _record_websocket_quota_failure(continuity_state, account_id=account_id)
+            failover_state.record_failure(
+                account_id,
+                OpenAIFailure(
+                    failure_class=OpenAIFailureClass.QUOTA_EXHAUSTED,
+                    code="usage_limit_reached",
+                    message="The usage limit has been reached",
+                    status_code=429,
+                    retry_next_account=True,
+                    safe_full_replay=True,
+                ),
+            )
+
+        def _exclude_account(
+            account_id: str | None,
+            *,
+            failure_class: OpenAIFailureClass = OpenAIFailureClass.UNKNOWN,
+            code: str = "upstream_error",
+            message: str = "Upstream account failed",
+            status_code: int | None = None,
+            retry_next_account: bool = True,
+            safe_full_replay: bool = False,
+        ) -> None:
+            """Record one account failure through the shared failover ledger.
+
+            The legacy retry branches used to mutate the exclusion set
+            directly.  Keeping that set as an alias of ``failover_state`` is
+            necessary for compatibility, but all new exclusions must pass the
+            same accounting boundary so switch budgets and diagnostics cannot
+            drift between transport adapters.
+            """
+
+            if account_id is None:
+                return
+            failover_state.exclude_account_id(
+                account_id,
+                failure_class=failure_class,
+                code=code,
+                message=message,
+                status_code=status_code,
+                retry_next_account=retry_next_account,
+                safe_full_replay=safe_full_replay,
+            )
+
         transient_failed_account_id: str | None = None
         hard_affinity_same_owner_retry_attempted = False
         # A paused hard sticky owner must not trap the request in the generic
@@ -471,7 +554,10 @@ class _StreamingRetryMixin:
         if verified_fresh_replay_payload is None:
             verified_fresh_replay_payload = _client_full_resend_replay(
                 payload,
-                enabled=server_indefinite_recovery,
+                # Full client transcripts are safe to project across
+                # accounts; the enhanced build keeps this recovery available
+                # even when a legacy settings object omitted the new mode.
+                enabled=True,
             )
             if verified_fresh_replay_payload is not None:
                 # A full client resend is structurally verified, but it may
@@ -496,6 +582,70 @@ class _StreamingRetryMixin:
                     request_id,
                     len(cast(list[Any], payload.input)),
                 )
+
+        if (
+            quota_recovery_account_id is not None
+            and payload.previous_response_id is not None
+            and file_preferred_account_id is None
+            and isinstance(payload.input, list)
+        ):
+            # The preceding request may have ended after visible output, so
+            # its pending state is gone and the normal owner lookup would pin
+            # this continuation back to the exhausted account.  Rebuild the
+            # complete transcript as a fresh, account-neutral Responses body
+            # before entering the selector.
+            account_neutral_payload = dict(payload.to_replay_safety_payload())
+            account_neutral_payload["previous_response_id"] = None
+            projected_payload = project_responses_payload_for_account_neutral_quota_replay(account_neutral_payload)
+            if projected_payload is None:
+                # A delta-only retry carries no complete history.  Rebuild it
+                # from the durable event spool instead of returning the prior
+                # account's quota error to the client.
+                get_transcript = getattr(getattr(proxy, "_durable_bridge", None), "get_replayable_transcript", None)
+                if callable(get_transcript):
+                    try:
+                        transcript = await get_transcript(response_id=payload.previous_response_id)
+                        durable_replay_text = project_durable_transcript_for_account_neutral_quota_replay(
+                            transcript or (),
+                            current_request_text=json.dumps(
+                                {"type": "response.create", **payload.to_replay_safety_payload()},
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                            ),
+                        )
+                        if durable_replay_text is not None:
+                            projected_payload = json.loads(durable_replay_text)
+                            if isinstance(projected_payload, dict):
+                                projected_payload.pop("type", None)
+                            else:
+                                projected_payload = None
+                    except Exception:
+                        logger.warning(
+                            "Failed durable transcript quota replay request_id=%s response_id=%s",
+                            request_id,
+                            payload.previous_response_id,
+                            exc_info=True,
+                        )
+            if projected_payload is not None:
+                try:
+                    payload = ResponsesRequest.model_validate(projected_payload)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Unable to validate account-neutral quota replay request_id=%s account_id=%s",
+                        request_id,
+                        quota_recovery_account_id,
+                        exc_info=True,
+                    )
+                else:
+                    affinity = replace(affinity, reallocate_sticky=True, key=None, kind=None)
+                    verified_fresh_replay_payload = None
+                    logger.info(
+                        "Detached exhausted HTTP owner with full transcript replay request_id=%s "
+                        "account_id=%s input_items=%s",
+                        request_id,
+                        quota_recovery_account_id,
+                        len(payload.input) if isinstance(payload.input, list) else 0,
+                    )
 
         def _detach_account_affinity_for_failover(*, account_id: str, outcome: str) -> None:
             """Detach stale account-owned routing state for this retry walk.
@@ -724,7 +874,7 @@ class _StreamingRetryMixin:
             payload = verified_fresh_replay_payload
             payload_replay_required_account_id = None
             verified_fresh_replay_payload = None
-            excluded_account_ids.add(account_id)
+            _exclude_account(account_id)
             preferred_account_id = None
             require_preferred_account = False
             affinity = replace(affinity, reallocate_sticky=True)
@@ -735,6 +885,44 @@ class _StreamingRetryMixin:
                 account_id,
             )
             return True
+
+        async def _durable_account_neutral_replay(
+            current_payload: ResponsesRequest,
+        ) -> ResponsesRequest | None:
+            """Rebuild a delta continuation from the durable response spool."""
+
+            previous_response_id = current_payload.previous_response_id
+            if previous_response_id is None:
+                return None
+            get_transcript = getattr(getattr(proxy, "_durable_bridge", None), "get_replayable_transcript", None)
+            if not callable(get_transcript):
+                return None
+            try:
+                transcript = await get_transcript(response_id=previous_response_id)
+                source_payload = dict(current_payload.to_replay_safety_payload())
+                replay_text = project_durable_transcript_for_account_neutral_quota_replay(
+                    transcript or (),
+                    current_request_text=json.dumps(
+                        {"type": "response.create", **source_payload},
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                )
+                if replay_text is None:
+                    return None
+                replay_payload = json.loads(replay_text)
+                if not isinstance(replay_payload, dict):
+                    return None
+                replay_payload.pop("type", None)
+                return ResponsesRequest.model_validate(replay_payload)
+            except Exception:
+                logger.warning(
+                    "Failed to rebuild HTTP durable account-neutral replay request_id=%s response_id=%s",
+                    request_id,
+                    previous_response_id,
+                    exc_info=True,
+                )
+                return None
 
         async def _stream_post_refresh_with_capacity_recovery(
             account: Account,
@@ -1068,7 +1256,7 @@ class _StreamingRetryMixin:
                 account_id=account.id,
                 outcome=outcome,
             ):
-                excluded_account_ids.add(account.id)
+                _exclude_account(account.id)
                 affinity = replace(affinity, reallocate_sticky=True)
             return True
 
@@ -1102,48 +1290,75 @@ class _StreamingRetryMixin:
                             request_id,
                         )
                     else:
-                        selection_inputs = await proxy._load_balancer._load_selection_inputs(
-                            model=payload.model,
-                            additional_limit_name=None,
-                            account_ids=None,
-                        )
-                        if len(selection_inputs.accounts) == 1:
-                            pass
+                        # Delta-only continuations cannot be sent to a
+                        # replacement account with the old anchor. Rebuild
+                        # one complete request from the durable event spool.
+                        replay_payload = await _durable_account_neutral_replay(payload)
+                        if replay_payload is not None:
+                            payload = replay_payload
+                            verified_fresh_replay_payload = None
+                            preferred_account_id = None
+                            require_preferred_account = False
+                            turn_state_owner_account_id = None
+                            affinity = replace(
+                                affinity,
+                                key=None,
+                                kind=None,
+                                codex_session_source=None,
+                                legacy_codex_session_key=None,
+                                legacy_continuity_source=None,
+                                seed_selection_key=None,
+                                seed_selection_kind=None,
+                                require_unambiguous_account=False,
+                                reallocate_sticky=True,
+                            )
+                            logger.info(
+                                "Recovered previous-response owner lookup miss with durable full replay "
+                                "request_id=%s input_items=%s",
+                                request_id,
+                                len(payload.input) if isinstance(payload.input, list) else 0,
+                            )
                         else:
-                            message = "Previous response owner account is unavailable; retry later."
-                            _record_continuity_fail_closed(
-                                surface="http_stream",
-                                reason="owner_account_unavailable",
-                                previous_response_id=payload.previous_response_id,
-                                session_id=previous_response_lookup_session_id,
-                                upstream_error_code="owner_lookup_miss",
-                            )
-                            event = response_failed_event(
-                                "previous_response_owner_unavailable",
-                                message,
-                                response_id=request_id,
-                            )
-                            yield format_sse_event(event)
-                            await proxy._write_request_log(
-                                account_id=None,
-                                api_key=api_key,
-                                request_id=request_id,
+                            selection_inputs = await proxy._load_balancer._load_selection_inputs(
                                 model=payload.model,
-                                latency_ms=int((time.monotonic() - start) * 1000),
-                                status="error",
-                                error_code="previous_response_owner_unavailable",
-                                error_message=message,
-                                reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
-                                transport=request_transport,
-                                upstream_transport=upstream_stream_transport,
-                                service_tier=payload.service_tier,
-                                requested_service_tier=payload.service_tier,
-                                useragent=useragent,
-                                useragent_group=useragent_group,
-                                conversation_id=conversation_id,
-                                client_ip=client_ip,
+                                additional_limit_name=None,
+                                account_ids=None,
                             )
-                            return
+                            if len(selection_inputs.accounts) != 1:
+                                message = "Previous response owner account is unavailable; retry later."
+                                _record_continuity_fail_closed(
+                                    surface="http_stream",
+                                    reason="owner_account_unavailable",
+                                    previous_response_id=payload.previous_response_id,
+                                    session_id=previous_response_lookup_session_id,
+                                    upstream_error_code="owner_lookup_miss",
+                                )
+                                event = response_failed_event(
+                                    "previous_response_owner_unavailable",
+                                    message,
+                                    response_id=request_id,
+                                )
+                                yield format_sse_event(event)
+                                await proxy._write_request_log(
+                                    account_id=None,
+                                    api_key=api_key,
+                                    request_id=request_id,
+                                    model=payload.model,
+                                    latency_ms=int((time.monotonic() - start) * 1000),
+                                    status="error",
+                                    error_code="previous_response_owner_unavailable",
+                                    error_message=message,
+                                    reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+                                    transport=request_transport,
+                                    upstream_transport=upstream_stream_transport,
+                                    service_tier=payload.service_tier,
+                                    requested_service_tier=payload.service_tier,
+                                    useragent=useragent,
+                                    useragent_group=useragent_group,
+                                    conversation_id=conversation_id,
+                                    client_ip=client_ip,
+                                )
+                                return
             # File and previous-response ownership are peers, not fallback
             # preferences. Resolve both before selection so a conflict cannot
             # be hidden by whichever source happened to run first. A hard turn
@@ -1278,6 +1493,18 @@ class _StreamingRetryMixin:
                         return
                     account = selection.account
                     current_account_lease = selection.lease
+                    if account is not None:
+                        exhausted_owner = _websocket_quota_failure_account_id(continuity_state)
+                        if (
+                            continuity_state is not None
+                            and exhausted_owner is not None
+                            and account.id != exhausted_owner
+                        ):
+                            # Replacement selection succeeded; the marker is
+                            # consumed so later healthy turns are governed by
+                            # the configured affinity/rotation policy again.
+                            continuity_state.quota_failure_account_id = None
+                            continuity_state.quota_failure_at = None
                     if selection.lease is not None:
                         account_leases.append(selection.lease)
                     if (
@@ -1402,7 +1629,7 @@ class _StreamingRetryMixin:
                                 verified_fresh_replay_payload = None
                                 payload_replay_required_account_id = None
                                 if effective_owner_id is not None:
-                                    excluded_account_ids.add(effective_owner_id)
+                                    _exclude_account(effective_owner_id)
                                 preferred_account_id = None
                                 require_preferred_account = False
                                 affinity = replace(affinity, reallocate_sticky=True)
@@ -1411,6 +1638,50 @@ class _StreamingRetryMixin:
                                 hard_affinity_recovery_attempted = True
                                 logger.warning(
                                     "Retrying stream with verified account-neutral replay after hard affinity "
+                                    "owner unavailable request_id=%s owner_account_id=%s",
+                                    request_id,
+                                    effective_owner_id,
+                                )
+                                continue
+                        if (
+                            not hard_affinity_recovery_attempted
+                            and file_preferred_account_id is None
+                            and payload.previous_response_id is not None
+                        ):
+                            # A paused/deleted hard owner produces
+                            # ``hard_affinity_saturated`` before an upstream
+                            # request is opened.  Delta continuations still
+                            # have a safe recovery path when the durable
+                            # transcript spool can rebuild a complete,
+                            # account-neutral request.  Treat this exactly
+                            # like a quota owner loss: exclude the stale
+                            # owner, clear account-owned affinity, and let the
+                            # normal selector choose the replacement.
+                            replay_payload = await _durable_account_neutral_replay(payload)
+                            if replay_payload is not None:
+                                payload = replay_payload
+                                verified_fresh_replay_payload = None
+                                payload_replay_required_account_id = None
+                                preferred_account_id = None
+                                require_preferred_account = False
+                                turn_state_owner_account_id = None
+                                affinity = replace(
+                                    affinity,
+                                    key=None,
+                                    kind=None,
+                                    codex_session_source=None,
+                                    legacy_codex_session_key=None,
+                                    legacy_continuity_source=None,
+                                    seed_selection_key=None,
+                                    seed_selection_kind=None,
+                                    require_unambiguous_account=False,
+                                    reallocate_sticky=True,
+                                )
+                                if effective_owner_id is not None:
+                                    _exclude_account(effective_owner_id)
+                                hard_affinity_recovery_attempted = True
+                                logger.warning(
+                                    "Retrying stream with durable account-neutral replay after hard affinity "
                                     "owner unavailable request_id=%s owner_account_id=%s",
                                     request_id,
                                     effective_owner_id,
@@ -1554,12 +1825,51 @@ class _StreamingRetryMixin:
                             raise last_pre_dispatch_transport_error
                         yield _render_dispatch_transport_error(last_pre_dispatch_transport_error)
                         return
+                    selection_quota_code = account_exhaustion_code_for_failover(
+                        selection.error_code,
+                        selection.error_message,
+                    )
                     if (
-                        selection.error_code == USAGE_LIMIT_REACHED
+                        selection.error_code in {"continuity_owner_unavailable", "continuity_owner_policy_conflict"}
                         and require_preferred_account
                         and preferred_account_id is not None
                         and file_preferred_account_id is None
-                        and verified_fresh_replay_payload is not None
+                    ):
+                        unavailable_owner_id = preferred_account_id
+                        replay_payload = await _durable_account_neutral_replay(payload)
+                        if replay_payload is not None:
+                            payload = replay_payload
+                            verified_fresh_replay_payload = None
+                            payload_replay_required_account_id = None
+                            preferred_account_id = None
+                            require_preferred_account = False
+                            turn_state_owner_account_id = None
+                            affinity = replace(
+                                affinity,
+                                key=None,
+                                kind=None,
+                                codex_session_source=None,
+                                legacy_codex_session_key=None,
+                                legacy_continuity_source=None,
+                                seed_selection_key=None,
+                                seed_selection_kind=None,
+                                require_unambiguous_account=False,
+                                reallocate_sticky=True,
+                            )
+                            _exclude_account(unavailable_owner_id)
+                            logger.warning(
+                                "Retrying stream after durable owner-unavailable replay request_id=%s "
+                                "owner_account_id=%s error_code=%s",
+                                request_id,
+                                unavailable_owner_id,
+                                selection.error_code,
+                            )
+                            continue
+                    if (
+                        selection_quota_code is not None
+                        and require_preferred_account
+                        and preferred_account_id is not None
+                        and file_preferred_account_id is None
                     ):
                         # Selection can fail before an upstream request is
                         # opened when the previous-response owner has already
@@ -1581,7 +1891,35 @@ class _StreamingRetryMixin:
                                 selection.resets_at,
                             )
                             continue
-                    if selection.error_code == USAGE_LIMIT_REACHED:
+                        replay_payload = await _durable_account_neutral_replay(payload)
+                        if replay_payload is not None:
+                            payload = replay_payload
+                            verified_fresh_replay_payload = None
+                            payload_replay_required_account_id = None
+                            preferred_account_id = None
+                            require_preferred_account = False
+                            turn_state_owner_account_id = None
+                            affinity = replace(
+                                affinity,
+                                key=None,
+                                kind=None,
+                                codex_session_source=None,
+                                legacy_codex_session_key=None,
+                                legacy_continuity_source=None,
+                                seed_selection_key=None,
+                                seed_selection_kind=None,
+                                require_unambiguous_account=False,
+                                reallocate_sticky=True,
+                            )
+                            _remember_quota_failure(exhausted_owner_id)
+                            account_exhaustion_walk_active = True
+                            logger.warning(
+                                "Retrying stream after durable owner quota replay request_id=%s owner_account_id=%s",
+                                request_id,
+                                exhausted_owner_id,
+                            )
+                            continue
+                    if selection_quota_code is not None:
                         await _drain_pending_post_refresh_penalty_on_terminal(settlement)
                         no_accounts_msg = selection.error_message or "Usage limit reached"
                         status_code, error_payload = selection_failure_response(selection)
@@ -1660,7 +1998,7 @@ class _StreamingRetryMixin:
                         and preferred_account_id is not None
                         and verified_fresh_replay_payload is not None
                     ):
-                        excluded_account_ids.add(preferred_account_id)
+                        _exclude_account(preferred_account_id)
                         payload = verified_fresh_replay_payload
                         verified_fresh_replay_payload = None
                         preferred_account_id = None
@@ -1834,7 +2172,7 @@ class _StreamingRetryMixin:
                     if verified_fresh_replay_payload is not None:
                         payload = verified_fresh_replay_payload
                         verified_fresh_replay_payload = None
-                        excluded_account_ids.add(preferred_account_id)
+                        _exclude_account(preferred_account_id)
                         preferred_account_id = None
                         require_preferred_account = False
                         affinity = replace(affinity, reallocate_sticky=True)
@@ -1984,7 +2322,7 @@ class _StreamingRetryMixin:
                                     # misleading generic no_accounts response.
                                     await _release_tracked_stream_lease(current_account_lease)
                                     current_account_lease = None
-                                    excluded_account_ids.add(account.id)
+                                    _exclude_account(account.id)
                                     last_retryable_stream_error = _RetryableStreamError(
                                         "upstream_unavailable",
                                         {
@@ -2108,7 +2446,7 @@ class _StreamingRetryMixin:
                             # replacement stream.
                             await _release_tracked_stream_lease(current_account_lease)
                             current_account_lease = None
-                            excluded_account_ids.add(account.id)
+                            _exclude_account(account.id)
                             continue
                         await proxy._write_stream_preflight_error(
                             account_id=account.id,
@@ -2292,11 +2630,12 @@ class _StreamingRetryMixin:
                                         error_message,
                                         response_id=failed_response_id,
                                     )
-                                account_exhaustion_code = upstream_usage_limit_error_code(
+                                account_exhaustion_code = account_exhaustion_code_for_failover(
                                     error_code,
                                     error_message,
                                 )
                                 if account_exhaustion_code is not None:
+                                    _remember_quota_failure(account.id)
                                     # A visible prefix makes proxy-local replay
                                     # unsafe. Native Codex routes end at the
                                     # private retry boundary so the official
@@ -2412,7 +2751,7 @@ class _StreamingRetryMixin:
                                     )
                                     await _release_tracked_stream_lease(current_account_lease)
                                     current_account_lease = None
-                                    excluded_account_ids.add(account.id)
+                                    _exclude_account(account.id)
                                     require_security_work_authorized = True
                                     last_security_work_retry_error = _RetryableStreamError(
                                         _facade()._SECURITY_WORK_AUTHORIZATION_REQUIRED_CODE,
@@ -2438,7 +2777,7 @@ class _StreamingRetryMixin:
                                         if can_try_other_account:
                                             deferred_capacity_account = account
                                             deferred_capacity_lease = current_account_lease
-                                            excluded_account_ids.add(account.id)
+                                            _exclude_account(account.id)
                                             break
                                         remaining_budget_seconds = _facade()._remaining_budget_seconds(deadline)
                                         if remaining_budget_seconds <= 0:
@@ -2461,7 +2800,7 @@ class _StreamingRetryMixin:
                                     last_transient_exc = tex
                                     await _release_tracked_stream_lease(current_account_lease)
                                     current_account_lease = None
-                                    excluded_account_ids.add(account.id)
+                                    _exclude_account(account.id)
                                     break
                                 recovery_decision = await _wait_for_process_network_recovery(
                                     account,
@@ -2520,7 +2859,7 @@ class _StreamingRetryMixin:
                                     last_transient_exc = tex
                                     last_pre_dispatch_transport_error = tex
                                     transient_failed_account_id = account.id
-                                    excluded_account_ids.add(account.id)
+                                    _exclude_account(account.id)
                                     if not verified_owner_replay_moved:
                                         affinity = replace(affinity, reallocate_sticky=True)
                                     _facade().logger.info(
@@ -2537,7 +2876,16 @@ class _StreamingRetryMixin:
                                     code,
                                     http_status=tex.status_code,
                                 )
-                                if getattr(base_settings, "deterministic_failover_enabled", True):
+                                definitive_quota = account_exhaustion_code_for_failover(code, error_message) is not None
+                                if definitive_quota:
+                                    # A quota response is evidence about this
+                                    # account, not a generic retry budget
+                                    # event.  Walk the normal selector until it
+                                    # reports no eligible account; otherwise
+                                    # the third attempted account is surfaced
+                                    # as a false client-side limit.
+                                    action = "failover_next"
+                                elif getattr(base_settings, "deterministic_failover_enabled", True):
                                     action = failover_decision(
                                         failure_class=classified["failure_class"],
                                         downstream_visible=settlement.downstream_visible,
@@ -2555,7 +2903,8 @@ class _StreamingRetryMixin:
                                     action,
                                 )
                                 if action == "failover_next":
-                                    if upstream_usage_limit_error_code(code, error_message) is not None:
+                                    if definitive_quota:
+                                        _remember_quota_failure(account.id)
                                         # Quota failover is a finite walk over
                                         # the eligible pool, not the ordinary
                                         # three-attempt transport budget.
@@ -2564,13 +2913,9 @@ class _StreamingRetryMixin:
                                     transient_failed_account_id = account.id
                                     await _release_tracked_stream_lease(current_account_lease)
                                     current_account_lease = None
-                                    excluded_account_ids.add(account.id)
-                                    if (
-                                        upstream_usage_limit_error_code(code, error_message) is not None
-                                        or (
-                                            not require_preferred_account
-                                            and file_preferred_account_id is None
-                                        )
+                                    _exclude_account(account.id)
+                                    if definitive_quota or (
+                                        not require_preferred_account and file_preferred_account_id is None
                                     ):
                                         _detach_account_affinity_for_failover(
                                             account_id=account.id,
@@ -2648,7 +2993,7 @@ class _StreamingRetryMixin:
                                 )
                             await _release_tracked_stream_lease(current_account_lease)
                             current_account_lease = None
-                            excluded_account_ids.add(account.id)
+                            _exclude_account(account.id)
                             break  # outer loop: select different account
                         finally:
                             pop_stream_timeout_overrides(stream_timeout_tokens)
@@ -2667,7 +3012,8 @@ class _StreamingRetryMixin:
                         return
                     continue  # outer loop: account failover after transient exhaustion
                 except _RetryableStreamError as exc:
-                    if upstream_usage_limit_error_code(exc.code, exc.error.get("message")) is not None:
+                    if account_exhaustion_code_for_failover(exc.code, exc.error.get("message")) is not None:
+                        _remember_quota_failure(account.id)
                         # Quota errors are evidence about one selected account.
                         # The growing exclusion set bounds this walk; do not let
                         # the generic three-attempt transport budget expose a
@@ -2708,7 +3054,7 @@ class _StreamingRetryMixin:
                         )
                         await _release_tracked_stream_lease(current_account_lease)
                         current_account_lease = None
-                        excluded_account_ids.add(account.id)
+                        _exclude_account(account.id)
                         require_security_work_authorized = True
                         last_security_work_retry_error = exc
                         continue
@@ -2717,13 +3063,9 @@ class _StreamingRetryMixin:
                     if exc.exclude_account:
                         await _release_tracked_stream_lease(current_account_lease)
                         current_account_lease = None
-                        excluded_account_ids.add(account.id)
-                        if (
-                            upstream_usage_limit_error_code(exc.code, exc.error.get("message")) is not None
-                            or (
-                                not require_preferred_account
-                                and file_preferred_account_id is None
-                            )
+                        _exclude_account(account.id)
+                        if account_exhaustion_code_for_failover(exc.code, exc.error.get("message")) is not None or (
+                            not require_preferred_account and file_preferred_account_id is None
                         ):
                             _detach_account_affinity_for_failover(
                                 account_id=account.id,
@@ -2832,7 +3174,7 @@ class _StreamingRetryMixin:
                                         # misleading generic no_accounts response.
                                         await _release_tracked_stream_lease(current_account_lease)
                                         current_account_lease = None
-                                        excluded_account_ids.add(account.id)
+                                        _exclude_account(account.id)
                                         last_retryable_stream_error = _RetryableStreamError(
                                             "upstream_unavailable",
                                             {
@@ -2930,7 +3272,7 @@ class _StreamingRetryMixin:
                                 # the claim-contention/permanent branches above).
                                 await _release_tracked_stream_lease(current_account_lease)
                                 current_account_lease = None
-                                excluded_account_ids.add(account.id)
+                                _exclude_account(account.id)
                                 continue
                             await proxy._write_stream_preflight_error(
                                 account_id=account.id,
@@ -3069,7 +3411,7 @@ class _StreamingRetryMixin:
                                 )
                                 await _release_tracked_stream_lease(current_account_lease)
                                 current_account_lease = None
-                                excluded_account_ids.add(account.id)
+                                _exclude_account(account.id)
                                 continue
                             account_model_retry = await _retry_account_model_rejection(
                                 retry_exc,
@@ -3092,7 +3434,7 @@ class _StreamingRetryMixin:
                                 if can_try_other_account:
                                     deferred_capacity_account = account
                                     deferred_capacity_lease = current_account_lease
-                                    excluded_account_ids.add(account.id)
+                                    _exclude_account(account.id)
                                     continue
                                 # The same-account helper only re-raises this
                                 # neutral cap when recovery cannot continue
@@ -3138,7 +3480,7 @@ class _StreamingRetryMixin:
                                     and not require_preferred_account
                                 )
                                 if can_try_other_account:
-                                    excluded_account_ids.add(account.id)
+                                    _exclude_account(account.id)
                                     if not verified_owner_replay_moved:
                                         affinity = replace(affinity, reallocate_sticky=True)
                                     _facade().logger.info(
@@ -3157,6 +3499,8 @@ class _StreamingRetryMixin:
                                 break
                             current_error_payload = _upstream_error_from_openai(error)
                             current_error_code = error_code or "upstream_error"
+                            if account_exhaustion_code_for_failover(current_error_code, error_message) is not None:
+                                _remember_quota_failure(account.id)
                             classified = classify_upstream_failure(
                                 error_code=current_error_code,
                                 error=current_error_payload,
@@ -3164,7 +3508,15 @@ class _StreamingRetryMixin:
                                 phase="first_event",
                             )
                             candidates_remaining = max_attempts - attempt - 1
-                            if retry_exc.status_code == 401 and candidates_remaining > 0:
+                            definitive_quota = (
+                                account_exhaustion_code_for_failover(current_error_code, error_message) is not None
+                            )
+                            if definitive_quota:
+                                # Quota failover is governed by the distinct
+                                # account exclusion ledger, not the ordinary
+                                # three-attempt transient budget.
+                                action = "failover_next"
+                            elif retry_exc.status_code == 401 and candidates_remaining > 0:
                                 action = "failover_next"
                             elif getattr(base_settings, "deterministic_failover_enabled", True):
                                 action = failover_decision(
@@ -3184,7 +3536,8 @@ class _StreamingRetryMixin:
                                 action,
                             )
                             if action == "failover_next":
-                                if upstream_usage_limit_error_code(current_error_code, error_message) is not None:
+                                if definitive_quota:
+                                    _remember_quota_failure(account.id)
                                     account_exhaustion_walk_active = True
                                 await proxy._handle_stream_error(
                                     account,
@@ -3199,13 +3552,9 @@ class _StreamingRetryMixin:
                                     account_id=account.id,
                                     outcome="owner_post_refresh_failure",
                                 )
-                                excluded_account_ids.add(account.id)
-                                if (
-                                    upstream_usage_limit_error_code(current_error_code, error_message) is not None
-                                    or (
-                                        not require_preferred_account
-                                        and file_preferred_account_id is None
-                                    )
+                                _exclude_account(account.id)
+                                if definitive_quota or (
+                                    not require_preferred_account and file_preferred_account_id is None
                                 ):
                                     _detach_account_affinity_for_failover(
                                         account_id=account.id,
@@ -3292,7 +3641,7 @@ class _StreamingRetryMixin:
                             )
                             await _release_tracked_stream_lease(current_account_lease)
                             current_account_lease = None
-                            excluded_account_ids.add(account.id)
+                            _exclude_account(account.id)
                             require_security_work_authorized = True
                             continue
                     health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)

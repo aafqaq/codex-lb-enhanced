@@ -6,6 +6,7 @@ import logging
 import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from itertools import count
 from typing import Any, NoReturn, Protocol, TypeVar, cast
 
 import aiohttp
@@ -25,6 +26,7 @@ from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.errors import openai_error
 from app.core.openai.exceptions import ClientPayloadError
+from app.core.openai.failover import OpenAIFailoverState, OpenAIFailure, OpenAIFailureClass
 from app.core.openai.models import CompactResponsePayload
 from app.core.openai.requests import ResponsesCompactRequest
 from app.core.resilience.network_recovery import ProcessNetworkRecovery
@@ -61,6 +63,7 @@ from app.modules.proxy.helpers import (
     _header_account_id,
     _normalize_error_code,
     _parse_openai_error,
+    account_exhaustion_code_for_failover,
     classify_upstream_failure,
 )
 from app.modules.proxy.load_balancer import (
@@ -70,6 +73,7 @@ from app.modules.proxy.load_balancer import (
     effective_account_concurrency_caps,
 )
 from app.modules.proxy.replay_safety import (
+    project_durable_transcript_for_account_neutral_quota_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
@@ -618,6 +622,18 @@ def _compact_account_neutral_replay_payload(
     return replay_payload
 
 
+# Compact classifies failures with its own labels; the shared failover
+# controller speaks ``OpenAIFailureClass``.  Keep the translation in one place
+# so a new compact label cannot silently degrade to ``UNKNOWN`` and disable the
+# quota pool walk.
+_COMPACT_FAILURE_CLASSES: dict[str, OpenAIFailureClass] = {
+    "quota": OpenAIFailureClass.QUOTA_EXHAUSTED,
+    "rate_limit": OpenAIFailureClass.RATE_LIMITED,
+    "retryable_transient": OpenAIFailureClass.UPSTREAM_TRANSPORT,
+    "non_retryable": OpenAIFailureClass.UNKNOWN,
+}
+
+
 class _CompactMixin:
     async def _compact_owner_selection_loss_is_quota_caused(self, account_id: str) -> bool:
         """Return whether the pinned owner is unselectable because of quota state.
@@ -897,6 +913,7 @@ class _CompactMixin:
         previous_response_id = getattr(payload, "previous_response_id", None)
         previous_response_preferred_account_id: str | None = None
         previous_response_lookup_session_id: str | None = None
+        _log_compact_account_neutral_replay = False
         if isinstance(previous_response_id, str) and previous_response_id.strip():
             previous_response_id = previous_response_id.strip()
             previous_response_lookup_session_id = _owner_lookup_session_id_from_headers(headers)
@@ -907,30 +924,89 @@ class _CompactMixin:
                 surface="compact",
             )
             if previous_response_preferred_account_id is None:
-                selection_inputs = await proxy._load_balancer._load_selection_inputs(
-                    model=payload.model,
-                    additional_limit_name=None,
-                    account_ids=api_key.assigned_account_ids
-                    if api_key is not None and api_key.account_assignment_scope_enabled
-                    else None,
-                )
-                if len(selection_inputs.accounts) != 1:
-                    message = "Previous response owner account is unavailable; retry later."
-                    _record_continuity_fail_closed(
-                        surface="compact",
-                        reason="owner_account_unavailable",
-                        previous_response_id=previous_response_id,
-                        session_id=previous_response_lookup_session_id,
-                        upstream_error_code="owner_lookup_miss",
+                # The compaction endpoint is also a Responses continuation:
+                # its previous_response_id is owned by one upstream account.
+                # If that owner disappeared, rebuild the complete request from
+                # the durable event spool before returning the misleading
+                # owner-unavailable 502.  This is the same account-neutral
+                # replay contract used by the normal HTTP bridge path.
+                get_transcript = getattr(getattr(proxy, "_durable_bridge", None), "get_replayable_transcript", None)
+                if callable(get_transcript):
+                    try:
+                        source_payload = dict(payload.to_payload())
+                        source_payload["previous_response_id"] = previous_response_id
+                        replay_text = await get_transcript(response_id=previous_response_id)
+                        replay_text = (
+                            project_durable_transcript_for_account_neutral_quota_replay(
+                                replay_text,
+                                current_request_text=json.dumps(
+                                    {"type": "response.create", **source_payload},
+                                    separators=(",", ":"),
+                                    ensure_ascii=False,
+                                ),
+                            )
+                            if replay_text
+                            else None
+                        )
+                        replay_payload = (
+                            ResponsesCompactRequest.model_validate(json.loads(replay_text))
+                            if replay_text is not None
+                            else None
+                        )
+                    except Exception:
+                        replay_payload = None
+                        logger.warning(
+                            "Failed to rebuild compact continuation from durable transcript "
+                            "request_id=%s response_id=%s",
+                            request_id,
+                            previous_response_id,
+                            exc_info=True,
+                        )
+                    if replay_payload is not None:
+                        payload = replay_payload
+                        previous_response_id = None
+                        previous_response_preferred_account_id = None
+                        previous_response_lookup_session_id = None
+                        filtered = without_http_bridge_session_affinity_headers(filtered)
+                        affinity = _AffinityPolicy()
+                        turn_state_owner_account_id = None
+                        _log_compact_account_neutral_replay = True
+                else:
+                    _log_compact_account_neutral_replay = False
+                if _log_compact_account_neutral_replay:
+                    logger.info(
+                        "Compact previous-response owner unavailable; using durable full replay request_id=%s",
+                        request_id,
                     )
-                    raise ProxyResponseError(
-                        502,
-                        openai_error(
-                            "previous_response_owner_unavailable",
-                            message,
-                            error_type="server_error",
-                        ),
+                if previous_response_preferred_account_id is None and _log_compact_account_neutral_replay:
+                    # The rebuilt payload is a fresh request; continue into
+                    # ordinary pool selection below.
+                    pass
+                elif previous_response_preferred_account_id is None:
+                    selection_inputs = await proxy._load_balancer._load_selection_inputs(
+                        model=payload.model,
+                        additional_limit_name=None,
+                        account_ids=api_key.assigned_account_ids
+                        if api_key is not None and api_key.account_assignment_scope_enabled
+                        else None,
                     )
+                    if len(selection_inputs.accounts) != 1:
+                        message = "Previous response owner account is unavailable; retry later."
+                        _record_continuity_fail_closed(
+                            surface="compact",
+                            reason="owner_account_unavailable",
+                            previous_response_id=previous_response_id,
+                            session_id=previous_response_lookup_session_id,
+                            upstream_error_code="owner_lookup_miss",
+                        )
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "previous_response_owner_unavailable",
+                                message,
+                                error_type="server_error",
+                            ),
+                        )
 
         # File pins are account ownership, not locality. Resolved turn-state or
         # previous-response owners above still take precedence (and conflicts
@@ -1227,7 +1303,8 @@ class _CompactMixin:
 
             last_exc: ProxyResponseError | None = None
             network_recovery = ProcessNetworkRecovery(transport="compact", request_id=request_id)
-            excluded_account_ids: set[str] = set()
+            failover_state = OpenAIFailoverState(max_switches=_compact_max_account_attempts())
+            excluded_account_ids: set[str] = failover_state.failed_account_ids
             # Account-neutral replay off a pinned previous-response owner is only
             # legal for owner loss the owner's quota state caused: either the
             # owner was never usable at selection time, or it was excluded
@@ -1241,7 +1318,45 @@ class _CompactMixin:
             estimated_lease_tokens = _estimated_lease_tokens_from_request_usage_budget(
                 estimate_api_key_request_usage(payload)
             )
-            for _account_attempt in range(_compact_max_account_attempts()):
+            quota_walk_active = False
+            compact_max_attempts = _compact_max_account_attempts()
+
+            def _exclude_account(
+                account_id: str | None,
+                *,
+                failure_class: OpenAIFailureClass | str = OpenAIFailureClass.UNKNOWN,
+                code: str | None = "upstream_error",
+                message: str = "Upstream account failed",
+                status_code: int | None = None,
+                safe_full_replay: bool = False,
+            ) -> None:
+                """Keep compact exclusions and failover accounting in lock-step.
+
+                Compact's local classifier speaks its own vocabulary; translate
+                it here so the controller always receives a real failure class.
+                Passing the raw string through left every compact failure as
+                ``UNKNOWN``, which silently disabled the quota pool walk that
+                this path exists to perform.
+                """
+
+                if isinstance(failure_class, str):
+                    failure_class = _COMPACT_FAILURE_CLASSES.get(failure_class, OpenAIFailureClass.UNKNOWN)
+
+                if account_id is None:
+                    return
+                failover_state.exclude_account_id(
+                    account_id,
+                    failure_class=failure_class,
+                    code=code or "upstream_error",
+                    message=message,
+                    status_code=status_code,
+                    retry_next_account=True,
+                    safe_full_replay=safe_full_replay,
+                )
+
+            for _account_attempt in count():
+                if _account_attempt >= compact_max_attempts and not quota_walk_active:
+                    break
                 selection = await proxy._select_account_with_budget_compatible(
                     deadline,
                     request_id=request_id,
@@ -1369,8 +1484,57 @@ class _CompactMixin:
                         replay_payload: ResponsesCompactRequest | None = None
                         if recovery_blocked_reason is None:
                             replay_payload = _compact_account_neutral_replay_payload(payload)
-                            if replay_payload is None:
-                                recovery_blocked_reason = "history_not_account_neutral"
+                        # A compact continuation may carry only the anchor;
+                        # in that shape the request body itself cannot prove a
+                        # portable history.  The durable bridge spool can,
+                        # and it also lets a manually paused/removed owner be
+                        # replaced even when the selector reports a policy or
+                        # session-affinity conflict rather than a quota code.
+                        if (
+                            replay_payload is None
+                            and turn_state_owner_account_id is None
+                            and rewritten_file_account_id is None
+                            and isinstance(previous_response_id, str)
+                        ):
+                            get_transcript = getattr(
+                                getattr(proxy, "_durable_bridge", None),
+                                "get_replayable_transcript",
+                                None,
+                            )
+                            if callable(get_transcript):
+                                try:
+                                    transcript = await get_transcript(response_id=previous_response_id)
+                                    source_payload = dict(payload.to_payload())
+                                    source_payload["previous_response_id"] = previous_response_id
+                                    replay_text = project_durable_transcript_for_account_neutral_quota_replay(
+                                        transcript or (),
+                                        current_request_text=json.dumps(
+                                            {"type": "response.create", **source_payload},
+                                            separators=(",", ":"),
+                                            ensure_ascii=False,
+                                        ),
+                                    )
+                                    if replay_text is not None:
+                                        replay_payload = ResponsesCompactRequest.model_validate(json.loads(replay_text))
+                                except Exception:
+                                    logger.warning(
+                                        "Failed durable compact ownerless replay request_id=%s response_id=%s",
+                                        request_id,
+                                        previous_response_id,
+                                        exc_info=True,
+                                    )
+                        if replay_payload is not None and recovery_blocked_reason in {
+                            "session_scoped_continuity",
+                            "session_affinity",
+                            "non_quota_owner_loss",
+                            "owner_skipped_by_policy",
+                        }:
+                            # The full durable transcript is stronger than a
+                            # stale affinity hint.  Only explicit turn/file
+                            # ownership remains hard-bound above.
+                            recovery_blocked_reason = None
+                        if replay_payload is None:
+                            recovery_blocked_reason = "history_not_account_neutral"
                         if replay_payload is None:
                             logger.info(
                                 "Compact previous-response owner unavailable; staying owner-bound "
@@ -1398,7 +1562,36 @@ class _CompactMixin:
                                 preferred_account_id,
                                 selection.error_code,
                             )
-                            excluded_account_ids.add(unavailable_owner_account_id)
+                            failover_state.record_failure(
+                                unavailable_owner_account_id,
+                                OpenAIFailure(
+                                    failure_class=(
+                                        OpenAIFailureClass.QUOTA_EXHAUSTED
+                                        if account_exhaustion_code_for_failover(
+                                            selection.error_code,
+                                            selection.error_message,
+                                        )
+                                        is not None
+                                        else OpenAIFailureClass.UNKNOWN
+                                    ),
+                                    code=selection.error_code or "usage_limit_reached",
+                                    message=selection.error_message or "The usage limit has been reached",
+                                    status_code=429,
+                                    retry_next_account=True,
+                                    safe_full_replay=True,
+                                ),
+                            )
+                            if (
+                                account_exhaustion_code_for_failover(
+                                    selection.error_code,
+                                    selection.error_message,
+                                )
+                                is not None
+                            ):
+                                # Definitive quota is scoped to this account;
+                                # continue walking the finite pool beyond the
+                                # generic compact retry cap.
+                                quota_walk_active = True
                             payload = replay_payload
                             filtered = without_http_bridge_session_affinity_headers(filtered)
                             preferred_account_id = None
@@ -1569,7 +1762,7 @@ class _CompactMixin:
                                 )
                                 _raise_proxy_unavailable(message)
                             last_exc = ProxyResponseError(502, openai_error("upstream_unavailable", message))
-                            excluded_account_ids.add(account.id)
+                            _exclude_account(account.id, code="upstream_unavailable", message=message, status_code=502)
                             continue
                         # A GENUINE OAuth transport failure (``code == "transport_error"``:
                         # the refresh request itself timed out / its upstream
@@ -1615,7 +1808,7 @@ class _CompactMixin:
                         "upstream_unavailable",
                     )
                     last_exc = ProxyResponseError(502, openai_error("upstream_unavailable", message))
-                    excluded_account_ids.add(account.id)
+                    _exclude_account(account.id, code="upstream_unavailable", message=message, status_code=502)
                     continue
                 except BaseException:
                     await proxy._load_balancer.release_account_lease(selected_account_response_create_lease)
@@ -1692,7 +1885,12 @@ class _CompactMixin:
                                     )
                                     raise
                                 last_exc = exc
-                                excluded_account_ids.add(account.id)
+                                _exclude_account(
+                                    account.id,
+                                    code=_proxy_response_error_code(exc),
+                                    message=str(exc),
+                                    status_code=exc.status_code,
+                                )
                                 transient_exhausted = True
                                 break
                             try:
@@ -1790,7 +1988,9 @@ class _CompactMixin:
                                         last_exc = ProxyResponseError(
                                             502, openai_error("upstream_unavailable", message)
                                         )
-                                        excluded_account_ids.add(account.id)
+                                        _exclude_account(
+                                            account.id, code="upstream_unavailable", message=message, status_code=502
+                                        )
                                         transient_exhausted = True
                                         break
                                     if not refresh_exc.transport_error:
@@ -1842,12 +2042,53 @@ class _CompactMixin:
                                     "upstream_unavailable",
                                 )
                                 last_exc = ProxyResponseError(502, openai_error("upstream_unavailable", message))
-                                excluded_account_ids.add(account.id)
+                                _exclude_account(
+                                    account.id, code="upstream_unavailable", message=message, status_code=502
+                                )
                                 transient_exhausted = True
                                 break
                             refresh_retry_used = True
                             continue
                         if exc.status_code == 500:
+                            # Parse a stable failure code/message before
+                            # recording the account failure.  The structured-
+                            # error branch below normally initializes these
+                            # locals, but a raw HTTP 500 reaches this branch
+                            # first on the initial attempt.
+                            raw_error = _parse_openai_error(exc.payload)
+                            code = (
+                                _normalize_error_code(
+                                    raw_error.code if raw_error else None,
+                                    raw_error.type if raw_error else None,
+                                )
+                                or "server_error"
+                            )
+                            error_message = (
+                                (raw_error.message if raw_error else None) or str(exc) or "Upstream server error"
+                            )
+                            # Some upstream gateways wrap a definitive usage
+                            # limit in HTTP 500.  It is still account-scoped
+                            # evidence and must bypass same-account transport
+                            # retries; otherwise compact burns the retry budget
+                            # and returns B's limit while C is available.
+                            definitive_quota = account_exhaustion_code_for_failover(code, error_message) is not None
+                            if definitive_quota:
+                                last_exc = exc
+                                quota_walk_active = True
+                                failover_state.record_failure(
+                                    account.id,
+                                    OpenAIFailure(
+                                        failure_class=OpenAIFailureClass.QUOTA_EXHAUSTED,
+                                        code=code,
+                                        message=error_message,
+                                        status_code=exc.status_code,
+                                        retry_next_account=True,
+                                        account_health_penalty=False,
+                                        safe_full_replay=True,
+                                    ),
+                                )
+                                transient_exhausted = True
+                                break
                             transient_retries += 1
                             if (
                                 transient_retries < _max_transient_same_account_retries()
@@ -1881,7 +2122,22 @@ class _CompactMixin:
                                 # meeting the load balancer backoff threshold (error_count >= 3).
                                 await proxy._load_balancer.record_errors(account, transient_retries - 1)
                             last_exc = exc
-                            excluded_account_ids.add(account.id)
+                            failover_state.record_failure(
+                                account.id,
+                                OpenAIFailure(
+                                    failure_class=(
+                                        OpenAIFailureClass.QUOTA_EXHAUSTED
+                                        if definitive_quota
+                                        else OpenAIFailureClass.UPSTREAM_TRANSPORT
+                                    ),
+                                    code=code,
+                                    message=error_message or "Upstream account failed",
+                                    status_code=exc.status_code,
+                                    retry_next_account=True,
+                                    account_health_penalty=not definitive_quota,
+                                    safe_full_replay=definitive_quota,
+                                ),
+                            )
                             transient_exhausted = True
                             break  # break inner loop → outer loop tries different account
                         error = _parse_openai_error(exc.payload)
@@ -1890,6 +2146,10 @@ class _CompactMixin:
                             error.type if error else None,
                         )
                         error_message = error.message if error else None
+                        # Keep this local initialized for every structured
+                        # error branch (including account_response_create_cap)
+                        # before the later failover decision refines it.
+                        definitive_quota = account_exhaustion_code_for_failover(code, error_message) is not None
                         network_recovery.account_id = account.id
                         recovery_decision = await network_recovery.wait(
                             error_code=code,
@@ -1915,10 +2175,15 @@ class _CompactMixin:
                             if (
                                 not account.security_work_authorized
                                 and account.id != preferred_account_id
-                                and _account_attempt < _compact_max_account_attempts() - 1
+                                and _account_attempt < compact_max_attempts - 1
                             ):
                                 last_exc = exc
-                                excluded_account_ids.add(account.id)
+                                _exclude_account(
+                                    account.id,
+                                    code=code,
+                                    message=error_message or "Upstream account failed",
+                                    status_code=exc.status_code,
+                                )
                                 require_security_work_authorized = True
                                 transient_exhausted = True
                                 break
@@ -1931,7 +2196,18 @@ class _CompactMixin:
                             raise
                         if code == "account_response_create_cap":
                             last_exc = exc
-                            excluded_account_ids.add(account.id)
+                            _exclude_account(
+                                account.id,
+                                failure_class=(
+                                    OpenAIFailureClass.QUOTA_EXHAUSTED
+                                    if definitive_quota
+                                    else OpenAIFailureClass.UNKNOWN
+                                ),
+                                code=code,
+                                message=error_message or "Upstream account failed",
+                                status_code=exc.status_code,
+                                safe_full_replay=definitive_quota,
+                            )
                             transient_exhausted = True
                             break
                         if _is_account_neutral_error_code(code):
@@ -1999,7 +2275,16 @@ class _CompactMixin:
                             http_status=exc.status_code,
                             phase="first_event",
                         )
-                        if getattr(base_settings, "deterministic_failover_enabled", True):
+                        definitive_quota = account_exhaustion_code_for_failover(code, error_message) is not None
+                        if definitive_quota:
+                            # Quota exhaustion belongs to one account. Keep
+                            # walking the normal selector beyond the generic
+                            # compact retry cap until no eligible account
+                            # remains; never surface B's limit while C is
+                            # still available.
+                            action = "failover_next"
+                            quota_walk_active = True
+                        elif getattr(base_settings, "deterministic_failover_enabled", True):
                             action = failover_decision(
                                 failure_class=classified["failure_class"],
                                 downstream_visible=False,
@@ -2026,7 +2311,14 @@ class _CompactMixin:
                                 # recovery eligible for the remaining attempts.
                                 owner_quota_failover_eligible = True
                             last_exc = exc
-                            excluded_account_ids.add(account.id)
+                            _exclude_account(
+                                account.id,
+                                failure_class=classified["failure_class"],
+                                code=code or "upstream_error",
+                                message=error_message or "Upstream account failed",
+                                status_code=exc.status_code,
+                                safe_full_replay=definitive_quota,
+                            )
                             await record_or_defer_stream_health(
                                 account,
                                 _upstream_error_from_openai(error),

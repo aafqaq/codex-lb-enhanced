@@ -1949,8 +1949,7 @@ class ProxyService(
                 # the caller still retains the request payload/continuity proof
                 # and can restore a safe anchor on a subsequent retry.
                 fallback_owner_excluded = (
-                    preferred_account_id is not None
-                    and preferred_account_id in excluded_account_ids_set
+                    preferred_account_id is not None and preferred_account_id in excluded_account_ids_set
                 )
                 fallback_sticky_key = None if fallback_owner_excluded else sticky_key
                 fallback_sticky_kind = None if fallback_owner_excluded else sticky_kind

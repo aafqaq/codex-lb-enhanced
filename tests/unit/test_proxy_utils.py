@@ -1444,7 +1444,11 @@ def test_websocket_precreated_retry_error_code_does_not_replay_missing_tool_outp
     )
 
 
-def test_websocket_precreated_retry_error_code_does_not_replay_after_response_event():
+def test_websocket_precreated_retry_error_code_does_not_replay_after_visible_output():
+    # Replay safety is decided by whether semantic output already reached the
+    # client, not by how many lifecycle frames arrived.  An upstream may emit
+    # several acknowledgements before a definitive quota error, so only the
+    # visibility markers may veto the account walk.
     request_state = proxy_service._WebSocketRequestState(
         request_id="req_visible_precreated",
         model="gpt-5.1",
@@ -1455,6 +1459,7 @@ def test_websocket_precreated_retry_error_code_does_not_replay_after_response_ev
         awaiting_response_created=True,
         request_text='{"type":"response.create","input":"hello"}',
         response_event_count=1,
+        downstream_visible=True,
     )
     payload: dict[str, JsonValue] = {
         "type": "error",
@@ -1473,6 +1478,43 @@ def test_websocket_precreated_retry_error_code_does_not_replay_after_response_ev
             has_other_pending_requests=False,
         )
         is None
+    )
+
+
+def test_websocket_precreated_retry_error_code_replays_quota_after_lifecycle_acknowledgements():
+    # Regression guard for the dominant production failure: upstream sent
+    # several pre-output lifecycle frames and then a usage-limit error.  The
+    # turn must stay replayable so the pool walk can reach a healthy account
+    # instead of surfacing the exhausted account's quota error to the client.
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req_quota_after_lifecycle",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        awaiting_response_created=False,
+        request_text='{"type":"response.create","input":"hello"}',
+        response_id="resp_ack",
+        response_event_count=3,
+    )
+    payload: dict[str, JsonValue] = {
+        "type": "error",
+        "error": {
+            "type": "rate_limit_error",
+            "code": "usage_limit_reached",
+            "message": "You have reached the usage limit.",
+        },
+    }
+
+    assert (
+        proxy_service._websocket_precreated_retry_error_code(
+            request_state,
+            event_type="error",
+            payload=payload,
+            has_other_pending_requests=False,
+        )
+        is not None
     )
 
 
@@ -1686,26 +1728,6 @@ def _client_connector_certificate_error() -> ClientConnectorCertificateError:
         connection_key,
         ssl.SSLCertVerificationError(1, "certificate verify failed"),
     )
-
-
-def test_trim_websocket_previous_response_input_items_accepts_untyped_assistant_replay() -> None:
-    items: list[JsonValue] = [
-        {"role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
-        {"type": "custom_tool_call", "call_id": "call_custom", "name": "shell", "input": "pwd"},
-        {"type": "custom_tool_call_output", "call_id": "call_custom", "output": "/tmp"},
-        {"role": "user", "content": [{"type": "input_text", "text": "next"}]},
-    ]
-
-    assert proxy_service._trim_websocket_previous_response_input_items(items) == items[2:]
-
-
-def test_trim_websocket_previous_response_input_items_keeps_non_replay_prefix() -> None:
-    items: list[JsonValue] = [
-        {"role": "system", "content": [{"type": "input_text", "text": "local context"}]},
-        {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
-    ]
-
-    assert proxy_service._trim_websocket_previous_response_input_items(items) == items
 
 
 def test_filter_inbound_headers_strips_auth_and_account():
@@ -20353,9 +20375,15 @@ async def test_connect_proxy_websocket_scopes_transient_exclusions_to_connect_lo
     account_b = _make_account("acc_ws_transient_reconnect_b")
     upstream_b = SimpleNamespace(name="upstream-b")
     upstream_a = SimpleNamespace(name="upstream-a")
+    # A transport-level handshake failure says the route was unreachable for
+    # this attempt, not that the account failed the request.  A definitive
+    # per-account verdict (quota/auth) is deliberately NOT used here: those
+    # must survive the connect loop, which
+    # ``test_connect_proxy_websocket_keeps_quota_exclusion_across_connects``
+    # covers.
     transient_handshake_error = proxy_module.ProxyResponseError(
-        429,
-        openai_error("usage_limit_reached", "usage limit reached"),
+        502,
+        openai_error("upstream_unavailable", "Upstream websocket handshake failed"),
     )
     seen_excluded_account_ids: list[set[str]] = []
 
@@ -20445,6 +20473,112 @@ async def test_connect_proxy_websocket_scopes_transient_exclusions_to_connect_lo
     assert selected_account == account_a
     assert selected_upstream is upstream_a
     assert seen_excluded_account_ids == [set(), {account_a.id}, set()]
+    assert request_logs.calls == []
+
+
+async def test_connect_proxy_websocket_keeps_quota_exclusion_across_connects(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account_a = _make_account("acc_ws_quota_persist_a")
+    account_b = _make_account("acc_ws_quota_persist_b")
+    upstream_b = SimpleNamespace(name="upstream-b")
+    # Quota exhaustion is a verdict about the account, not about one
+    # connection.  Forgetting it when the stream reconnects is what let a
+    # drained account be selected again and again, which surfaced to the
+    # client as a dead session instead of a transparent account switch.
+    transient_handshake_error = proxy_module.ProxyResponseError(
+        429,
+        openai_error("usage_limit_reached", "usage limit reached"),
+    )
+    seen_excluded_account_ids: list[set[str]] = []
+
+    async def select_account(**kwargs: object) -> AccountSelection:
+        excluded_account_ids = set(cast(set[str] | None, kwargs.get("exclude_account_ids")) or set())
+        seen_excluded_account_ids.append(excluded_account_ids)
+        # Behave like the real selector: never hand back an excluded account.
+        if account_a.id not in excluded_account_ids:
+            return AccountSelection(account=account_a, error_message=None)
+        return AccountSelection(account=account_b, error_message=None)
+        raise AssertionError("unexpected extra account selection")
+
+    async def ensure_fresh_with_budget(
+        account: Account,
+        *,
+        force: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> Account:
+        del force, timeout_seconds
+        return account
+
+    async def open_upstream_with_budget(
+        account: Account,
+        headers: dict[str, str],
+        *,
+        timeout_seconds: float,
+    ) -> SimpleNamespace:
+        del account, headers, timeout_seconds
+        result = open_results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    open_results: list[SimpleNamespace | BaseException] = [
+        transient_handshake_error,
+        upstream_b,
+        upstream_b,
+    ]
+
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(service._load_balancer, "mark_rate_limit", AsyncMock())
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", ensure_fresh_with_budget)
+    monkeypatch.setattr(service, "_open_upstream_websocket_with_budget", open_upstream_with_budget)
+    monkeypatch.setattr(service, "_release_websocket_reservation", AsyncMock())
+
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_quota_exclusion_persist",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+    )
+    websocket = cast(WebSocket, SimpleNamespace(send_text=AsyncMock()))
+
+    selected_account, selected_upstream = await service._connect_proxy_websocket(
+        {},
+        sticky_key=None,
+        sticky_kind=None,
+        prefer_earlier_reset=False,
+        routing_strategy="usage_weighted",
+        model="gpt-5.1",
+        request_state=request_state,
+        api_key=None,
+        client_send_lock=anyio.Lock(),
+        websocket=websocket,
+    )
+    assert selected_account == account_b
+    assert selected_upstream is upstream_b
+    assert request_state.excluded_account_ids == set()
+
+    selected_account, selected_upstream = await service._connect_proxy_websocket(
+        {},
+        sticky_key=None,
+        sticky_kind=None,
+        prefer_earlier_reset=False,
+        routing_strategy="usage_weighted",
+        model="gpt-5.1",
+        request_state=request_state,
+        api_key=None,
+        client_send_lock=anyio.Lock(),
+        websocket=websocket,
+    )
+
+    # The drained owner stays excluded on the reconnect, so the second
+    # connect goes straight to a healthy account instead of re-selecting it.
+    assert selected_account == account_b
+    assert seen_excluded_account_ids == [set(), {account_a.id}, {account_a.id}]
+    assert request_state.failover_state is not None
+    assert account_a.id in request_state.failover_state.failed_account_ids
     assert request_logs.calls == []
 
 
@@ -32254,6 +32388,7 @@ async def _run_websocket_clean_close_during_send_failure(
         upstream_control: proxy_service._WebSocketUpstreamControl,
         response_create_gate: asyncio.Semaphore,
         downstream_activity: proxy_service._DownstreamWebSocketActivity,
+        continuity_state: Any = None,
     ) -> bool:
         result = await original_transport_end(
             proxy,
@@ -32268,6 +32403,7 @@ async def _run_websocket_clean_close_during_send_failure(
             api_key=api_key,
             upstream_control=upstream_control,
             response_create_gate=response_create_gate,
+            continuity_state=continuity_state,
             downstream_activity=downstream_activity,
         )
         assert upstream_control.replay_request_state is not None
@@ -43956,19 +44092,6 @@ def test_prepare_response_bridge_request_state_dedupes_replayed_previous_respons
     assert upstream_input[2]["content"] == [{"type": "output_text", "text": "Process exited with code 0"}]
 
 
-def test_trim_websocket_previous_response_input_items_handles_apply_patch_replay():
-    input_items: list[JsonValue] = [
-        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "patching"}]},
-        {"type": "apply_patch_call", "call_id": "patch_1", "input": "*** Begin Patch\n*** End Patch\n"},
-        {"type": "apply_patch_call_output", "call_id": "patch_1", "output": "Success"},
-        {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
-    ]
-
-    trimmed = proxy_service._trim_websocket_previous_response_input_items(input_items)
-
-    assert trimmed == input_items[2:]
-
-
 def test_prepare_response_bridge_request_state_keeps_unconfirmed_missing_tool_output_history():
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -45628,6 +45751,7 @@ async def test_retry_http_bridge_request_on_fresh_upstream_uses_archive_request_
         restart_reader=True,
         require_same_account=False,
         require_preferred_account=False,
+        selection_affinity=None,
     )
     send_text.assert_awaited_once_with('{"type":"response.create","model":"gpt-5.1","input":"retry"}')
     assert send_request_ids == ["archive_bridge_retry_fresh"]

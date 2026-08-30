@@ -46,6 +46,7 @@ from app.core.clients.proxy_websocket import (
     UpstreamWebSocketTransportError,
 )
 from app.core.errors import OpenAIErrorEnvelope, openai_error
+from app.core.openai.failover import OpenAIFailoverState, OpenAIFailure, OpenAIFailureClass
 from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import (
     ResponsesRequest,
@@ -221,6 +222,7 @@ from app.modules.proxy.helpers import (
 )
 from app.modules.proxy.load_balancer import effective_account_concurrency_caps
 from app.modules.proxy.replay_safety import (
+    project_durable_transcript_for_account_neutral_quota_replay,
     project_responses_text_for_account_neutral_quota_replay,
 )
 from app.modules.proxy.tool_call_dedupe import (
@@ -283,7 +285,11 @@ def _http_bridge_client_full_history_recovery_enabled(request_state: _WebSocketR
     settings = _service_get_settings()
     return (
         request_state.propagate_http_errors
-        and getattr(settings, "http_responses_session_bridge_ambiguous_continuation_recovery_mode", "fail_closed")
+        and getattr(
+            settings,
+            "http_responses_session_bridge_ambiguous_continuation_recovery_mode",
+            "server_indefinite_recovery",
+        )
         == "client_full_history_once"
         and request_state.previous_response_id is not None
         and request_state.response_id is None
@@ -294,7 +300,11 @@ def _http_bridge_client_full_history_recovery_enabled(request_state: _WebSocketR
 def _http_bridge_server_anchored_replay_enabled(request_state: _WebSocketRequestState) -> bool:
     settings = _service_get_settings()
     return (
-        getattr(settings, "http_responses_session_bridge_ambiguous_continuation_recovery_mode", "fail_closed")
+        getattr(
+            settings,
+            "http_responses_session_bridge_ambiguous_continuation_recovery_mode",
+            "server_indefinite_recovery",
+        )
         in {"server_anchored_replay_once", "server_indefinite_recovery"}
         and request_state.previous_response_id is not None
         and request_state.response_id is None
@@ -525,6 +535,24 @@ def _text_without_account_installation_id(text_data: str) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
+def _http_bridge_operation_request_text(request_state: _WebSocketRequestState, text_data: str) -> str:
+    """Return the body to persist for a durable bridge operation.
+
+    An anchored turn is only replayable by the account that owns its
+    ``previous_response_id``.  When the streaming layer already proved a
+    complete anchor-free body, persist that instead so a later account switch
+    can rebuild the turn; otherwise persist the exact wire text.
+    """
+
+    if (
+        request_state.previous_response_id is None
+        and request_state.fresh_upstream_request_is_retry_safe
+        and isinstance(request_state.fresh_upstream_request_text, str)
+    ):
+        return request_state.fresh_upstream_request_text
+    return text_data
+
+
 def _text_with_previous_response_id(text_data: str, response_id: str | None) -> str:
     if not response_id:
         return text_data
@@ -720,6 +748,7 @@ class _HTTPBridgeRequestSubmitMixin:
             request_kind=request_kind,
             connection_request_kind=connection_request_kind,
             generate_false_prewarm=generate_false_prewarm,
+            failover_state=OpenAIFailoverState(max_switches=32),
         )
         if deduped_replayed_input_count is not None:
             request_state.input_item_count = deduped_replayed_input_count
@@ -942,6 +971,69 @@ class _HTTPBridgeRequestSubmitMixin:
         owned_unanchored_handoff: bool,
         recovery_turn_state: str | None = None,
     ) -> None:
+        request_state.failover_state = session.failover_state
+        request_state.excluded_account_ids.update(session.failover_state.failed_account_ids)
+        quota_owner = session.quota_failure_account_id
+        quota_recovery_prepared = False
+        if (
+            quota_owner is not None
+            and request_state.previous_response_id is not None
+            and not request_state.file_required_preferred_account
+        ):
+            # A new client continuation may arrive after the previous quota
+            # request has already been finalized.  Detach the stale owner
+            # before the normal submit path can reuse its hard bridge socket.
+            quota_replay_text = project_responses_text_for_account_neutral_quota_replay(
+                _websocket_recovery_source_text(request_state)
+            )
+            if quota_replay_text is None:
+                get_transcript = getattr(self._durable_bridge, "get_replayable_transcript", None)
+                if callable(get_transcript):
+                    try:
+                        transcript = await get_transcript(response_id=request_state.previous_response_id)
+                    except Exception:
+                        logger.warning(
+                            "Failed to load durable transcript before quota recovery request_id=%s",
+                            request_state.request_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if transcript:
+                            quota_replay_text = project_durable_transcript_for_account_neutral_quota_replay(
+                                transcript,
+                                current_request_text=_websocket_recovery_source_text(request_state),
+                            )
+            if quota_replay_text is not None:
+                request_state.request_text = quota_replay_text
+                text_data = quota_replay_text
+                request_state.previous_response_id = None
+                request_state.proxy_injected_previous_response_id = False
+                request_state.hard_continuity_anchor = False
+                request_state.preferred_account_id = None
+                request_state.replay_required_account_id = None
+                request_state.file_required_preferred_account = False
+                request_state.operation_rebind_required = True
+                request_state.excluded_account_ids.add(quota_owner)
+                session.failover_state.record_failure(
+                    quota_owner,
+                    OpenAIFailure(
+                        failure_class=OpenAIFailureClass.QUOTA_EXHAUSTED,
+                        code="usage_limit_reached",
+                        message="The usage limit has been reached",
+                        status_code=429,
+                        retry_next_account=True,
+                        safe_full_replay=True,
+                    ),
+                )
+                session.closed = True
+                session.upstream_control.reconnect_requested = True
+                session.upstream_control.retire_after_drain = True
+                quota_recovery_prepared = True
+                logger.info(
+                    "Prepared client continuation quota recovery request_id=%s owner_account_id=%s",
+                    request_state.request_id,
+                    quota_owner,
+                )
         recovery_attempt_consumed = False
         allow_operation_fenced_continuity_replay = False
         if _http_bridge_operation_fence_for_hard_continuity_enabled(request_state):
@@ -972,7 +1064,9 @@ class _HTTPBridgeRequestSubmitMixin:
         allow_server_anchored_replay = _http_bridge_server_anchored_replay_enabled(request_state)
         if not await self._http_bridge_precreated_retry_allowed(
             session,
-            allow_proof_gated_continuity_replay=allow_proof_gated_continuity_replay or allow_server_anchored_replay,
+            allow_proof_gated_continuity_replay=(
+                allow_proof_gated_continuity_replay or allow_server_anchored_replay or quota_recovery_prepared
+            ),
             allow_operation_fenced_continuity_replay=allow_operation_fenced_continuity_replay,
         ):
             retry_after_seconds = max(
@@ -1145,6 +1239,7 @@ class _HTTPBridgeRequestSubmitMixin:
             # that fences every identical retry as an unknown in-flight turn.
             operation_tagged_text = _text_with_operation_id(text_data, operation_id)
             _enforce_http_bridge_response_create_text_size(request_state, operation_tagged_text)
+            # Persist a complete, anchor-free request whenever the streaming
             try:
                 get_operation_by_fingerprint = getattr(self._durable_bridge, "get_operation_by_fingerprint", None)
                 get_operation = getattr(self._durable_bridge, "get_operation", None)
@@ -1284,7 +1379,15 @@ class _HTTPBridgeRequestSubmitMixin:
                     account_id=session.account.id,
                     model=request_state.model,
                     parent_response_id=operation_parent_response_id,
-                    request_text=text_data,
+                    # Persist a complete, anchor-free request whenever the
+                    # streaming layer proved one is available.  The wire
+                    # payload may be a compact suffix paired with
+                    # ``previous_response_id`` for the original account;
+                    # storing that suffix alone makes a later account-neutral
+                    # failover impossible.  Resolved here rather than before
+                    # the hard-turn chain walk above, which rewrites
+                    # ``text_data`` and the anchor as it advances.
+                    request_text=_http_bridge_operation_request_text(request_state, text_data),
                 )
             except Exception as exc:
                 session.closed = True
@@ -1545,7 +1648,24 @@ class _HTTPBridgeRequestSubmitMixin:
                             request_state=request_state,
                             text_data=text_data,
                             send_request=False,
-                            require_same_account=_http_bridge_key_strength(session.key) == "hard",
+                            require_same_account=(
+                                _http_bridge_key_strength(session.key) == "hard" and not quota_recovery_prepared
+                            ),
+                            selection_affinity=(
+                                replace(
+                                    request_state.affinity_policy,
+                                    key=None,
+                                    kind=None,
+                                    reallocate_sticky=True,
+                                    codex_session_source=None,
+                                    legacy_codex_session_key=None,
+                                    legacy_continuity_source=None,
+                                    seed_selection_key=None,
+                                    seed_selection_kind=None,
+                                )
+                                if quota_recovery_prepared
+                                else None
+                            ),
                         )
                     except BaseException:
                         await _cleanup_unsubmitted_recovery_claim()
@@ -2951,6 +3071,7 @@ class _HTTPBridgeRequestSubmitMixin:
         text_data: str,
         send_request: bool = True,
         require_same_account: bool = False,
+        selection_affinity: _AffinityPolicy | None = None,
     ) -> bool:
         require_same_account = require_same_account or is_http_bridge_account_neutral_replay(
             kind=session.key.affinity_kind,
@@ -2995,6 +3116,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 restart_reader=True,
                 require_same_account=require_same_account,
                 require_preferred_account=request_state.file_required_preferred_account,
+                selection_affinity=selection_affinity,
             )
             if send_request:
                 retry_text_data = self._http_bridge_text_with_account_installation_id(
@@ -3032,6 +3154,12 @@ class _HTTPBridgeRequestSubmitMixin:
         restart_reader: bool = False,
         allow_account_exhaustion_failover: bool = False,
     ) -> bool:
+        # Reconnect/replay attempts must share the bridge session's exclusion
+        # ledger.  A newly-created request state otherwise starts empty and
+        # can select the same exhausted owner after the client reconnects.
+        if request_state is not None:
+            request_state.failover_state = session.failover_state
+            request_state.excluded_account_ids.update(session.failover_state.failed_account_ids)
         clean_close_retry_max_count = self._http_bridge_clean_close_retry_max_count()
         account_neutral_recovery = is_http_bridge_account_neutral_replay(
             kind=session.key.affinity_kind,
@@ -3135,6 +3263,8 @@ class _HTTPBridgeRequestSubmitMixin:
                 if len(retryable_requests) != 1:
                     return False
                 request_state = retryable_requests[0]
+            request_state.failover_state = session.failover_state
+            request_state.excluded_account_ids.update(session.failover_state.failed_account_ids)
             model_fallback_replay = request_state.precreated_replay_reason == _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
             if request_state.previous_response_id is not None and not (
                 request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text

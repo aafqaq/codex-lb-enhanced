@@ -334,15 +334,18 @@ class Settings(BaseSettings):
         default=7 * 24 * 60 * 60,
         gt=0,
     )
-    # Recovery-first mode can either ask the client to drop an ambiguous anchor
-    # or let the bridge retry that anchored request once on a fresh upstream
-    # socket. Both are at-least-once strategies; fail-closed remains default.
+    # Recovery-first mode retries an ambiguous/failed Responses turn on a
+    # fresh upstream socket and walks the eligible account pool.  The enhanced
+    # build targets Responses clients, which already deduplicate/replay a
+    # turn boundary; keeping this enabled by default prevents a single stale
+    # owner from surfacing as ``Previous response owner unavailable``.  The
+    # normal load-balancer rotation strategy remains authoritative.
     http_responses_session_bridge_ambiguous_continuation_recovery_mode: Literal[
         "fail_closed",
         "client_full_history_once",
         "server_anchored_replay_once",
         "server_indefinite_recovery",
-    ] = "fail_closed"
+    ] = "server_indefinite_recovery"
     http_responses_session_bridge_instance_id: str = Field(default_factory=_default_http_bridge_instance_id)
     http_responses_session_bridge_instance_ring: Annotated[list[str], NoDecode] = Field(default_factory=list)
     http_responses_session_bridge_advertise_base_url: str | None = None

@@ -71,7 +71,16 @@ _UPSTREAM_USAGE_LIMIT_MESSAGE_MARKERS = (
     "usage limit has been reached",
     "usage limit is reached",
     "usage limit reached",
+    "reached the usage limit",
     "reached your usage limit",
+    "you have reached the usage limit",
+    "you've reached the usage limit",
+    "you have reached your usage limit",
+    "you've reached your usage limit",
+    "you have hit the usage limit",
+    "you've hit the usage limit",
+    "you have hit your usage limit",
+    "you've hit your usage limit",
     "hit your usage limit",
 )
 
@@ -113,8 +122,18 @@ def upstream_usage_limit_error_code(code: str | None, message: str | None) -> st
         return normalized_code
     if message is None:
         return None
+    # Keep punctuation-insensitive matching for client-facing variants such
+    # as ``You have reached the usage limit. Upgrade ...``.  The raw compact
+    # form is retained as well so existing markers and diagnostics remain
+    # unchanged.
     normalized_message = " ".join(message.casefold().split())
-    if any(marker in normalized_message for marker in _UPSTREAM_USAGE_LIMIT_MESSAGE_MARKERS):
+    normalized_message_plain = " ".join(
+        "".join(character if character.isalnum() else " " for character in message.casefold()).split()
+    )
+    if any(
+        marker in normalized_message or marker in normalized_message_plain
+        for marker in _UPSTREAM_USAGE_LIMIT_MESSAGE_MARKERS
+    ):
         return "usage_limit_reached"
     return None
 

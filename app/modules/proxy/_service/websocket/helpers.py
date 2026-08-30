@@ -732,6 +732,48 @@ def _record_websocket_transport_failure(
     continuity_state.transport_failure_at = time.monotonic()
 
 
+def _record_websocket_quota_failure(
+    continuity_state: _WebSocketContinuityState | None,
+    *,
+    account_id: str | None,
+) -> None:
+    """Remember a definitive quota owner failure for the next continuation.
+
+    A quota frame is authoritative account-health evidence even when it is
+    observed after ``response.created``.  The old implementation only asked
+    the current pending request to reconnect; once that state was finalized,
+    the next client retry resolved the same previous-response owner again.
+    Keeping a short-lived owner marker on the logical websocket continuity
+    state lets the next request detach that owner before selection while
+    leaving normal routing/rotation policy unchanged.
+    """
+
+    if continuity_state is None or not isinstance(account_id, str) or not account_id.strip():
+        return
+    continuity_state.quota_failure_account_id = account_id.strip()
+    continuity_state.quota_failure_at = time.monotonic()
+
+
+def _websocket_quota_failure_account_id(
+    continuity_state: _WebSocketContinuityState | None,
+    *,
+    ttl_seconds: float = 300.0,
+) -> str | None:
+    """Return the recent exhausted owner, expiring stale recovery hints."""
+
+    if continuity_state is None:
+        return None
+    account_id = continuity_state.quota_failure_account_id
+    failed_at = continuity_state.quota_failure_at
+    if account_id is None or failed_at is None:
+        return None
+    if time.monotonic() - failed_at >= max(float(ttl_seconds), 0.0):
+        continuity_state.quota_failure_account_id = None
+        continuity_state.quota_failure_at = None
+        return None
+    return account_id
+
+
 def _websocket_transport_failure_account_id(
     continuity_state: _WebSocketContinuityState | None,
 ) -> str | None:
@@ -881,23 +923,16 @@ def _websocket_precreated_retry_error_code(
         # output (or sequenced frame) was exposed.  ``excluded_account_ids``
         # grows on every retry, so this walks the finite eligible pool and
         # naturally stops when selection reports no remaining account.
-        # A response.created frame is a pre-output acknowledgement and may
-        # precede a quota terminal.  Keep that created-only shape replayable so
-        # the public response can continue on the next account.  Any other
-        # lifecycle event means the model may have started producing output;
-        # fail closed rather than risking duplicate tool/text delivery.
-        created_only_event = (
-            request_state.response_event_count == 1
-            and request_state.response_id is not None
-            and not request_state.awaiting_response_created
-        )
+        # An upstream may emit several lifecycle acknowledgements
+        # (response.created/in_progress/output-item metadata) before reporting
+        # a definitive usage-limit error.  Those frames are not model output;
+        # rely on the explicit visibility/model-output/sequence markers below
+        # instead of treating response_event_count > 1 as irreversible.
         if (
             has_other_pending_requests
             or request_state.last_downstream_sequence_number is not None
             or request_state.downstream_visible
             or request_state.upstream_model_output_seen
-            or request_state.response_event_count > 1
-            or (request_state.response_event_count == 1 and not created_only_event)
         ):
             return None
         if request_state.previous_response_id is not None and request_state.preferred_account_id is not None:
@@ -2082,21 +2117,18 @@ def _serialize_websocket_error_event(payload: dict[str, JsonValue]) -> str:
 
 
 def _trim_websocket_previous_response_input_items(input_items: list[JsonValue]) -> list[JsonValue]:
-    first_output_index = next(
-        (
-            index
-            for index, item in enumerate(input_items)
-            if _websocket_input_item_type(item)
-            in {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
-        ),
-        None,
-    )
-    if first_output_index is None or first_output_index == 0:
-        return input_items
-    prefix = input_items[:first_output_index]
-    if not all(_is_websocket_previous_response_output_item(item) for item in prefix):
-        return input_items
-    return input_items[first_output_index:]
+    """Return the complete client transcript.
+
+    Older recovery code dropped every assistant/tool item before the first
+    tool output.  That produced the observed ``568 -> 3`` payload and made a
+    replacement account lose the reasoning/tool history it needed.  The
+    Responses API accepts the full transcript (and the account-neutral
+    projector removes only account-owned ids), so trimming is no longer a
+    valid recovery operation.  Keep this compatibility helper for callers
+    and imports, but deliberately make it identity-preserving.
+    """
+
+    return input_items
 
 
 def _is_websocket_previous_response_output_item(item: JsonValue) -> bool:

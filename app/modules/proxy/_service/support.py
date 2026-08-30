@@ -20,6 +20,7 @@ from app.core.clients.proxy import CodexControlRequestPrivacyPolicy, ProxyRespon
 from app.core.clients.proxy_websocket import UpstreamWebSocket
 from app.core.config.settings import get_settings
 from app.core.errors import OpenAIErrorEnvelope, openai_error
+from app.core.openai.failover import OpenAIFailoverState
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import OpenAIEvent
 from app.core.openai.parsing import classify_event_type
@@ -40,6 +41,9 @@ from app.modules.proxy.load_balancer import (
     AccountLease,
     AccountSelection,
     CatalogOmissionQuotaAdmission,
+)
+from app.modules.proxy.replay_safety import (
+    project_durable_transcript_for_account_neutral_quota_replay,
 )
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
@@ -976,6 +980,11 @@ class _WebSocketRequestState:
     # Account quota failover is bounded by distinct excluded accounts, not by
     # the generic one-shot replay budget.
     account_exhaustion_replay_count: int = 0
+    # True only while the current logical turn is walking accounts after a
+    # definitive upstream quota response.  Keep this separate from the replay
+    # counter: a later transport/auth failure must return to the ordinary
+    # bounded retry budget instead of inheriting an unbounded quota loop.
+    quota_walk_active: bool = False
     last_account_exhaustion_error_message: str | None = None
     # Counts only the one extra replay permitted after the initial recovery
     # replay when the replacement upstream socket also closes cleanly before
@@ -988,6 +997,11 @@ class _WebSocketRequestState:
     auth_replay_counts_by_account: dict[str, int] = field(default_factory=dict)
     force_refresh_account_id: str | None = None
     excluded_account_ids: set[str] = field(default_factory=set)
+    # The request-scoped controller is shared by reconnect/replay attempts.
+    # Keeping it on the state object prevents each transport adapter from
+    # rebuilding a fresh exclusion set and accidentally selecting A again
+    # after A already returned a definitive quota/transport failure.
+    failover_state: OpenAIFailoverState | None = None
     # A narrowly classified pre-acceptance account/model rejection may move
     # once to another account. Keep the original upstream error until that
     # replacement connection is established so an empty replacement pool does
@@ -1270,6 +1284,13 @@ class _HTTPBridgeSession:
     upstream_proxy_endpoint_id: str | None = None
     upstream_proxy_fallback_used: bool | None = None
     upstream_proxy_fail_closed_reason: str | None = None
+    # One failover controller survives socket replacement and client retries
+    # for this bridge session.  It is deliberately separate from
+    # ``affinity``: locality remains a routing preference, while this state
+    # is the authoritative per-session exclusion ledger.
+    failover_state: OpenAIFailoverState = field(default_factory=lambda: OpenAIFailoverState(max_switches=32))
+    quota_failure_account_id: str | None = None
+    quota_failure_at: float | None = None
 
     def claim_liveness_settlement(self) -> bool:
         """Claim whole-deque settlement for a liveness-failed submitter.
@@ -1386,6 +1407,13 @@ class _WebSocketContinuityState:
     # health state: the socket can fail while the selected account is healthy.
     transport_failure_account_id: str | None = None
     transport_failure_at: float | None = None
+    # Definitive account quota is different from a transient socket failure:
+    # the next client continuation must not be pinned back to the exhausted
+    # response owner until its quota window has recovered.  This marker is
+    # process-local and short-lived; durable quota health remains owned by the
+    # account/load-balancer layer.
+    quota_failure_account_id: str | None = None
+    quota_failure_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1569,10 +1597,13 @@ def _websocket_request_can_replay_before_visible_output(
     created_only_pending = (
         request_state.response_id is not None
         and not request_state.awaiting_response_created
-        and request_state.response_event_count <= 1
+        and (allow_account_exhaustion_replay or request_state.response_event_count <= 1)
         and (request_state.previous_response_id is None or has_retry_safe_fresh_payload)
     )
-    if precreated_pending and request_state.response_event_count > 0:
+    # Lifecycle acknowledgements can arrive before a definitive quota error.
+    # They do not expose model text/tool calls, so quota failover may replay
+    # after them; ordinary transport recovery remains conservative.
+    if precreated_pending and request_state.response_event_count > 0 and not allow_account_exhaustion_replay:
         return False
     return precreated_pending or created_only_pending
 
@@ -1599,6 +1630,62 @@ def _websocket_recovery_source_text(request_state: _WebSocketRequestState) -> st
     ):
         return request_state.fresh_upstream_request_text
     return request_state.request_text
+
+
+async def materialize_anchor_replay_text(
+    durable_bridge: object,
+    *,
+    anchor_response_id: str | None,
+    current_request_text: str | None,
+    request_id: str | None = None,
+) -> str | None:
+    """Return the complete body an injected anchor stands for, or ``None``.
+
+    Replacing conversation context with ``previous_response_id`` is only a
+    transport optimization: the identifier is owned by one upstream account,
+    so a request that keeps *only* the anchor cannot be moved to a healthy
+    account after a quota rejection or a stale-anchor error.  Sub2API never
+    hits this because its canonical forward body is always complete; codex-lb
+    trades that for token savings and must therefore materialize the
+    equivalent body whenever it injects an anchor.
+
+    The durable event spool already stores the request body and terminal
+    response of every completed parent turn, so the anchor's chain plus the
+    current client suffix reconstructs an account-neutral request.  Returns
+    ``None`` (fail-closed) when the chain is incomplete; callers keep their
+    existing conservative behaviour instead of replaying partial context.
+    """
+
+    if not anchor_response_id or not current_request_text:
+        return None
+    get_transcript = getattr(durable_bridge, "get_replayable_transcript", None)
+    if not callable(get_transcript):
+        return None
+    try:
+        transcript = await get_transcript(response_id=anchor_response_id)
+    except Exception:
+        logger.warning(
+            "Failed to load durable transcript for anchor replay request_id=%s response_id=%s",
+            request_id,
+            anchor_response_id,
+            exc_info=True,
+        )
+        return None
+    if not transcript:
+        return None
+    try:
+        return project_durable_transcript_for_account_neutral_quota_replay(
+            transcript,
+            current_request_text=current_request_text,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to project durable transcript for anchor replay request_id=%s response_id=%s",
+            request_id,
+            anchor_response_id,
+            exc_info=True,
+        )
+        return None
 
 
 def _record_websocket_route_metadata(
