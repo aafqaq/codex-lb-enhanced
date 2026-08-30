@@ -590,27 +590,33 @@ def _http_bridge_precreated_retry_failure_error(exc: BaseException) -> tuple[int
 
 
 def _trim_http_bridge_previous_response_input_items(input_items: list[JsonValue]) -> list[JsonValue]:
-    """Preserve the complete Responses transcript during recovery.
-
-    The former implementation removed every response item before the first
-    tool output.  A 568-item continuation could therefore be sent as only
-    three items, losing reasoning, assistant output, and tool-call context on
-    an account switch.  Account-neutral replay now performs an explicit,
-    schema-checked projection in :mod:`app.modules.proxy.replay_safety`; a
-    positional trim is never safe and is intentionally an identity operation.
-    """
-
-    return input_items
+    first_output_index = next(
+        (
+            index
+            for index, item in enumerate(input_items)
+            if _http_bridge_input_item_type(item)
+            in {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
+        ),
+        None,
+    )
+    if first_output_index is None or first_output_index == 0:
+        return input_items
+    prefix = input_items[:first_output_index]
+    if not all(_is_http_bridge_previous_response_output_item(item) for item in prefix):
+        return input_items
+    return input_items[first_output_index:]
 
 
 def _is_http_bridge_previous_response_output_item(item: JsonValue) -> bool:
     item_type = _http_bridge_input_item_type(item)
     if item_type in {"reasoning", "function_call", "custom_tool_call", "apply_patch_call"}:
-        return _has_http_bridge_response_output_marker(item)
+        # Anchored continuations may omit response-owned ids/status fields;
+        # the item type itself identifies content from the parent response.
+        return True
     if item_type != "message" or not isinstance(item, dict):
         return False
     role = item.get("role")
-    return role == "assistant" and _has_http_bridge_response_output_marker(item)
+    return role == "assistant"
 
 
 def _has_http_bridge_response_output_marker(item: JsonValue) -> bool:
@@ -620,7 +626,16 @@ def _has_http_bridge_response_output_marker(item: JsonValue) -> bool:
     if isinstance(item_id, str) and item_id.strip():
         return True
     status = item.get("status")
-    return status in {"completed", "in_progress"}
+    if status in {"completed", "in_progress"}:
+        return True
+    # Responses clients often omit ``id``/``status`` on tool-call items in a
+    # continuation because the previous response anchor already identifies
+    # the parent output.  A typed call with a stable call id is still a
+    # response-owned prefix and is safe to trim before forwarding the suffix.
+    item_type = item.get("type")
+    return item_type in {"function_call", "custom_tool_call"} and isinstance(item.get("call_id"), str) and bool(
+        item["call_id"].strip()
+    )
 
 
 def _http_bridge_input_item_type(item: JsonValue) -> str | None:

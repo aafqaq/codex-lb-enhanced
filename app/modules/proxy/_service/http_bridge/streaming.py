@@ -103,6 +103,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _release_http_bridge_unanchored_handoff,
     _release_http_bridge_unanchored_handoffs_for_request,
     _reserve_http_bridge_unanchored_handoff,
+    _trim_http_bridge_previous_response_input_items,
 )
 from app.modules.proxy._service.http_bridge.owner_forwarding import (
     _owner_forward_failure_allows_local_recovery,
@@ -3054,14 +3055,33 @@ class _HTTPBridgeStreamingMixin:
                     effective_payload.previous_response_id,
                 )
             else:
-                logger.warning(
-                    "store_context_input_trim_skipped_prefix_mismatch request_id=%s incoming_items=%s "
-                    "stored_items=%s previous_response_id=%s",
-                    request_id,
-                    len(incoming_input_list),
-                    stored_count,
-                    effective_payload.previous_response_id,
-                )
+                fallback_trimmed_input = _trim_http_bridge_previous_response_input_items(incoming_input_list)
+                if fallback_trimmed_input is not incoming_input_list:
+                    store_context_trim_applied = True
+                    store_context_original_count = len(incoming_input_list)
+                    store_context_original_fingerprint = _fingerprint_input_items(incoming_input_list)
+                    _fresh_state, client_full_resend_fresh_upstream_request_text = prepare_bridge_request(
+                        _http_bridge_payload_without_previous_response_id(untrimmed_effective_payload)
+                    )
+                    del _fresh_state
+                    submit_payload = effective_payload.model_copy(update={"input": fallback_trimmed_input})
+                    logger.info(
+                        "store_context_input_trimmed_fallback request_id=%s original_items=%s trimmed_to=%s "
+                        "previous_response_id=%s",
+                        request_id,
+                        store_context_original_count,
+                        len(fallback_trimmed_input),
+                        effective_payload.previous_response_id,
+                    )
+                else:
+                    logger.warning(
+                        "store_context_input_trim_skipped_prefix_mismatch request_id=%s incoming_items=%s "
+                        "stored_items=%s previous_response_id=%s",
+                        request_id,
+                        len(incoming_input_list),
+                        stored_count,
+                        effective_payload.previous_response_id,
+                    )
         injected_input_items = _http_bridge_interrupted_tool_outputs_input(
             session,
             payload=submit_payload,
