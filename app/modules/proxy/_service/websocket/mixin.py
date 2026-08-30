@@ -3366,6 +3366,12 @@ class _WebSocketMixin:
                     "client_metadata": full_resend_client_metadata,
                 }
             )
+        if responses_payload.previous_response_id is not None and isinstance(responses_payload.input, list):
+            trimmed_input = _trim_http_bridge_previous_response_input_items(
+                cast(list[JsonValue], responses_payload.input)
+            )
+            if trimmed_input is not responses_payload.input:
+                responses_payload = responses_payload.model_copy(update={"input": trimmed_input})
         validate_model_access(refreshed_api_key, responses_payload.model)
         proxy._raise_for_unsupported_input_image_references(responses_payload)
         rewritten_file_account_id = await proxy._resolve_file_account_for_responses(responses_payload, headers)
