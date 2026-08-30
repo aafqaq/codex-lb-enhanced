@@ -590,21 +590,17 @@ def _http_bridge_precreated_retry_failure_error(exc: BaseException) -> tuple[int
 
 
 def _trim_http_bridge_previous_response_input_items(input_items: list[JsonValue]) -> list[JsonValue]:
-    first_output_index = next(
-        (
-            index
-            for index, item in enumerate(input_items)
-            if _http_bridge_input_item_type(item)
-            in {"function_call_output", "custom_tool_call_output", "apply_patch_call_output"}
-        ),
-        None,
-    )
-    if first_output_index is None or first_output_index == 0:
-        return input_items
-    prefix = input_items[:first_output_index]
-    if not all(_is_http_bridge_previous_response_output_item(item) for item in prefix):
-        return input_items
-    return input_items[first_output_index:]
+    """Preserve the complete Responses transcript during recovery.
+
+    The former implementation removed every response item before the first
+    tool output.  A 568-item continuation could therefore be sent as only
+    three items, losing reasoning, assistant output, and tool-call context on
+    an account switch.  Account-neutral replay now performs an explicit,
+    schema-checked projection in :mod:`app.modules.proxy.replay_safety`; a
+    positional trim is never safe and is intentionally an identity operation.
+    """
+
+    return input_items
 
 
 def _is_http_bridge_previous_response_output_item(item: JsonValue) -> bool:

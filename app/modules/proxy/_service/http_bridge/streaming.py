@@ -103,7 +103,6 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _release_http_bridge_unanchored_handoff,
     _release_http_bridge_unanchored_handoffs_for_request,
     _reserve_http_bridge_unanchored_handoff,
-    _trim_http_bridge_previous_response_input_items,
 )
 from app.modules.proxy._service.http_bridge.owner_forwarding import (
     _owner_forward_failure_allows_local_recovery,
@@ -172,7 +171,9 @@ from app.modules.proxy._service.support import (
     _signal_propagated_capacity_startup_wait,
     _signal_propagated_responses_service_cleanup_ready,
     _ttft_event_visible_at,
+    _websocket_recovery_source_text,
     _WebSocketRequestState,
+    materialize_anchor_replay_text,
 )
 from app.modules.proxy._service.support import (
     _websocket_route_log_kwargs as _websocket_route_log_kwargs,
@@ -229,9 +230,10 @@ from app.modules.proxy.durable_bridge_repository import durable_bridge_hash
 from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
 from app.modules.proxy.helpers import (
     _normalize_error_code,
-    upstream_usage_limit_error_code,
+    account_exhaustion_code_for_failover,
 )
 from app.modules.proxy.replay_safety import (
+    project_durable_transcript_for_account_neutral_quota_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
     responses_input_suffix_retains_prior_output,
@@ -449,7 +451,11 @@ def _http_bridge_client_full_history_recovery_enabled(request_state: _WebSocketR
     """
     settings = _service_get_settings()
     return (
-        getattr(settings, "http_responses_session_bridge_ambiguous_continuation_recovery_mode", "fail_closed")
+        getattr(
+            settings,
+            "http_responses_session_bridge_ambiguous_continuation_recovery_mode",
+            "server_indefinite_recovery",
+        )
         == "client_full_history_once"
         and request_state.previous_response_id is not None
         and request_state.response_id is None
@@ -462,7 +468,11 @@ def _http_bridge_server_anchored_replay_enabled(request_state: _WebSocketRequest
     """Return whether the one permitted server-side anchored replay is unused."""
     settings = _service_get_settings()
     return (
-        getattr(settings, "http_responses_session_bridge_ambiguous_continuation_recovery_mode", "fail_closed")
+        getattr(
+            settings,
+            "http_responses_session_bridge_ambiguous_continuation_recovery_mode",
+            "server_indefinite_recovery",
+        )
         in {"server_anchored_replay_once", "server_indefinite_recovery"}
         and request_state.previous_response_id is not None
         and request_state.response_id is None
@@ -590,7 +600,10 @@ def _http_bridge_owner_quota_exhausted(
     if preferred_account_id is None:
         return False
     code, message = _proxy_error_code_message(exc)
-    return upstream_usage_limit_error_code(code, message) is not None
+    # ``rate_limit_exceeded`` is also emitted for temporary model capacity.
+    # Use the narrow failover classifier so a healthy continuity owner is not
+    # detached merely because the capacity-wait path produced that code.
+    return account_exhaustion_code_for_failover(code, message) is not None
 
 
 _HTTP_BRIDGE_AMBIGUOUS_RECOVERY_ERROR_CODES = frozenset(
@@ -1383,8 +1396,9 @@ class _HTTPBridgeStreamingMixin:
         proxy_injected_previous_response_id = False
         fresh_upstream_request_text: str | None = None
         client_full_resend_fresh_upstream_request_text: str | None = None
-        previous_response_trimmed_input_count: int | None = None
-        previous_response_trimmed_input_fingerprint: str | None = None
+        # Keep the complete client transcript.  Recovery must use the
+        # account-neutral projector, never positional trimming (which caused
+        # the historical 568-items-to-3 regression).
         durable_full_resend_anchor_count: int | None = None
         durable_full_resend_anchor_fingerprint: str | None = None
         durable_full_resend_fresh_payload: ResponsesRequest | None = None
@@ -1751,13 +1765,6 @@ class _HTTPBridgeStreamingMixin:
                 model_class=_extract_model_class(payload.model) if payload.model else None,
                 owner_check_applied=True,
             )
-        if effective_payload.previous_response_id is not None and isinstance(effective_payload.input, list):
-            previous_response_input_items = cast(list[JsonValue], effective_payload.input)
-            trimmed_input_items = _trim_http_bridge_previous_response_input_items(previous_response_input_items)
-            if len(trimmed_input_items) != len(previous_response_input_items):
-                previous_response_trimmed_input_count = len(previous_response_input_items)
-                previous_response_trimmed_input_fingerprint = _fingerprint_input_items(previous_response_input_items)
-                effective_payload = effective_payload.model_copy(update={"input": trimmed_input_items})
         request_state, text_data = prepare_bridge_request(effective_payload)
         request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
         request_state.affinity_policy = affinity
@@ -1766,19 +1773,6 @@ class _HTTPBridgeStreamingMixin:
             downstream_turn_state=downstream_turn_state,
             incoming_turn_state_header=incoming_turn_state_header,
         )
-        if previous_response_trimmed_input_count is not None:
-            request_state.input_item_count = previous_response_trimmed_input_count
-            request_state.input_full_fingerprint = previous_response_trimmed_input_fingerprint
-            logger.info(
-                "http_bridge_previous_response_input_trimmed request_id=%s original_items=%s trimmed_to=%s "
-                "previous_response_id=%s",
-                request_state.request_id,
-                previous_response_trimmed_input_count,
-                len(cast(list[JsonValue], effective_payload.input))
-                if isinstance(effective_payload.input, list)
-                else None,
-                effective_payload.previous_response_id,
-            )
         request_state.transport = _REQUEST_TRANSPORT_HTTP
         request_state.request_stage = _http_bridge_request_stage(
             headers=headers,
@@ -1893,9 +1887,32 @@ class _HTTPBridgeStreamingMixin:
             # owner-bound proof (missing owner metadata or fingerprint), so
             # the captured unanchored text cannot be assumed to carry the
             # complete conversational context the anchor was pointing at.
-            # Only the trim branch below (which verifies the stored prefix
-            # fingerprint) is allowed to flip this flag to ``True``.
             request_state.fresh_upstream_request_is_retry_safe = False
+            # The proxy chose to replace that context with an anchor, so it
+            # owns the obligation to keep an equivalent portable body.  The
+            # anchor's own durable chain plus this client suffix rebuilds one;
+            # without it a later stale-anchor or quota rejection can only be
+            # reported to the client as a dead stream (the dominant observed
+            # production failure).  Fail-closed: an incomplete chain leaves
+            # the conservative flag above untouched.
+            anchor_replay_text = await materialize_anchor_replay_text(
+                self._durable_bridge,
+                anchor_response_id=request_state.previous_response_id,
+                current_request_text=fresh_upstream_request_text or text_data,
+                request_id=request_id,
+            )
+            if anchor_replay_text is not None:
+                request_state.fresh_upstream_request_text = anchor_replay_text
+                request_state.fresh_upstream_request_is_retry_safe = True
+                _log_http_bridge_event(
+                    "injected_anchor_replay_materialized",
+                    bridge_session_key,
+                    account_id=None,
+                    model=payload.model,
+                    detail=f"response_id={request_state.previous_response_id}",
+                    cache_key_family=bridge_session_key.affinity_kind,
+                    model_class=_extract_model_class(payload.model) if payload.model else None,
+                )
         elif (
             effective_payload.previous_response_id is not None
             and payload_looks_like_full_resend
@@ -1914,6 +1931,113 @@ class _HTTPBridgeStreamingMixin:
             del _fresh_state
             request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
             request_state.fresh_upstream_request_is_retry_safe = True
+        elif request_state.previous_response_id is not None and rewritten_file_account_id is None:
+            # A client-supplied anchor the proxy could not prove complete is
+            # in the same position as an injected one: the account that owns
+            # it may be gone by the time upstream answers.  Resolve the
+            # question once, here, so every later recovery site can decide
+            # locally whether a portable body exists instead of discovering
+            # mid-stream that it has nothing to replay.
+            anchor_replay_text = await materialize_anchor_replay_text(
+                self._durable_bridge,
+                anchor_response_id=request_state.previous_response_id,
+                current_request_text=text_data,
+                request_id=request_id,
+            )
+            if anchor_replay_text is not None:
+                request_state.fresh_upstream_request_text = anchor_replay_text
+                request_state.fresh_upstream_request_is_retry_safe = True
+                _log_http_bridge_event(
+                    "client_anchor_replay_materialized",
+                    bridge_session_key,
+                    account_id=None,
+                    model=payload.model,
+                    detail=f"response_id={request_state.previous_response_id}",
+                    cache_key_family=bridge_session_key.affinity_kind,
+                    model_class=_extract_model_class(payload.model) if payload.model else None,
+                )
+        # Keep this set alive for every recovery entry point.  In particular,
+        # the durable-transcript path below may discover that the previous
+        # response has no routable owner before the normal session-creation
+        # loop has been entered.
+        fresh_replay_excluded_account_ids: set[str] = set()
+        durable_ownerless_replay_prepared = False
+        if (
+            required_continuity_owner_missing
+            and request_state.previous_response_id is not None
+            and rewritten_file_account_id is None
+        ):
+            # A previous_response_id is account-scoped upstream.  If the
+            # durable index has lost its owner (for example after an account
+            # was paused or its quota was exhausted), do not fail closed yet:
+            # the event spool can reconstruct a complete account-neutral
+            # request.  The owner check below still remains strict for cases
+            # where reconstruction is impossible.
+            get_transcript = getattr(self._durable_bridge, "get_replayable_transcript", None)
+            if callable(get_transcript):
+                try:
+                    transcript = await get_transcript(response_id=request_state.previous_response_id)
+                except Exception:
+                    transcript = None
+                    logger.warning(
+                        "Failed to inspect durable transcript before continuity-owner check request_id=%s",
+                        request_id,
+                        exc_info=True,
+                    )
+                if transcript:
+                    replay_text = project_durable_transcript_for_account_neutral_quota_replay(
+                        transcript,
+                        current_request_text=_websocket_recovery_source_text(request_state),
+                    )
+                    if replay_text is not None:
+                        try:
+                            replay_payload = ResponsesRequest.model_validate(json.loads(replay_text))
+                        except Exception:
+                            replay_payload = None
+                        if replay_payload is not None:
+                            old_owner_id = request_state.preferred_account_id
+                            if old_owner_id is not None:
+                                fresh_replay_excluded_account_ids.add(old_owner_id)
+                            replay_kind, replay_key = make_http_bridge_account_neutral_replay_key(uuid4().hex)
+                            bridge_session_key = _HTTPBridgeSessionKey(
+                                replay_kind,
+                                replay_key,
+                                bridge_session_key.api_key_id,
+                            )
+                            affinity = _AffinityPolicy()
+                            incoming_turn_state_header = None
+                            session_header_fallback_key = None
+                            durable_session_header_alias = None
+                            durable_lookup = None
+                            durable_model_transition_lookup = None
+                            force_local_recovery_creation = True
+                            account_neutral_recovery = True
+                            effective_payload = replay_payload
+                            untrimmed_effective_payload = replay_payload
+                            proxy_injected_previous_response_id = False
+                            fresh_upstream_request_text = None
+                            client_full_resend_fresh_upstream_request_text = None
+                            request_state, text_data = prepare_bridge_request(replay_payload)
+                            request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
+                            request_state.affinity_policy = affinity
+                            request_state.transport = _REQUEST_TRANSPORT_HTTP
+                            request_state.request_stage = "follow_up"
+                            request_state.preferred_account_id = None
+                            request_state.excluded_account_ids.update(fresh_replay_excluded_account_ids)
+                            request_state.operation_rebind_required = True
+                            durable_ownerless_replay_prepared = True
+                            _log_http_bridge_event(
+                                "durable_transcript_account_neutral_replay",
+                                bridge_session_key,
+                                account_id=old_owner_id,
+                                model=replay_payload.model,
+                                detail="outcome=ownerless_previous_response_rebuilt_without_anchor",
+                                cache_key_family=bridge_session_key.affinity_kind,
+                                model_class=_extract_model_class(replay_payload.model)
+                                if replay_payload.model
+                                else None,
+                                owner_check_applied=True,
+                            )
         settings = _service_get_settings()
         request_deadline = request_state.started_at + _http_bridge_request_budget_seconds(settings)
         session_creation_headers = (
@@ -1921,7 +2045,6 @@ class _HTTPBridgeStreamingMixin:
             if account_neutral_recovery or owner_bound_full_resend_ignores_broad_session
             else dict(headers)
         )
-        fresh_replay_excluded_account_ids: set[str] = set()
         unanchored_fork_spill_attempted = False
         owner_failure_reason = "owner_unavailable"
 
@@ -1982,6 +2105,60 @@ class _HTTPBridgeStreamingMixin:
                 owner_failure_reason = "owner_quota_exhausted" if owner_quota_exhausted else "owner_unavailable"
             return allowed and durable_full_resend_allows_account_neutral_replay()
 
+        async def prepare_durable_ownerless_replay() -> bool:
+            """Build a portable body when the bridge owner is not routable.
+
+            The normal bridge path can prove a client full resend from the
+            stored prefix fingerprint.  A Codex continuation often contains
+            only a delta, however; in that case the durable event spool is the
+            only complete source.  Populate the same replay slot consumed by
+            ``switch_to_account_neutral_replay`` so all handoff paths share
+            one session/operation rebind implementation.
+            """
+
+            nonlocal durable_full_resend_fresh_payload
+            nonlocal durable_full_resend_is_account_neutral
+            nonlocal durable_full_resend_retains_prior_output
+            previous_response_id = request_state.previous_response_id
+            if previous_response_id is None or rewritten_file_account_id is not None:
+                return False
+            if request_state.preferred_account_id is not None:
+                fresh_replay_excluded_account_ids.add(request_state.preferred_account_id)
+            # Prefer the body already proved portable while this request was
+            # built.  Recovery decisions elsewhere are gated on that same slot,
+            # so re-deriving it here could disagree with the gate and turn a
+            # turn we promised to recover into a hard client failure.  The
+            # durable spool remains the fallback for requests whose body was
+            # never resolved up front.
+            replay_text: str | None = None
+            if request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text:
+                replay_text = request_state.fresh_upstream_request_text
+            get_transcript = getattr(self._durable_bridge, "get_replayable_transcript", None)
+            if replay_text is None and not callable(get_transcript):
+                return False
+            try:
+                if replay_text is None and callable(get_transcript):
+                    transcript = await get_transcript(response_id=previous_response_id)
+                    replay_text = project_durable_transcript_for_account_neutral_quota_replay(
+                        transcript or (),
+                        current_request_text=request_state.request_text,
+                    )
+                if replay_text is None:
+                    return False
+                replay_payload = ResponsesRequest.model_validate(json.loads(replay_text))
+            except Exception:
+                logger.warning(
+                    "Failed to rebuild durable bridge ownerless replay request_id=%s response_id=%s",
+                    request_id,
+                    previous_response_id,
+                    exc_info=True,
+                )
+                return False
+            durable_full_resend_fresh_payload = replay_payload
+            durable_full_resend_is_account_neutral = True
+            durable_full_resend_retains_prior_output = True
+            return True
+
         def switch_to_account_neutral_replay() -> None:
             nonlocal owner_failure_reason
             nonlocal account_neutral_recovery
@@ -2000,8 +2177,6 @@ class _HTTPBridgeStreamingMixin:
             nonlocal client_full_resend_fresh_upstream_request_text
             nonlocal fresh_upstream_request_text
             nonlocal incoming_turn_state_header
-            nonlocal previous_response_trimmed_input_count
-            nonlocal previous_response_trimmed_input_fingerprint
             nonlocal proxy_injected_previous_response_id
             nonlocal request_state
             nonlocal session_creation_headers
@@ -2009,7 +2184,18 @@ class _HTTPBridgeStreamingMixin:
             nonlocal text_data
             nonlocal untrimmed_effective_payload
 
-            preserve_operation_identity = durable_recovery_attempt_claimed or durable_recovery_fresh_replay
+            # A transport close or pre-dispatch owner rejection may already
+            # have registered this request in the durable operation ledger.
+            # Once the operation is explicitly marked rebindable, carry its
+            # fingerprint/id into the account-neutral replay instead of
+            # creating a second logical operation that the client cannot
+            # correlate.  The flag is only set after a complete replay body
+            # has been verified (or reconstructed from the durable spool).
+            preserve_operation_identity = (
+                durable_recovery_attempt_claimed
+                or durable_recovery_fresh_replay
+                or request_state.operation_rebind_required
+            )
             prior_operation_id = request_state.operation_id if preserve_operation_identity else None
             prior_operation_fingerprint = request_state.operation_fingerprint if preserve_operation_identity else None
             prior_operation_parent_response_id = (
@@ -2074,8 +2260,6 @@ class _HTTPBridgeStreamingMixin:
             proxy_injected_previous_response_id = False
             fresh_upstream_request_text = None
             client_full_resend_fresh_upstream_request_text = None
-            previous_response_trimmed_input_count = None
-            previous_response_trimmed_input_fingerprint = None
             durable_full_resend_anchor_count = None
             durable_full_resend_anchor_fingerprint = None
             durable_full_resend_fresh_payload = None
@@ -2110,7 +2294,7 @@ class _HTTPBridgeStreamingMixin:
             )
             switch_to_account_neutral_replay()
 
-        if required_continuity_owner_missing:
+        if required_continuity_owner_missing and not durable_ownerless_replay_prepared:
             owner_unavailable = ProxyResponseError(
                 502,
                 openai_error(
@@ -2178,6 +2362,10 @@ class _HTTPBridgeStreamingMixin:
                 )
             except ProxyResponseError as exc:
                 owner_replay_allowed = owner_unavailable_allows_account_neutral_replay(exc)
+                if not owner_replay_allowed and _http_bridge_is_previous_response_owner_unavailable(exc):
+                    owner_replay_allowed = await prepare_durable_ownerless_replay()
+                    if owner_replay_allowed:
+                        owner_failure_reason = "owner_unavailable"
                 if not owner_replay_allowed:
                     exc_code, _exc_message = _proxy_error_code_message(exc)
                     if not unanchored_fork_spill_attempted and _http_bridge_unanchored_fork_can_spill_on_cap(
@@ -2848,6 +3036,15 @@ class _HTTPBridgeStreamingMixin:
                 store_context_trim_applied = True
                 store_context_original_count = len(incoming_input_list)
                 store_context_original_fingerprint = _fingerprint_input_items(incoming_input_list)
+                # Keep an anchor-free copy for a later definitive quota
+                # failover.  The normal same-account request may still use
+                # the compact suffix below, but a replacement account must
+                # receive the complete transcript rather than the historical
+                # ``568 -> 3`` slice.
+                _fresh_state, client_full_resend_fresh_upstream_request_text = prepare_bridge_request(
+                    _http_bridge_payload_without_previous_response_id(untrimmed_effective_payload)
+                )
+                del _fresh_state
                 submit_payload = effective_payload.model_copy(update={"input": incoming_input_list[stored_count:]})
                 logger.info(
                     "store_context_input_trimmed request_id=%s original_items=%s trimmed_to=%s previous_response_id=%s",
@@ -2899,9 +3096,6 @@ class _HTTPBridgeStreamingMixin:
                 # so the client's next full resend can prefix-match it.
                 request_state.input_item_count = store_context_original_count
                 request_state.input_full_fingerprint = store_context_original_fingerprint
-            elif previous_response_trimmed_input_count is not None:
-                request_state.input_item_count = previous_response_trimmed_input_count
-                request_state.input_full_fingerprint = previous_response_trimmed_input_fingerprint
             if proxy_injected_previous_response_id:
                 request_state.proxy_injected_previous_response_id = True
                 # Unlike ``fresh_upstream_request_is_retry_safe`` below, this
@@ -3322,6 +3516,78 @@ class _HTTPBridgeStreamingMixin:
                     allow_previous_response_recovery_rebind = False
                 else:
                     durable_recovery_attempt_available = False
+            # A transport-level websocket close can carry no explicit quota
+            # frame.  When it interrupts a pre-visible delta continuation,
+            # the only safe way to move accounts is to rebuild the complete
+            # predecessor chain from the durable event spool.  Do this before
+            # the legacy local-owner recovery branches; those branches retain
+            # the old previous_response_id and therefore reconnect to the
+            # same account that just closed.
+            durable_ownerless_transport_recovery = False
+            if (
+                _http_bridge_error_is_ambiguous_transport(exc)
+                and request_state.previous_response_id is not None
+                and rewritten_file_account_id is None
+                # ``response.created``/``response.in_progress`` and output
+                # metadata are lifecycle acknowledgements, not model output.
+                # Upstream may emit several of them before closing a quota-
+                # exhausted socket, so the count alone must not disable the
+                # durable ownerless replay path.
+                and not request_state.downstream_visible
+                and not request_state.upstream_model_output_seen
+                and request_state.last_downstream_sequence_number is None
+            ):
+                try:
+                    durable_ownerless_transport_recovery = await prepare_durable_ownerless_replay()
+                except Exception:
+                    durable_ownerless_transport_recovery = False
+                    logger.warning(
+                        "Failed to prepare durable ownerless replay after eventless upstream close request_id=%s",
+                        request_id,
+                        exc_info=True,
+                    )
+                if durable_ownerless_transport_recovery:
+                    # The request was registered before the close.  Mark the
+                    # ambiguous operation rebindable so the replacement can
+                    # reuse its id/fingerprint and the old owner cannot fence
+                    # the next send as an in-flight duplicate.
+                    request_state.operation_rebind_required = True
+                    update_operation = getattr(self._durable_bridge, "update_operation", None)
+                    operation_id = getattr(request_state, "operation_id", None)
+                    owner_epoch = getattr(session, "durable_owner_epoch", None)
+                    durable_session_id = getattr(session, "durable_session_id", None)
+                    if (
+                        operation_id
+                        and durable_session_id is not None
+                        and owner_epoch is not None
+                        and callable(update_operation)
+                    ):
+                        try:
+                            await update_operation(
+                                operation_id=operation_id,
+                                session_id=durable_session_id,
+                                instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                                owner_epoch=owner_epoch,
+                                state="failed",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to mark eventless HTTP bridge operation rebindable operation_id=%s",
+                                operation_id,
+                                exc_info=True,
+                            )
+                    await self._reset_http_bridge_session_after_local_terminal_error(
+                        session,
+                        error_code="stream_incomplete",
+                        error_message="Upstream websocket closed before response.completed",
+                    )
+                    switch_to_account_neutral_replay()
+                    recovery_path = "durable_ownerless_transport"
+                    retry_payload = effective_payload
+                    retry_previous_response_id = None
+                    retry_request_stage = "durable_recovery"
+                    retry_preferred_account_id = None
+                    allow_previous_response_recovery_rebind = False
             is_context_overflow = _http_bridge_is_context_overflow_error(exc)
             should_rollover_after_context_overflow = _http_bridge_should_rollover_after_context_overflow(
                 exc,
@@ -3341,6 +3607,7 @@ class _HTTPBridgeStreamingMixin:
                 and not should_rollover_after_context_overflow
                 and not should_attempt_context_overflow_fresh_turn_recovery
                 and not durable_recovery_fresh_replay
+                and not durable_ownerless_transport_recovery
             ):
                 if is_context_overflow:
                     _log_http_bridge_event(
@@ -3355,7 +3622,7 @@ class _HTTPBridgeStreamingMixin:
                     )
                 raise
 
-            if durable_recovery_fresh_replay:
+            if durable_recovery_fresh_replay or durable_ownerless_transport_recovery:
                 pass
             elif should_attempt_context_overflow_fresh_turn_recovery:
                 if PROMETHEUS_AVAILABLE and bridge_durable_recover_total is not None:
@@ -4592,6 +4859,43 @@ class _HTTPBridgeStreamingMixin:
                 else:
                     event_block = await event_queue.get()
                 if event_block is None:
+                    # The upstream reader closes the queue when its socket
+                    # ends without a terminal response.  For a delta
+                    # continuation this is indistinguishable from a quota
+                    # close at the wire level, and returning here would leak
+                    # the raw ``stream disconnected`` failure to Codex before
+                    # the outer recovery planner can consult the durable
+                    # transcript.  Raise the canonical ambiguous transport
+                    # error only while no downstream output/sequence has
+                    # been observed; the outer method will attempt a full,
+                    # account-neutral durable replay and otherwise preserve
+                    # the existing fail-closed contract.
+                    if (
+                        request_state.previous_response_id is not None
+                        # Multiple lifecycle frames can precede an
+                        # eventless/quota close.  Replay remains safe until a
+                        # visible model event or downstream sequence exists.
+                        and not request_state.downstream_visible
+                        and not request_state.upstream_model_output_seen
+                        and request_state.last_downstream_sequence_number is None
+                        and not request_state.file_required_preferred_account
+                        # Only signal the recoverable error when a portable
+                        # body actually exists.  The replay body is resolved
+                        # once while the request is built, so this stays a
+                        # local check.  Without it an unrecoverable close is
+                        # escalated from a graceful stream end into a hard
+                        # client-visible failure -- strictly worse than the
+                        # behaviour it replaced.
+                        and not _http_bridge_continuity_bound_without_safe_replay(request_state)
+                    ):
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "stream_incomplete",
+                                "Upstream websocket closed before response.completed",
+                                error_type="server_error",
+                            ),
+                        )
                     break
                 keepalive_count = 0
                 # A real upstream event means the stream is active again; do
@@ -4619,6 +4923,30 @@ class _HTTPBridgeStreamingMixin:
                 ):
                     session.upstream_control.reconnect_requested = True
                     request_state.error_http_status_override = 502
+                    if (
+                        not yielded_any
+                        and not request_state.downstream_visible
+                        and not request_state.upstream_model_output_seen
+                        and request_state.last_downstream_sequence_number is None
+                        and not _http_bridge_continuity_bound_without_safe_replay(request_state)
+                    ):
+                        # Upstream rejected the anchor, but a complete
+                        # account-neutral body for this turn is on hand and the
+                        # client has seen nothing yet.  Surface the recoverable
+                        # error so the outer planner replays without the dead
+                        # anchor -- the official client does the same thing by
+                        # resetting its websocket session and resending the full
+                        # input.  Yielding the terminal event here instead is
+                        # what stranded the turn and let the next reattach
+                        # re-inject the same dead anchor.
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "stream_incomplete",
+                                "Upstream websocket closed before response.completed",
+                                error_type="server_error",
+                            ),
+                        )
                     (
                         event_block,
                         _event,

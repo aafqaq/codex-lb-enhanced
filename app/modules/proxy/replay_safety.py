@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import cast
 from urllib.parse import urlsplit
@@ -992,6 +992,197 @@ def project_responses_text_for_account_neutral_quota_replay(
         separators=(",", ":"),
         ensure_ascii=False,
     )
+
+
+def project_durable_transcript_for_account_neutral_quota_replay(
+    transcript: Sequence[object],
+    *,
+    current_request_text: str | None,
+) -> str | None:
+    """Rebuild a complete fresh request from a durable response chain.
+
+    Codex normally sends only ``previous_response_id`` on a continuation.
+    That identifier is owned by the account that created it, so it cannot be
+    replayed after a definitive quota rejection on another account.  The
+    HTTP bridge event spool already contains the request body and terminal
+    response for each completed parent turn; this function combines those
+    records with the current client suffix and runs the same strict
+    account-neutral projection used for full client resends.
+
+    The function is deliberately pure and fail-closed.  It accepts the
+    repository's transcript snapshots structurally (``operation.request_text``
+    and ``events``) to avoid importing the persistence layer into this module.
+    Missing request bodies, malformed events, or a non-list current input
+    return ``None`` rather than silently dropping conversational context.
+    """
+
+    if not transcript or not isinstance(current_request_text, str):
+        return None
+    try:
+        current_payload = json.loads(current_request_text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(current_payload, dict):
+        return None
+    current_input = current_payload.get("input")
+    if not isinstance(current_input, (list, str)):
+        return None
+
+    reconstructed_input: list[JsonValue] = []
+    for turn in transcript:
+        operation = getattr(turn, "operation", None)
+        request_text = getattr(operation, "request_text", None)
+        events = getattr(turn, "events", None)
+        if not isinstance(request_text, str) or not isinstance(events, Sequence):
+            return None
+        try:
+            operation_payload = json.loads(request_text)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(operation_payload, dict):
+            return None
+        operation_input = operation_payload.get("input")
+        if isinstance(operation_input, str):
+            operation_input = [_text_input_item(operation_input)]
+        if not isinstance(operation_input, list):
+            return None
+        operation_items = cast(list[JsonValue], operation_input)
+        if reconstructed_input:
+            # Some older bridge rows persisted a client full-resend body even
+            # though the operation also points at its parent response.  Do
+            # not duplicate that prefix when rebuilding a durable chain.  A
+            # suffix-only continuation has no matching prefix and is appended
+            # unchanged.  Canonical JSON comparison keeps this independent of
+            # dictionary insertion order while preserving every item after
+            # the verified overlap.
+            overlap = 0
+            max_overlap = min(len(reconstructed_input), len(operation_items))
+            for candidate in range(max_overlap, 1, -1):
+                if all(
+                    _canonical_replay_item(reconstructed_input[index]) == _canonical_replay_item(operation_items[index])
+                    for index in range(candidate)
+                ):
+                    overlap = candidate
+                    break
+            reconstructed_input.extend(operation_items[overlap:])
+        else:
+            reconstructed_input.extend(operation_items)
+        terminal_output = _terminal_response_output_items(events)
+        if terminal_output is None:
+            return None
+        reconstructed_input.extend(terminal_output)
+
+    # The current failed turn was not accepted by the exhausted account, so
+    # its client-supplied suffix is safe to append as the final turn.
+    if isinstance(current_input, str):
+        reconstructed_input.append(_text_input_item(current_input))
+    else:
+        # Codex may send either a delta suffix or a complete local transcript
+        # after reconnecting.  Appending a complete resend verbatim would
+        # duplicate every prior turn in the rebuilt body.  Keep only the
+        # portion not already represented by the durable chain.
+        current_items = cast(list[JsonValue], current_input)
+        overlap = _replay_prefix_overlap(reconstructed_input, current_items)
+        reconstructed_input.extend(current_items[overlap:])
+    replay_payload = dict(current_payload)
+    replay_payload["input"] = reconstructed_input
+    replay_payload.pop("previous_response_id", None)
+    # Use the strict projector directly.  The text wrapper falls back to a
+    # lenient projection for anchor-free bodies, which exists to forgive
+    # unfamiliar fields in a transcript the *client* assembled.  This body was
+    # assembled here, so an item the strict contract rejects -- an unsettled
+    # tool call, a non-portable tool, account-owned state -- means the rebuild
+    # is wrong and must fail closed instead of being sent to a new account.
+    projected = project_responses_payload_for_account_neutral_quota_replay(replay_payload)
+    if projected is None:
+        return None
+    return json.dumps(
+        {"type": "response.create", **projected},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _text_input_item(value: str) -> dict[str, JsonValue]:
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": value}],
+    }
+
+
+def _canonical_replay_item(item: JsonValue) -> str:
+    """Return a stable representation for durable transcript overlap checks."""
+
+    return json.dumps(item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _replay_prefix_overlap(reconstructed: list[JsonValue], current: list[JsonValue]) -> int:
+    """Return the current-input prefix already present in durable history."""
+
+    if not reconstructed or not current:
+        return 0
+    max_overlap = min(len(reconstructed), len(current))
+    # Full client resends normally begin at the first user message, so prefer
+    # the longest common prefix.  A partial resend may begin at a later
+    # boundary; then match the durable tail to the current prefix as a safe
+    # secondary form.  Never drop a non-matching suffix.
+    for candidate in range(max_overlap, 0, -1):
+        if all(
+            _canonical_replay_item(reconstructed[index]) == _canonical_replay_item(current[index])
+            for index in range(candidate)
+        ):
+            return candidate
+    for candidate in range(max_overlap, 0, -1):
+        if all(
+            _canonical_replay_item(reconstructed[-candidate + index]) == _canonical_replay_item(current[index])
+            for index in range(candidate)
+        ):
+            return candidate
+    return 0
+
+
+def _terminal_response_output_items(events: Sequence[object]) -> list[JsonValue] | None:
+    """Extract the output array from a durable terminal SSE event."""
+
+    completed_items: list[JsonValue] = []
+    saw_terminal = False
+    for event_text in events:
+        if not isinstance(event_text, str):
+            continue
+        for line in event_text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            raw_data = line[5:].strip()
+            if not raw_data or raw_data == "[DONE]":
+                continue
+            try:
+                event_payload = json.loads(raw_data)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event_payload, dict):
+                continue
+            event_type = event_payload.get("type")
+            if event_type == "response.output_item.done":
+                item = event_payload.get("item")
+                if isinstance(item, dict):
+                    completed_items.append(cast(JsonValue, item))
+                continue
+            if event_type not in {"response.completed", "response.incomplete"}:
+                continue
+            saw_terminal = True
+            response = event_payload.get("response")
+            if not isinstance(response, dict):
+                continue
+            output = response.get("output")
+            if isinstance(output, list):
+                return cast(list[JsonValue], output)
+    # Some upstream versions omit ``response.output`` from an incomplete
+    # terminal event while still emitting every ``response.output_item.done``
+    # frame.  The durable transcript is complete enough in that shape to
+    # preserve model/tool context; without a terminal marker it is not safe to
+    # infer that the operation settled.
+    return completed_items if saw_terminal else None
 
 
 def _fallback_fresh_responses_payload(

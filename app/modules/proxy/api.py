@@ -6824,11 +6824,14 @@ async def _wait_for_first_stream_probe(
     timeout_seconds: float,
     capacity_wait_event: asyncio.Event | None,
     capacity_ready_event: asyncio.Event | None = None,
+    capacity_marker_seen: list[bool] | None = None,
 ) -> bool:
     try:
         done, _pending = await asyncio.wait({first_task}, timeout=timeout_seconds)
         if done:
             if capacity_wait_event is not None and capacity_wait_event.is_set():
+                if capacity_marker_seen is not None:
+                    capacity_marker_seen[0] = True
                 capacity_wait_event.clear()
             return True
         if capacity_wait_event is None:
@@ -6848,9 +6851,13 @@ async def _wait_for_first_stream_probe(
         while True:
             if first_task.done():
                 if capacity_wait_event.is_set():
+                    if capacity_marker_seen is not None:
+                        capacity_marker_seen[0] = True
                     capacity_wait_event.clear()
                 return True
             if capacity_wait_event.is_set():
+                if capacity_marker_seen is not None:
+                    capacity_marker_seen[0] = True
                 recovery_ready_task = (
                     asyncio.create_task(capacity_ready_event.wait()) if capacity_ready_event is not None else None
                 )
@@ -6858,10 +6865,23 @@ async def _wait_for_first_stream_probe(
                     recovery_waiters = {first_task}
                     if recovery_ready_task is not None:
                         recovery_waiters.add(recovery_ready_task)
+                    recovery_remaining = max(
+                        0.0,
+                        signal_discovery_deadline - asyncio.get_running_loop().time(),
+                    )
+                    if recovery_remaining <= 0:
+                        return False
                     recovery_done, _pending = await asyncio.wait(
                         recovery_waiters,
+                        timeout=recovery_remaining,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
+                    if not recovery_done:
+                        # A marker is level-triggered, so repeated ``set``
+                        # calls can leave it set after the first item arrives.
+                        # Bound this wait by the same discovery window instead
+                        # of waiting indefinitely for a later stream item.
+                        return False
                     if first_task not in recovery_done:
                         # Re-read the paired level state. The ready signal has
                         # cleared the wait that recovered, but a newer wait may
@@ -6893,13 +6913,31 @@ async def _wait_for_first_stream_probe(
                 )
                 return bool(post_ready_done)
 
+            signal_discovery_remaining = max(
+                0.0,
+                signal_discovery_deadline - asyncio.get_running_loop().time(),
+            )
+            if capacity_ready_event is None:
+                # On Windows' ProactorEventLoop, a timeout on ``asyncio.wait``
+                # can remain pending while the first-item task is blocked on
+                # an async-generator ``Event``.  A plain sleep has reliable
+                # timer semantics there; inspect the level-triggered marker
+                # and first-item task after the bounded discovery window.
+                await asyncio.sleep(signal_discovery_remaining)
+                if first_task.done():
+                    if capacity_wait_event.is_set() and capacity_marker_seen is not None:
+                        capacity_marker_seen[0] = True
+                        capacity_wait_event.clear()
+                    return True
+                if capacity_wait_event.is_set():
+                    if capacity_marker_seen is not None:
+                        capacity_marker_seen[0] = True
+                    continue
+                return False
+
             marker_task = asyncio.create_task(capacity_wait_event.wait())
             ready_task = asyncio.create_task(capacity_ready_event.wait()) if capacity_ready_event is not None else None
             try:
-                signal_discovery_remaining = max(
-                    0.0,
-                    signal_discovery_deadline - asyncio.get_running_loop().time(),
-                )
                 if signal_discovery_remaining <= 0:
                     return False
                 signal_waiters = {first_task, marker_task}
@@ -7346,12 +7384,20 @@ async def _probe_chat_stream_startup_error(
 ) -> tuple[AsyncIterator[str], ProxyResponseError | OpenAIErrorEnvelopeModel | None]:
     buffered: list[str] = []
     for _ in range(max_startup_events):
+        # Discard any level-triggered marker left over from the previous
+        # startup event before beginning the next bounded probe.  Otherwise a
+        # repeated ``set`` that happened while the event was already set can
+        # make the next probe take its extended recovery path indefinitely.
+        if capacity_wait_event is not None:
+            capacity_wait_event.clear()
+        marker_seen = [False]
         first_task = _create_first_stream_probe_task(stream)
         probe_done = await _wait_for_first_stream_probe(
             first_task,
             timeout_seconds=timeout_seconds,
             capacity_wait_event=capacity_wait_event,
             capacity_ready_event=capacity_ready_event,
+            capacity_marker_seen=marker_seen,
         )
         if not probe_done:
             return _prepend_items(buffered, _prepend_first_task(first_task, stream)), None
@@ -7373,6 +7419,16 @@ async def _probe_chat_stream_startup_error(
         event_type = payload.get("type") if payload else None
         buffered.append(first)
         if event_type in _CHAT_COMPLETIONS_STARTUP_EVENT_TYPES:
+            # ``asyncio.Event`` is level-triggered: a second marker arriving
+            # while the first one is still set does not create a distinct
+            # wake-up.  Once the startup event itself has been observed, any
+            # marker left over from that same admission cycle is stale; clear
+            # it before probing the next item so a blocked stream cannot make
+            # the startup probe wait indefinitely.
+            if capacity_wait_event is not None:
+                capacity_wait_event.clear()
+            if marker_seen[0]:
+                return _prepend_items(buffered, stream), None
             continue
         return _prepend_items(buffered, stream), None
     return _prepend_items(buffered, stream), None

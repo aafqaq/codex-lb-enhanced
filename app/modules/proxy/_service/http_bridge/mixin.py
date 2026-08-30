@@ -221,6 +221,7 @@ from app.modules.proxy.continuity import (
     without_http_bridge_session_affinity_headers,
 )
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
+from app.modules.proxy.helpers import account_exhaustion_code_for_failover
 from app.modules.proxy.load_balancer import CONTINUITY_OWNER_UNAVAILABLE, AccountLease
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
@@ -2063,7 +2064,12 @@ class _HTTPBridgeMixin(
             settings = await _service_get_settings_cache().get()
             session.api_key = request_state.api_key
             forced_refresh_account_id = request_state.force_refresh_account_id
-            excluded_account_ids: set[str] = set(request_state.excluded_account_ids)
+            # The bridge session owns the canonical exclusion ledger.  Merge
+            # the request-local set for compatibility with older states, but
+            # never discard accounts already rejected by a prior continuation.
+            excluded_account_ids: set[str] = set(session.failover_state.failed_account_ids)
+            excluded_account_ids.update(request_state.excluded_account_ids)
+            session.failover_state.failed_account_ids.update(excluded_account_ids)
             requested_preferred_account_id = resolve_reconnect_preferred_account_id(
                 request_state, session.account.id, require_preferred_account, account_neutral_recovery
             )
@@ -2168,6 +2174,7 @@ class _HTTPBridgeMixin(
 
         while True:
             reuse_current_account_lease = preferred_candidate_id == session.account.id and bool(session.account_lease)
+            session.failover_state.failed_account_ids.update(excluded_account_ids)
             try:
                 selection = await self._select_account_with_budget_for_stream(
                     deadline,
@@ -2199,6 +2206,11 @@ class _HTTPBridgeMixin(
                 complete_failed_handoff()
                 raise
             account = selection.account
+            if account is not None:
+                exhausted_owner = session.quota_failure_account_id
+                if exhausted_owner is not None and account.id != exhausted_owner:
+                    session.quota_failure_account_id = None
+                    session.quota_failure_at = None
             if (
                 account is not None
                 and account.id in excluded_account_ids
@@ -2236,6 +2248,10 @@ class _HTTPBridgeMixin(
                 except BaseException:
                     complete_failed_handoff()
                     raise
+                selection_quota_code = account_exhaustion_code_for_failover(
+                    selection.error_code,
+                    selection.error_message,
+                )
                 if account_neutral_recovery and selection.error_code == CONTINUITY_OWNER_UNAVAILABLE:
                     complete_failed_handoff()
                     raise _http_bridge_previous_response_owner_unavailable_error()
@@ -2247,12 +2263,12 @@ class _HTTPBridgeMixin(
                 ):
                     preferred_candidate_id = None
                     continue
-                if selection.error_code == USAGE_LIMIT_REACHED and (
+                if selection_quota_code is not None and (
                     required_preferred_account_id is not None or hard_close_account_bound
                 ):
                     complete_failed_handoff()
                     raise _http_bridge_previous_response_owner_unavailable_error()
-                if selection.error_code == USAGE_LIMIT_REACHED:
+                if selection_quota_code is not None:
                     record_selected_account_takeover(None)
                     status_code, error_payload = selection_failure_response(selection)
                     complete_failed_handoff()

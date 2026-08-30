@@ -73,6 +73,7 @@ from app.core.errors import (
 )
 from app.core.exceptions import AppError, ProxyAuthError
 from app.core.openai.exceptions import ClientPayloadError
+from app.core.openai.failover import OpenAIFailoverState, OpenAIFailure, OpenAIFailureClass
 from app.core.openai.models import OpenAIEvent
 from app.core.openai.parsing import (
     _LIFECYCLE_EVENT_TYPES,
@@ -90,7 +91,7 @@ from app.core.resilience.network_recovery import (
 )
 from app.core.types import JsonValue
 from app.core.upstream_proxy import UpstreamProxyRouteError
-from app.core.utils.request_id import get_request_id, reset_request_id, set_request_id
+from app.core.utils.request_id import ensure_request_id, get_request_id, reset_request_id, set_request_id
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
 from app.core.utils.sse import format_sse_event
 from app.core.utils.time import utcnow as utcnow
@@ -341,6 +342,7 @@ from app.modules.proxy._service.support import (
     _StreamSettlement,
     _wait_for_websocket_continuity_gap,
     _websocket_full_replay_should_wait_for_continuity,
+    _websocket_recovery_source_text,
     _WebSocketConnectFailureEmitted,
     _WebSocketContinuityState,
     _WebSocketReceiveTimeout,
@@ -405,8 +407,11 @@ from app.modules.proxy._service.websocket.helpers import (
     _prepare_websocket_request_state_for_auth_replay,
     _prepare_websocket_request_state_for_visible_output_replay,
     _record_websocket_continuity_completion,
+    _record_websocket_quota_failure,
     _record_websocket_responses_lite_acceptance,
     _record_websocket_stale_anchor_failure,
+    _record_websocket_transport_failure,
+    _refresh_websocket_request_input_fingerprint_from_text,
     _release_websocket_response_create_gate,
     _rewrite_websocket_continuity_corruption_event,
     _rewrite_websocket_downstream_response_id,
@@ -416,7 +421,6 @@ from app.modules.proxy._service.websocket.helpers import (
     _sanitize_websocket_previous_response_error,
     _sanitize_websocket_terminal_error_fields,
     _serialize_websocket_error_event,
-    _trim_websocket_previous_response_input_items,
     _upstream_websocket_disconnect_message,
     _websocket_auth_failure_requires_reauth,
     _websocket_capability_metadata_values,
@@ -437,6 +441,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_precreated_auth_error_code,
     _websocket_precreated_replay_fallback_error,
     _websocket_precreated_retry_error_code,
+    _websocket_quota_failure_account_id,
     _websocket_receive_timeout_for_pending_requests,
     _websocket_response_id,
     _websocket_transport_failure_account_id,
@@ -475,6 +480,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
     _upstream_error_from_openai,
+    account_exhaustion_code_for_failover,
     upstream_usage_limit_error_code,
 )
 from app.modules.proxy.http_bridge_forwarding import (
@@ -484,6 +490,10 @@ from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection, effective_account_concurrency_caps
+from app.modules.proxy.replay_safety import (
+    project_durable_transcript_for_account_neutral_quota_replay,
+    project_responses_payload_for_account_neutral_quota_replay,
+)
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_enforced_service_tier_model_fallback,
@@ -513,6 +523,17 @@ def _facade() -> Any:
 logger = logging.getLogger(__name__)
 
 _WEBSOCKET_PINNED_REFRESH_UNAVAILABLE_MESSAGE = "Account refresh is temporarily unavailable; retry later."
+# Failure classes that are a verdict about the *account* rather than about one
+# connection attempt.  Only these may enter the request-scoped failover ledger
+# and therefore exclude the account from later turns; transport noise stays
+# local to the connect loop that observed it.
+_WEBSOCKET_ACCOUNT_SCOPED_FAILURE_CLASSES = frozenset(
+    {
+        OpenAIFailureClass.QUOTA_EXHAUSTED,
+        OpenAIFailureClass.AUTHENTICATION,
+        OpenAIFailureClass.MODEL_UNSUPPORTED,
+    }
+)
 # Scope teardown coordinates several request/lease finalizers; keep its normal
 # observation budget separate from the short generic child-task cancel bound.
 _WEBSOCKET_SCOPE_CLEANUP_TIMEOUT_SECONDS = 5.0
@@ -521,6 +542,76 @@ _CAPABILITY_REQUIRED_NO_AUTHORIZED_ACCOUNTS_MESSAGE = (
     "security-work-authorized. codex-lb did not fall back to an ordinary account."
 )
 _CAPABILITY_REQUIRED_NO_AUTHORIZED_ACCOUNTS_ACTION = "fail_closed_capability_routing"
+
+
+async def _prepare_websocket_ownerless_replay(
+    proxy: Any,
+    request_state: _WebSocketRequestState,
+    *,
+    allow_quota_projection: bool = False,
+) -> str | None:
+    """Detach an unavailable owner after producing a complete fresh body.
+
+    Owner affinity is an optimization, not durable conversation state.  When
+    the selected owner is paused, removed, or has exhausted its quota, a
+    continuation carrying only ``previous_response_id`` cannot be sent to a
+    different account.  This helper is the one recovery boundary for that
+    case: use the verified in-request resend first, then rebuild from the
+    durable bridge transcript, and only then clear owner affinity.  If no
+    complete projection exists it returns ``None`` and the caller keeps the
+    existing fail-closed behavior.
+    """
+
+    replay_text = _prepare_websocket_request_state_for_account_switch(
+        request_state,
+        allow_quota_projection=allow_quota_projection,
+    )
+    if replay_text is None and request_state.previous_response_id is not None:
+        get_transcript = getattr(getattr(proxy, "_durable_bridge", None), "get_replayable_transcript", None)
+        if callable(get_transcript):
+            try:
+                transcript = await get_transcript(response_id=request_state.previous_response_id)
+                replay_text = project_durable_transcript_for_account_neutral_quota_replay(
+                    transcript or (),
+                    current_request_text=_websocket_recovery_source_text(request_state),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed websocket ownerless durable replay request_id=%s response_id=%s",
+                    request_state.request_log_id or request_state.request_id,
+                    request_state.previous_response_id,
+                    exc_info=True,
+                )
+        if replay_text is not None:
+            request_state.request_text = replay_text
+            request_state.previous_response_id = None
+            request_state.proxy_injected_previous_response_id = False
+            request_state.preferred_account_id = None
+            request_state.replay_required_account_id = None
+            request_state.file_required_preferred_account = False
+            request_state.fresh_upstream_request_text = None
+            request_state.fresh_upstream_request_is_retry_safe = False
+
+    if replay_text is None:
+        return None
+
+    # A replay body is account-neutral by construction.  Clear every
+    # account-owned affinity source together so the selector cannot rediscover
+    # the paused/exhausted owner through a legacy or prompt-cache key.
+    request_state.affinity_policy = replace(
+        request_state.affinity_policy,
+        key=None,
+        kind=None,
+        codex_session_source=None,
+        legacy_codex_session_key=None,
+        legacy_continuity_source=None,
+        seed_selection_key=None,
+        seed_selection_kind=None,
+        require_unambiguous_account=False,
+        reallocate_sticky=True,
+    )
+    _refresh_websocket_request_input_fingerprint_from_text(request_state)
+    return replay_text
 
 
 class _WebSocketReplaySequenceRegression(Exception):
@@ -1200,6 +1291,7 @@ async def _process_upstream_websocket_transport_end(
     upstream_control: _WebSocketUpstreamControl,
     response_create_gate: asyncio.Semaphore,
     downstream_activity: _DownstreamWebSocketActivity,
+    continuity_state: "_WebSocketContinuityState | None" = None,
 ) -> bool:
     """Finalize only requests that crossed this transport's send boundary."""
 
@@ -1248,11 +1340,65 @@ async def _process_upstream_websocket_transport_end(
     # close/error transport failures must flow through the normal penalty and
     # failover path.
     account_neutral = is_account_neutral_websocket_error_code(message_error_code)
+    # Preserve the failed owner across the next client retry.  The marker is
+    # intentionally separate from account-health penalties: a frame-less
+    # close/reset can be a route hiccup, but selecting the same sticky owner
+    # immediately is still the exact loop that caused repeated
+    # ``stream_incomplete`` failures in production.
+    _record_websocket_transport_failure(
+        continuity_state,
+        account_id=account_id_value,
+    )
     replay_request_state = await _pop_replayable_precreated_websocket_request_state(
         reader_owned,
         pending_lock=anyio.Lock(),
         replay_refusal_reasons=replay_refusal_reasons,
     )
+    if replay_request_state is None and len(reader_owned) == 1:
+        # A frame-less close is often the only signal emitted when the
+        # upstream account has just crossed its quota window.  The in-memory
+        # request may be a delta continuation, so the strict pre-created
+        # replay helper cannot prove a portable body and would otherwise
+        # surface ``stream_incomplete`` immediately.  Before failing closed,
+        # use the durable response spool to rebuild an account-neutral full
+        # request.  The same visibility guards below remain in force: once
+        # model output, a tool side effect, or a downstream sequence frame was
+        # observed, replay is intentionally refused to avoid duplication.
+        durable_candidate = reader_owned[0]
+        if (
+            durable_candidate.previous_response_id is not None
+            # Several response lifecycle acknowledgements may be present
+            # before an unframed close.  Only visible model output, a tool
+            # side effect, or a downstream sequence makes account-neutral
+            # replay unsafe.
+            and not durable_candidate.downstream_visible
+            and not durable_candidate.upstream_model_output_seen
+            and durable_candidate.last_downstream_sequence_number is None
+            and not durable_candidate.file_required_preferred_account
+            and not downstream_activity.disconnected
+        ):
+            durable_replay_text = await _prepare_websocket_ownerless_replay(
+                proxy,
+                durable_candidate,
+                allow_quota_projection=True,
+            )
+            if durable_replay_text is not None:
+                replay_request_state = durable_candidate
+                if _prepare_websocket_request_state_for_visible_output_replay(replay_request_state) is not None:
+                    replay_request_state.excluded_account_ids.add(account_id_value)
+                    replay_request_state.affinity_policy = replace(
+                        replay_request_state.affinity_policy,
+                        reallocate_sticky=True,
+                    )
+                    _refresh_websocket_request_input_fingerprint_from_text(replay_request_state)
+                    _facade().logger.warning(
+                        "Durable websocket replay after eventless upstream close "
+                        "request_id=%s account_id=%s previous_response_id_stripped=true",
+                        replay_request_state.request_log_id or replay_request_state.request_id,
+                        account_id_value,
+                    )
+                else:
+                    replay_request_state = None
     if account_neutral and replay_request_state is None:
         # A sequenced or already-visible request is intentionally terminal:
         # replaying it could duplicate chargeable work or tool side effects.
@@ -2042,6 +2188,27 @@ class _WebSocketMixin:
                         error_message = error.message if error and error.message else "Upstream error"
                         error_type = error.type if error and error.type else "server_error"
                         error_param = error.param if error else None
+                        if request_state.previous_response_id is not None and error_code in {
+                            "previous_response_owner_unavailable",
+                            USAGE_LIMIT_REACHED,
+                            "turn_state_owner_unavailable",
+                        }:
+                            # Owner lookup can fail before the account
+                            # selector runs (for example when an operator
+                            # pauses the current account).  Reuse the same
+                            # account-neutral replay boundary as the selector
+                            # and event-reader paths.
+                            replay_text = await _prepare_websocket_ownerless_replay(
+                                proxy,
+                                request_state,
+                                allow_quota_projection=True,
+                            )
+                            if replay_text is not None:
+                                _facade().logger.info(
+                                    "Recovered websocket owner lookup with durable full replay request_id=%s",
+                                    request_state.request_log_id or request_state.request_id,
+                                )
+                                continue
                         await proxy._release_websocket_request_state_reservation(request_state)
                         await proxy._write_websocket_connect_failure(
                             account_id=None,
@@ -2529,6 +2696,17 @@ class _WebSocketMixin:
                         # normally instead of inheriting stale routing state.
                         continuity_state.transport_failure_account_id = None
                         continuity_state.transport_failure_at = None
+                    quota_failure_account_id = _websocket_quota_failure_account_id(continuity_state)
+                    if (
+                        continuity_state is not None
+                        and quota_failure_account_id is not None
+                        and account.id != quota_failure_account_id
+                    ):
+                        # The pool successfully moved away from the exhausted
+                        # owner; consume the marker and restore normal routing
+                        # semantics for subsequent turns.
+                        continuity_state.quota_failure_account_id = None
+                        continuity_state.quota_failure_at = None
                     await release_current_account_lease()
                     account_lease = request_state.websocket_stream_lease
                     request_state.websocket_stream_lease = None
@@ -3157,8 +3335,6 @@ class _WebSocketMixin:
             responses_payload = responses_payload.model_copy(
                 update={"reasoning": ResponsesReasoning.model_validate(lite_payload["reasoning"])}
             )
-        previous_response_trimmed_input_count: int | None = None
-        previous_response_trimmed_input_fingerprint: str | None = None
         client_full_resend_payload: ResponsesRequest | None = None
         client_full_resend_input_items: list[JsonValue] | None = None
         client_full_resend_retry_safe = False
@@ -3170,13 +3346,6 @@ class _WebSocketMixin:
                 input_value=responses_payload.input,
                 continuity_state=continuity_state,
             )
-            trimmed_input_items = _trim_websocket_previous_response_input_items(previous_response_input_items)
-            if len(trimmed_input_items) != len(previous_response_input_items):
-                previous_response_trimmed_input_count = len(previous_response_input_items)
-                previous_response_trimmed_input_fingerprint = _facade()._fingerprint_input_items(
-                    previous_response_input_items
-                )
-                responses_payload = responses_payload.model_copy(update={"input": trimmed_input_items})
         full_resend_client_metadata = client_metadata
         if client_full_resend_retry_safe and client_full_resend_input_items is not None:
             if trusted_incremental_responses_lite and client_metadata is not None:
@@ -3200,6 +3369,71 @@ class _WebSocketMixin:
         validate_model_access(refreshed_api_key, responses_payload.model)
         proxy._raise_for_unsupported_input_image_references(responses_payload)
         rewritten_file_account_id = await proxy._resolve_file_account_for_responses(responses_payload, headers)
+        # A prior definitive quota frame may have finalized the current
+        # request before the client issued its continuation.  In that case
+        # the previous-response owner is intentionally unavailable, but the
+        # client often still sends a complete input transcript.  Project that
+        # transcript to an account-neutral fresh request *before* resolving
+        # the old owner; otherwise the owner lookup pins the retry back to the
+        # exhausted account and returns ``previous_response_owner_unavailable``.
+        quota_recovery_account_id = _websocket_quota_failure_account_id(continuity_state)
+        quota_recovery_replayed = False
+        if (
+            quota_recovery_account_id is not None
+            and responses_payload.previous_response_id is not None
+            and rewritten_file_account_id is None
+            and isinstance(responses_payload.input, list)
+        ):
+            account_neutral_payload = dict(responses_payload.to_replay_safety_payload())
+            account_neutral_payload["previous_response_id"] = None
+            projected_payload = project_responses_payload_for_account_neutral_quota_replay(account_neutral_payload)
+            if projected_payload is None:
+                get_transcript = getattr(
+                    getattr(proxy, "_durable_bridge", None),
+                    "get_replayable_transcript",
+                    None,
+                )
+                if callable(get_transcript):
+                    try:
+                        transcript = await get_transcript(response_id=responses_payload.previous_response_id)
+                        durable_replay_text = project_durable_transcript_for_account_neutral_quota_replay(
+                            transcript or (),
+                            current_request_text=json.dumps(
+                                {"type": "response.create", **responses_payload.to_replay_safety_payload()},
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                            ),
+                        )
+                        if durable_replay_text is not None:
+                            durable_payload = json.loads(durable_replay_text)
+                            if isinstance(durable_payload, dict):
+                                durable_payload.pop("type", None)
+                                projected_payload = durable_payload
+                    except Exception:
+                        _facade().logger.warning(
+                            "Failed durable websocket quota replay request_id=%s response_id=%s",
+                            ensure_request_id(),
+                            responses_payload.previous_response_id,
+                            exc_info=True,
+                        )
+            if projected_payload is not None:
+                try:
+                    responses_payload = ResponsesRequest.model_validate(projected_payload)
+                except ValidationError:
+                    _facade().logger.warning(
+                        "Quota recovery projection validation failed request_id=%s account_id=%s",
+                        ensure_request_id(),
+                        quota_recovery_account_id,
+                        exc_info=True,
+                    )
+                else:
+                    quota_recovery_replayed = True
+                    client_metadata = responses_payload.to_payload().get("client_metadata")
+                    _facade().logger.info(
+                        "Detached exhausted websocket owner with full transcript replay account_id=%s input_items=%s",
+                        quota_recovery_account_id,
+                        len(responses_payload.input) if isinstance(responses_payload.input, list) else 0,
+                    )
         original_full_resend_payload: ResponsesRequest | None = None
         original_input_item_count: int | None = None
         original_input_fingerprint: str | None = None
@@ -3298,6 +3532,25 @@ class _WebSocketMixin:
         request_state.useragent_group = useragent_group
         request_state.conversation_id = conversation_id
         request_state.client_ip = client_ip
+        request_state.failover_state = OpenAIFailoverState(
+            max_switches=max(int(getattr(_facade(), "_WEBSOCKET_MAX_ACCOUNT_ATTEMPTS", 3)), 1)
+        )
+        if quota_recovery_replayed and quota_recovery_account_id is not None:
+            request_state.failover_state.record_failure(
+                quota_recovery_account_id,
+                OpenAIFailure(
+                    failure_class=OpenAIFailureClass.QUOTA_EXHAUSTED,
+                    code="usage_limit_reached",
+                    message="The usage limit has been reached",
+                    retry_next_account=True,
+                    safe_full_replay=True,
+                ),
+            )
+            request_state.quota_walk_active = True
+            # Keep the legacy set in sync for adapters that still consume it
+            # directly; the controller owns the canonical state.
+            request_state.excluded_account_ids.add(quota_recovery_account_id)
+            request_state.affinity_policy = replace(request_state.affinity_policy, reallocate_sticky=True)
         request_state.raw_source_model = raw_source_model
         request_state.source_route_excluded = source_route_excluded
         request_state.responses_lite_model = next_responses_lite_model
@@ -3335,28 +3588,17 @@ class _WebSocketMixin:
                 responses_payload.model if body_uses_responses_lite else None
             )
             _facade().logger.info(
-                "websocket_session_anchor_injected request_id=%s response_id=%s original_items=%s trimmed_to=%s",
+                "websocket_session_anchor_injected request_id=%s response_id=%s original_items=%s suffix_items=%s "
+                "full_replay_retained=%s",
                 request_state.request_id,
                 session_anchor.previous_response_id,
                 original_input_item_count,
                 len(cast(list[JsonValue], responses_payload.input))
                 if isinstance(responses_payload.input, list)
                 else None,
+                request_state.fresh_upstream_request_is_retry_safe,
             )
         had_prompt_cache_key = _prompt_cache_key_from_request_model(responses_payload) is not None
-        if previous_response_trimmed_input_count is not None:
-            request_state.input_item_count = previous_response_trimmed_input_count
-            request_state.input_full_fingerprint = previous_response_trimmed_input_fingerprint
-            _facade().logger.info(
-                "websocket_previous_response_input_trimmed request_id=%s original_items=%s trimmed_to=%s "
-                "previous_response_id=%s",
-                request_state.request_id,
-                previous_response_trimmed_input_count,
-                len(cast(list[JsonValue], responses_payload.input))
-                if isinstance(responses_payload.input, list)
-                else None,
-                responses_payload.previous_response_id,
-            )
         if client_full_resend_payload is not None and not request_state.proxy_injected_previous_response_id:
             request_state.fresh_upstream_request_text = _facade()._response_create_text_with_size_guard(
                 client_full_resend_payload,
@@ -3620,11 +3862,29 @@ class _WebSocketMixin:
             )
             return None, None
         max_attempts = _facade()._WEBSOCKET_MAX_ACCOUNT_ATTEMPTS
-        excluded_account_ids: set[str] = set(request_state.excluded_account_ids)
+        request_state.failover_state = request_state.failover_state or OpenAIFailoverState(
+            max_switches=max(int(max_attempts), 1)
+        )
+        # Working set for this connect loop only.  It must be a copy: a
+        # transient handshake exclusion is not evidence that the account
+        # failed the request, and aliasing the controller's ledger would let
+        # every such hiccup accumulate in the session-scoped failover state
+        # until the selector reports an empty pool.  Definitive failures below
+        # still go through ``failover_state.record_failure`` and therefore
+        # survive for the rest of the request.
+        excluded_account_ids: set[str] = set(request_state.failover_state.failed_account_ids)
+        excluded_account_ids.update(request_state.excluded_account_ids)
         last_failover_exc: ProxyResponseError | None = None
         last_failover_account: Account | None = None
-        for attempt in range(max_attempts):
+        # A definitive quota response is a per-account result.  Once the
+        # request state enters quota-walk mode, continue selecting through the
+        # eligible pool until the selector itself reports exhaustion.  The
+        # ordinary websocket attempt cap still applies to transport/auth
+        # failures and therefore does not alter normal rotation policy.
+        attempt = 0
+        while attempt < max_attempts or request_state.quota_walk_active:
             is_retry = attempt > 0
+            attempt += 1
             forced_refresh_account_id = request_state.force_refresh_account_id
             preferred_account_id = (
                 request_state.replay_required_account_id
@@ -3761,6 +4021,11 @@ class _WebSocketMixin:
                         ),
                     )
                     return None, None
+                request_state.quota_walk_active = False
+                # A temporarily unavailable refresh is a route condition, not
+                # an account-scoped verdict, so it stays local to this connect
+                # loop.  Excluding it here still moves the walk to another
+                # account without shrinking the pool for later turns.
                 excluded_account_ids.add(failover.account_id)
                 last_failover_exc = refresh_failure
                 last_failover_account = account
@@ -3777,7 +4042,7 @@ class _WebSocketMixin:
                         account=account,
                         exc=exc,
                         request_state=request_state,
-                        attempt=attempt + 1,
+                        attempt=attempt,
                         max_attempts=max_attempts,
                         deterministic_failover_enabled=getattr(base_settings, "deterministic_failover_enabled", True),
                         require_preferred_account=require_preferred_account,
@@ -3790,6 +4055,39 @@ class _WebSocketMixin:
                     selected_stream_lease = None
                     if confirmed_pre_dispatch:
                         await _record_or_defer_confirmed_route_backoff(account)
+                    error = _parse_openai_error(exc.payload)
+                    error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
+                    error_message = error.message if error else "Upstream connection failed"
+                    failure_class = (
+                        OpenAIFailureClass.QUOTA_EXHAUSTED
+                        if account_exhaustion_code_for_failover(error_code, error_message) is not None
+                        else OpenAIFailureClass.UPSTREAM_TRANSPORT
+                        if confirmed_pre_dispatch
+                        else OpenAIFailureClass.UNKNOWN
+                    )
+                    request_state.failover_state = request_state.failover_state or OpenAIFailoverState(
+                        max_switches=max(int(max_attempts), 1)
+                    )
+                    # Only an account-scoped verdict may outlive this connect
+                    # loop.  A failed handshake says the route was unreachable
+                    # right now, not that the account failed the request, so
+                    # recording it would let ordinary connection noise
+                    # permanently shrink the pool for every later turn on this
+                    # session.  Such attempts are still excluded locally, so
+                    # the loop keeps walking to a different account.
+                    if failure_class in _WEBSOCKET_ACCOUNT_SCOPED_FAILURE_CLASSES:
+                        request_state.failover_state.record_failure(
+                            account.id,
+                            OpenAIFailure(
+                                failure_class=failure_class,
+                                code=error_code or "upstream_error",
+                                message=error_message or "Upstream connection failed",
+                                status_code=exc.status_code,
+                                retry_next_account=True,
+                                safe_full_replay=failure_class is OpenAIFailureClass.QUOTA_EXHAUSTED,
+                            ),
+                        )
+                    request_state.quota_walk_active = failure_class is OpenAIFailureClass.QUOTA_EXHAUSTED
                     last_failover_exc = exc
                     last_failover_account = account
                     excluded_account_ids.add(account.id)
@@ -3915,8 +4213,12 @@ class _WebSocketMixin:
             account = selection.account
             if account is not None:
                 break
+            selection_quota_code = account_exhaustion_code_for_failover(
+                selection.error_code,
+                selection.error_message,
+            )
             if (
-                selection.error_code == USAGE_LIMIT_REACHED
+                selection_quota_code is not None
                 and require_preferred_account
                 and preferred_account_id is not None
                 and not request_state.file_required_preferred_account
@@ -3928,9 +4230,28 @@ class _WebSocketMixin:
                 # normal routing strategy choose the next account.  Transport
                 # failures and unproven/short continuations still fail closed
                 # below; this branch is deliberately quota-only.
-                switch_text = _prepare_websocket_request_state_for_account_switch(request_state)
+                switch_text = await _prepare_websocket_ownerless_replay(
+                    proxy,
+                    request_state,
+                    allow_quota_projection=True,
+                )
                 if switch_text is not None:
                     exhausted_owner_id = preferred_account_id
+                    request_state.failover_state = request_state.failover_state or OpenAIFailoverState(
+                        max_switches=max(int(getattr(_facade(), "_WEBSOCKET_MAX_ACCOUNT_ATTEMPTS", 3)), 1)
+                    )
+                    request_state.failover_state.record_failure(
+                        exhausted_owner_id,
+                        OpenAIFailure(
+                            failure_class=OpenAIFailureClass.QUOTA_EXHAUSTED,
+                            code=selection_quota_code,
+                            message=selection.error_message or "The usage limit has been reached",
+                            status_code=429,
+                            retry_next_account=True,
+                            safe_full_replay=True,
+                        ),
+                    )
+                    request_state.quota_walk_active = True
                     exclude_account_ids.add(preferred_account_id)
                     request_state.excluded_account_ids.add(preferred_account_id)
                     request_state.affinity_policy = replace(
@@ -3952,7 +4273,72 @@ class _WebSocketMixin:
                         selection.resets_at,
                     )
                     continue
-            if selection.error_code == USAGE_LIMIT_REACHED:
+            if (
+                selection.error_code in {"continuity_owner_unavailable", "continuity_owner_policy_conflict"}
+                and require_preferred_account
+                and preferred_account_id is not None
+                and not request_state.file_required_preferred_account
+            ):
+                # A paused/removed owner is recoverable for the same reason as
+                # a quota-exhausted owner: the continuation must first become
+                # account-neutral, then the configured selector chooses the
+                # replacement.  If no complete transcript is available we
+                # retain the existing owner-unavailable terminal contract.
+                switch_text = await _prepare_websocket_ownerless_replay(
+                    proxy,
+                    request_state,
+                    allow_quota_projection=True,
+                )
+                if switch_text is not None:
+                    unavailable_owner_id = preferred_account_id
+                    exclude_account_ids.add(unavailable_owner_id)
+                    request_state.excluded_account_ids.add(unavailable_owner_id)
+                    preferred_account_id = None
+                    require_preferred_account = False
+                    reallocate_sticky = True
+                    _facade().logger.warning(
+                        "Websocket continuity owner unavailable; retrying with durable account-neutral replay "
+                        "request_id=%s owner_account_id=%s error_code=%s",
+                        request_state.request_log_id or request_state.request_id,
+                        unavailable_owner_id,
+                        selection.error_code,
+                    )
+                    continue
+            if (
+                selection.error_code == "hard_affinity_saturated"
+                and require_preferred_account
+                and preferred_account_id is not None
+                and not request_state.file_required_preferred_account
+            ):
+                # A paused/removed hard owner can be rejected by the
+                # balancer before any upstream quota/error frame exists.
+                # If the request has a complete verified or durable
+                # transcript, detach the stale owner and replay account-
+                # neutrally instead of returning a continuity 502.
+                switch_text = await _prepare_websocket_ownerless_replay(
+                    proxy,
+                    request_state,
+                    allow_quota_projection=True,
+                )
+                if switch_text is not None:
+                    unavailable_owner_id = preferred_account_id
+                    exclude_account_ids.add(unavailable_owner_id)
+                    request_state.excluded_account_ids.add(unavailable_owner_id)
+                    preferred_account_id = None
+                    require_preferred_account = False
+                    reallocate_sticky = True
+                    request_state.affinity_policy = replace(
+                        request_state.affinity_policy,
+                        reallocate_sticky=True,
+                    )
+                    logger.warning(
+                        "Websocket hard affinity owner unavailable; retrying with durable account-neutral replay "
+                        "request_id=%s owner_account_id=%s",
+                        request_state.request_log_id or request_state.request_id,
+                        unavailable_owner_id,
+                    )
+                    continue
+            if selection_quota_code is not None:
                 break
 
             async def _heartbeat(remaining_seconds: float) -> None:
@@ -5200,6 +5586,7 @@ class _WebSocketMixin:
                         upstream_control=upstream_control,
                         response_create_gate=response_create_gate,
                         downstream_activity=downstream_activity,
+                        continuity_state=continuity_state,
                     ),
                     name=f"proxy-websocket-transport-end-{account_id_value}",
                 )
@@ -5728,8 +6115,10 @@ class _WebSocketMixin:
                 has_other_pending_requests=has_other_pending_requests,
             )
         retry_error_message = _websocket_event_error_message(event_type, payload)
-        account_exhaustion_retry = upstream_usage_limit_error_code(retry_error_code, retry_error_message) is not None
-        terminal_account_exhaustion_code = upstream_usage_limit_error_code(
+        account_exhaustion_retry = (
+            account_exhaustion_code_for_failover(retry_error_code, retry_error_message) is not None
+        )
+        terminal_account_exhaustion_code = account_exhaustion_code_for_failover(
             _normalize_error_code(
                 _websocket_event_error_code(event_type, payload),
                 _websocket_event_error_type(event_type, payload),
@@ -5773,6 +6162,31 @@ class _WebSocketMixin:
                 or request_state.last_downstream_sequence_number is not None
             )
         )
+        if terminal_account_exhaustion_code is not None:
+            # Quota is definitive account evidence even when the backend sent
+            # ``response.created`` before rejecting the turn.  Persist a
+            # short-lived owner marker so a later client retry (after this
+            # request state has been finalized) cannot resolve the same
+            # previous-response owner again.
+            _record_websocket_quota_failure(
+                continuity_state,
+                account_id=account_id_value,
+            )
+            request_state.excluded_account_ids.add(account_id_value)
+            if request_state.failover_state is None:
+                request_state.failover_state = OpenAIFailoverState(
+                    max_switches=max(int(getattr(_facade(), "_WEBSOCKET_MAX_ACCOUNT_ATTEMPTS", 3)), 1)
+                )
+            request_state.failover_state.record_failure(
+                account_id_value,
+                OpenAIFailure(
+                    failure_class=OpenAIFailureClass.QUOTA_EXHAUSTED,
+                    code=terminal_account_exhaustion_code,
+                    message=retry_error_message or "The usage limit has been reached",
+                    retry_next_account=True,
+                    safe_full_replay=not account_exhaustion_after_visible_output,
+                ),
+            )
         if account_exhaustion_after_visible_output:
             upstream_control.suppress_downstream_event = True
             upstream_control.close_downstream_for_client_retry = True
@@ -5913,6 +6327,49 @@ class _WebSocketMixin:
                         request_state,
                         allow_quota_projection=True,
                     )
+                    if retry_text is None and request_state.previous_response_id is not None:
+                        # A delta continuation cannot be projected from its
+                        # wire body alone.  Use the durable operation/event
+                        # spool as the authoritative transcript, then feed
+                        # the resulting fresh request through the same retry
+                        # state machine.  This closes the exact gap where a
+                        # quota response was logged but still leaked to the
+                        # Codex client instead of trying the next account.
+                        get_transcript = getattr(
+                            getattr(proxy, "_durable_bridge", None),
+                            "get_replayable_transcript",
+                            None,
+                        )
+                        if callable(get_transcript):
+                            try:
+                                transcript = await get_transcript(response_id=request_state.previous_response_id)
+                                durable_replay_text = project_durable_transcript_for_account_neutral_quota_replay(
+                                    transcript or (),
+                                    current_request_text=_websocket_recovery_source_text(request_state),
+                                )
+                            except Exception:
+                                durable_replay_text = None
+                                _facade().logger.warning(
+                                    "Failed websocket durable quota replay request_id=%s response_id=%s",
+                                    request_state.request_log_id or request_state.request_id,
+                                    request_state.previous_response_id,
+                                    exc_info=True,
+                                )
+                            if durable_replay_text is not None:
+                                request_state.request_text = durable_replay_text
+                                request_state.previous_response_id = None
+                                request_state.proxy_injected_previous_response_id = False
+                                request_state.preferred_account_id = None
+                                request_state.replay_required_account_id = None
+                                request_state.file_required_preferred_account = False
+                                request_state.fresh_upstream_request_text = None
+                                request_state.fresh_upstream_request_is_retry_safe = False
+                                _refresh_websocket_request_input_fingerprint_from_text(request_state)
+                                retry_text = durable_replay_text
+                                _facade().logger.info(
+                                    "Prepared websocket durable full replay after quota request_id=%s",
+                                    request_state.request_log_id or request_state.request_id,
+                                )
                     if retry_text is None:
                         _facade().logger.warning(
                             "websocket quota failover replay unavailable "
@@ -5949,6 +6406,7 @@ class _WebSocketMixin:
                             retry_error_code = None
                         else:
                             request_state.account_exhaustion_replay_count += 1
+                            request_state.quota_walk_active = True
                             request_state.last_account_exhaustion_error_message = (
                                 retry_error_message or "The usage limit has been reached"
                             )
@@ -5997,6 +6455,19 @@ class _WebSocketMixin:
             and completed_usage is not None
             and completed_usage.output_tokens == 0
         )
+        if event_type == "response.completed" and not completed_empty_prewarm:
+            # A replacement account is considered healthy only after a
+            # terminal completion.  Clear the quota-walk marker here so a
+            # subsequent unrelated transport failure cannot inherit an
+            # unbounded account-exhaustion loop.
+            request_state.quota_walk_active = False
+            if request_state.failover_state is not None:
+                request_state.failover_state.reset_after_success()
+            # Keep the compatibility exclusion field in lock-step with the
+            # canonical controller.  A warm WebSocket request state can be
+            # reused for another turn; retaining an old per-turn exclusion
+            # here would make a recovered account appear permanently banned.
+            request_state.excluded_account_ids.clear()
         if event_type == "response.completed" and continuity_state is not None and not completed_empty_prewarm:
             _record_websocket_continuity_completion(
                 continuity_state,
@@ -6361,6 +6832,13 @@ class _WebSocketMixin:
             and usage is not None
             and usage.output_tokens == 0
         )
+        if event_type == "response.completed" and not completed_empty_prewarm:
+            # A replacement is successful only after a terminal completion.
+            # Clear quota-walk mode here so a later unrelated transport error
+            # cannot inherit an unbounded account-exhaustion loop.
+            request_state.quota_walk_active = False
+            if request_state.failover_state is not None:
+                request_state.failover_state.reset_after_success()
         if event_type in {"response.failed", "response.incomplete", "error"}:
             settlement.record_success = False
         if completed_empty_prewarm:

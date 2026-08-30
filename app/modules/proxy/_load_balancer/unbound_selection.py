@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 from app.core.balancer import (
     ResetPreferenceWindow,
@@ -75,6 +75,11 @@ class UnboundSelectionRequest(Generic[SelectionInputsT]):
     reload_inputs: Callable[[], Awaitable[SelectionInputsT]]
     record_account_cap_rejection: AccountCapRejectionCallback
     allow_usage_exhaustion_error: bool = True
+    # Snapshot of the effective pool before this request's exclusion ledger is
+    # applied.  Selection may filter failed accounts, but pool-wide quota
+    # reporting must still inspect the original candidates so A->B->C ends in
+    # a real usage-limit response instead of a misleading no-accounts error.
+    usage_exhaustion_accounts: list[Account] | None = None
     api_key_id: str | None = None
     api_key_stream_fair_share_threshold_pct: int = 0
 
@@ -151,6 +156,20 @@ async def run_unbound_selection_path(
                 required_account_id=required_account_id,
                 redact_sensitive_details=redact_sensitive_details,
             )
+            usage_exhaustion_states = states
+            if request.usage_exhaustion_accounts is not None:
+                # ``SelectionInputsT`` is bound to a Protocol, so the
+                # checker cannot see the concrete dataclass every caller
+                # actually passes; ``replace`` is correct at runtime.
+                usage_inputs = replace(
+                    cast(Any, selection_inputs),
+                    accounts=[_clone_account(account) for account in request.usage_exhaustion_accounts],
+                )
+                usage_exhaustion_states, _ = owner._prepare_sticky_selection_states(
+                    usage_inputs,
+                    required_account_id=None,
+                    redact_sensitive_details=redact_sensitive_details,
+                )
             effective_routing_costs = (
                 routing_costs_by_account_id
                 if routing_costs_by_account_id is not None
@@ -214,7 +233,7 @@ async def run_unbound_selection_path(
                     ignore_standard_quota=False,
                     routing_costs_by_account_id=effective_routing_costs,
                     allow_usage_exhaustion_error=allow_usage_exhaustion_error,
-                    usage_exhaustion_states=states,
+                    usage_exhaustion_states=usage_exhaustion_states,
                 )
                 if (
                     result.account is None

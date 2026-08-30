@@ -39,6 +39,7 @@ from app.core.clients.proxy_websocket import (
     is_account_neutral_websocket_error_code,
 )
 from app.core.errors import response_failed_event
+from app.core.openai.failover import OpenAIFailure, OpenAIFailureClass
 from app.core.openai.models import OpenAIEvent
 from app.core.openai.parsing import (
     _LIFECYCLE_EVENT_TYPES,
@@ -205,6 +206,7 @@ from app.modules.proxy.helpers import (
     is_upstream_model_capacity_error,
 )
 from app.modules.proxy.replay_safety import (
+    project_durable_transcript_for_account_neutral_quota_replay,
     project_responses_text_for_account_neutral_quota_replay,
 )
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED
@@ -235,6 +237,35 @@ def _portable_full_resend_text_for_recovery(
     """
 
     return project_responses_text_for_account_neutral_quota_replay(_websocket_recovery_source_text(request_state))
+
+
+async def _durable_transcript_text_for_quota_recovery(
+    service: Any,
+    session: "_HTTPBridgeSession",
+    request_state: "_WebSocketRequestState",
+) -> str | None:
+    """Recover a delta-only Codex continuation from the durable event spool."""
+
+    response_id = request_state.previous_response_id
+    get_transcript = getattr(getattr(service, "_durable_bridge", None), "get_replayable_transcript", None)
+    if response_id is None or not callable(get_transcript):
+        return None
+    try:
+        transcript = await get_transcript(response_id=response_id)
+    except Exception:
+        logger.warning(
+            "Failed to load durable transcript for quota recovery request_id=%s response_id=%s",
+            request_state.request_id,
+            _truncate_identifier(response_id),
+            exc_info=True,
+        )
+        return None
+    if not transcript:
+        return None
+    return project_durable_transcript_for_account_neutral_quota_replay(
+        transcript,
+        current_request_text=_websocket_recovery_source_text(request_state),
+    )
 
 
 _HTTP_BRIDGE_RECOVERY_SETTLEMENT_RETRY_DELAYS = (
@@ -2690,6 +2721,26 @@ class _HTTPBridgeUpstreamEventsMixin:
                 or status_request_state.last_downstream_sequence_number is not None
             )
         )
+        session_quota_code = account_exhaustion_retry_code or owner_pinned_quota_error
+        if session_quota_code is not None:
+            # Persist quota evidence on the bridge session as well as the
+            # request state.  A quota frame can arrive after lifecycle
+            # acknowledgements (created/in_progress) and before the request
+            # state is requeued; recording only on that transient state lets a
+            # subsequent reconnect select the same exhausted account again.
+            session.quota_failure_account_id = session.account.id
+            session.quota_failure_at = _service_time().monotonic()
+            session.failover_state.record_failure(
+                session.account.id,
+                OpenAIFailure(
+                    failure_class=OpenAIFailureClass.QUOTA_EXHAUSTED,
+                    code=session_quota_code,
+                    message=retry_error_message or "The usage limit has been reached",
+                    status_code=429,
+                    retry_next_account=True,
+                    safe_full_replay=True,
+                ),
+            )
         if account_exhaustion_after_visible_output and status_request_state is not None:
             # A proxy-local replay after visible output could repeat text or a
             # tool call.  Hide the single-account quota terminal and finish
@@ -2844,6 +2895,10 @@ class _HTTPBridgeUpstreamEventsMixin:
                         if _http_bridge_request_counts_against_queue(status_request_state):
                             session.queued_request_count = max(0, session.queued_request_count - 1)
         elif owner_pinned_quota_error is not None and not is_previous_response_not_found_event:
+            # Record this on the bridge session, not only on the transient
+            # request state.  The client may wait hours/days before retrying;
+            # when it does, a newly-created request state must still exclude
+            # this exhausted owner until its quota window recovers.
             await self._handle_stream_error(
                 session.account,
                 {"message": retry_error_message or "Upstream error"},
@@ -2856,6 +2911,17 @@ class _HTTPBridgeUpstreamEventsMixin:
                 if status_request_state is not None
                 else None
             )
+            if quota_replay_text is None and status_request_state is not None:
+                # Codex often retries a continuation with only
+                # ``previous_response_id``.  Once that id's owner is out of
+                # quota, the in-memory request no longer contains a complete
+                # transcript.  Reconstruct it from the durable operation
+                # chain before deciding that recovery is impossible.
+                quota_replay_text = await _durable_transcript_text_for_quota_recovery(
+                    self,
+                    session,
+                    status_request_state,
+                )
             if quota_replay_text is not None and status_request_state is not None and not has_other_pending_requests:
                 # The client supplied a full transcript, but its stale
                 # previous_response_id is tied to the exhausted owner.  A
@@ -3090,6 +3156,26 @@ class _HTTPBridgeUpstreamEventsMixin:
                 )
             ):
                 quota_replay_text = _portable_full_resend_text_for_recovery(status_request_state)
+            if (
+                account_exhaustion_retry
+                and quota_replay_text is None
+                and status_request_state is not None
+                and status_request_state.previous_response_id is not None
+                and not status_request_state.file_required_preferred_account
+                and not status_request_state.downstream_visible
+                and not status_request_state.upstream_model_output_seen
+                and status_request_state.last_downstream_sequence_number is None
+            ):
+                # A delta-only continuation has no portable body in the
+                # request itself.  The durable event spool is authoritative
+                # for the already-completed predecessor; rebuild the same
+                # account-neutral request used by the direct HTTP path before
+                # returning the owner's quota error to Codex.
+                quota_replay_text = await _durable_transcript_text_for_quota_recovery(
+                    self,
+                    session,
+                    status_request_state,
+                )
             if status_request_state is not None and (
                 status_request_state.previous_response_id is None or quota_replay_text is not None
             ):
@@ -3429,6 +3515,18 @@ class _HTTPBridgeUpstreamEventsMixin:
                 # (interrupted turn) can receive synthetic interrupted
                 # outputs instead of an upstream missing-tool-output 400.
                 session.last_pending_tool_calls = dict(terminal_request_state.pending_tool_call_types)
+            # The request-scoped exclusion ledger must not become a permanent
+            # ban on a warm bridge session.  Reset only after a replacement
+            # account has actually produced a terminal completed response;
+            # resetting at socket-selection time would allow A->B->A within
+            # the same failed logical turn.
+            session.failover_state.reset_after_success()
+            # Request states may remain attached to a warm bridge for later
+            # turns.  Do not let a previous quota/transport walk leak its
+            # exclusions into the next request.
+            terminal_request_state.excluded_account_ids.clear()
+            session.quota_failure_account_id = None
+            session.quota_failure_at = None
             # Prefix trimming is only meaningful for list-shaped inputs, so
             # keep the input-count / fingerprint update scoped to that path.
             if terminal_request_state.input_item_count > 0:

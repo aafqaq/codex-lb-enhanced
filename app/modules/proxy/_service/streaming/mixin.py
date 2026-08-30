@@ -409,6 +409,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
     _upstream_error_from_openai,
+    account_exhaustion_code_for_failover,
     upstream_usage_limit_error_code,
 )
 from app.modules.proxy.http_bridge_forwarding import (
@@ -890,7 +891,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                             settlement.error = upstream_error
                             settlement.record_success = False
                             account_exhaustion_after_visible_output = (
-                                upstream_usage_limit_error_code(error_code, error_message) is not None
+                                account_exhaustion_code_for_failover(error_code, error_message) is not None
                                 and settlement.downstream_visible
                             )
                             if error_code == "stream_incomplete":
