@@ -633,9 +633,8 @@ def _has_http_bridge_response_output_marker(item: JsonValue) -> bool:
     # the parent output.  A typed call with a stable call id is still a
     # response-owned prefix and is safe to trim before forwarding the suffix.
     item_type = item.get("type")
-    return item_type in {"function_call", "custom_tool_call"} and isinstance(item.get("call_id"), str) and bool(
-        item["call_id"].strip()
-    )
+    call_id = item.get("call_id")
+    return item_type in {"function_call", "custom_tool_call"} and isinstance(call_id, str) and bool(call_id.strip())
 
 
 def _http_bridge_input_item_type(item: JsonValue) -> str | None:
