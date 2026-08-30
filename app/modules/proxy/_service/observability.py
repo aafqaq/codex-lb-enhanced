@@ -8,6 +8,7 @@ from hashlib import sha256
 from typing import Any, Callable, cast
 
 from app.core.config.settings import get_settings
+from app.core.config.trace import effective_trace_channels
 from app.core.metrics.prometheus import (
     PROMETHEUS_AVAILABLE,
     continuity_fail_closed_total,
@@ -66,7 +67,7 @@ def _maybe_log_proxy_request_shape(
     sticky_key_source: str | None = None,
     prompt_cache_key_set: bool | None = None,
 ) -> None:
-    trace_channels = _service_get_settings().trace_channels
+    trace_channels = effective_trace_channels(_service_get_settings().trace_channels)
     if "shape" not in trace_channels:
         return
 
@@ -116,7 +117,7 @@ def _maybe_log_proxy_request_payload(
     payload: ResponsesRequest | ResponsesCompactRequest,
     headers: Mapping[str, str],
 ) -> None:
-    if "payload" not in _service_get_settings().trace_channels:
+    if "payload" not in effective_trace_channels(_service_get_settings().trace_channels):
         return
 
     request_id = get_request_id()
@@ -142,7 +143,7 @@ def _maybe_log_proxy_service_tier_trace(
     requested_service_tier: str | None,
     actual_service_tier: str | None,
 ) -> None:
-    if "service_tier" not in _service_get_settings().trace_channels:
+    if "service_tier" not in effective_trace_channels(_service_get_settings().trace_channels):
         return
 
     logger.warning(

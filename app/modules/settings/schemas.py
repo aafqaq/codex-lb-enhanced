@@ -33,6 +33,11 @@ class AdditionalQuotaPolicy(DashboardModel):
 
 class DashboardSettingsResponse(DashboardModel):
     sticky_threads_enabled: bool
+    # Effective state, not the stored override: while no operator decision has
+    # been recorded these mirror what CODEX_LB_TRACE currently produces, so the
+    # dashboard always shows what the process is really logging.
+    verbose_logging_enabled: bool
+    verbose_logging_include_payloads: bool
     upstream_stream_transport: str = Field(pattern=r"^(default|auto|http|websocket)$")
     prohibit_fast_mode: bool
     http_downstream_transport_policy: str = Field(pattern=_HTTP_DOWNSTREAM_TRANSPORT_POLICY_PATTERN)
@@ -91,6 +96,8 @@ class DashboardSettingsResponse(DashboardModel):
 class DashboardSettingsUpdateRequest(DashboardModel):
     expected_version: int | None = Field(default=None, ge=1)
     sticky_threads_enabled: bool | None = None
+    verbose_logging_enabled: bool | None = None
+    verbose_logging_include_payloads: bool | None = None
     upstream_stream_transport: str | None = Field(
         default=None,
         pattern=r"^(default|auto|http|websocket)$",

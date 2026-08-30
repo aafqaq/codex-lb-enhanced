@@ -17,7 +17,7 @@ export function ImportSettings({ settings, busy, onSave }: ImportSettingsProps) 
     void onSave(buildSettingsUpdateRequest(settings, patch));
 
   return (
-    <section className="rounded-xl border bg-card p-5">
+    <section className="h-full rounded-xl border bg-card p-5">
       <div className="space-y-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">

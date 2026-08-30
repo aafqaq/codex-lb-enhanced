@@ -4763,3 +4763,95 @@ async def test_shared_owner_lookup_session_reads_each_owner_key_exactly_once() -
     # session-per-lookup flow would have recorded three distinct ids here.
     assert len(lookup_context_ids) == 1
     assert None not in lookup_context_ids
+
+
+@pytest.mark.asyncio
+async def test_legacy_raw_owner_yields_to_proven_upstream_owner(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A proven upstream-state owner supersedes a stale raw routing row.
+
+    Production shape (dev server, 2026-08-30 09:07): sticky_sessions held
+    ``http_turn_b89fed... -> account B`` written at selection time, while the
+    HTTP bridge registered the same turn-state alias on account A fourteen
+    seconds later. Three consecutive compact requests 502'd on a healthy
+    account until the client stopped sending the turn-state header.
+    """
+
+    caplog.set_level(logging.WARNING, logger=load_balancer_module.__name__)
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("legacy-proven-owner")
+    assert alternate is not None
+    raw_session = "legacy-proven-session"
+    sticky_repo.account_ids_by_key = {raw_session: owner.id}
+
+    selected = await balancer.select_account(
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="session_header",
+        legacy_sticky_key=raw_session,
+        required_account_id=alternate.id,
+        required_account_is_ownership_constraint=True,
+        lease_kind="stream",
+    )
+
+    assert selected.error_code is None
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    # The stale row is repaired so the next turn agrees instead of conflicting.
+    assert sticky_repo.account_ids_by_key[raw_session] == alternate.id
+    assert (raw_session, alternate.id, StickySessionKind.CODEX_SESSION) in sticky_repo.upserts
+    assert "superseded by upstream state owner" in caplog.text
+    if selected.lease is not None:
+        await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_turn_state_sticky_row_yields_to_proven_upstream_owner(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The sticky-selection path follows the bridge owner for the same token."""
+
+    caplog.set_level(logging.WARNING, logger=load_balancer_module.__name__)
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("turn-state-proven-owner")
+    assert alternate is not None
+    turn_state = "http_turn_b89fed2210dc41109c76f4c4a995732f"
+    sticky_repo.account_ids_by_key = {turn_state: owner.id}
+
+    selected = await balancer.select_account(
+        sticky_key=turn_state,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="turn_state",
+        required_account_id=alternate.id,
+        required_account_is_ownership_constraint=True,
+        lease_kind="response_create",
+    )
+
+    assert selected.error_code is None
+    assert selected.account is not None
+    assert selected.account.id == alternate.id
+    assert sticky_repo.account_ids_by_key[turn_state] == alternate.id
+    assert "superseded by upstream state owner" in caplog.text
+    if selected.lease is not None:
+        await balancer.release_account_lease(selected.lease)
+
+
+@pytest.mark.asyncio
+async def test_turn_state_sticky_row_conflict_without_ownership_proof_fails_closed() -> None:
+    """An unproven preference still cannot silently abandon a hard owner."""
+
+    balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("turn-state-unproven")
+    assert alternate is not None
+    turn_state = "http_turn_1cd0a9f04b7e40cf9d2f6f2a3b7c5e10"
+    sticky_repo.account_ids_by_key = {turn_state: owner.id}
+
+    selected = await balancer.select_account(
+        sticky_key=turn_state,
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        sticky_source="turn_state",
+        required_account_id=alternate.id,
+        lease_kind="response_create",
+    )
+
+    assert selected.account is None
+    assert selected.error_code == "continuity_owner_conflict"
+    assert sticky_repo.account_ids_by_key == {turn_state: owner.id}
+    assert sticky_repo.upserts == []

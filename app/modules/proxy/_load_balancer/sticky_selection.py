@@ -246,6 +246,12 @@ class StickySelectionRequest(Generic[SelectionInputsT]):
     # owner-lookup session (see load_balancer.select_account). Consumed exactly
     # once; retries re-read fresh ownership evidence through a repo bundle.
     initial_sticky_owner_lookup: StickyOwnerLookup | None = None
+    # True when the caller resolved ``required_account_id`` from an upstream
+    # state index (HTTP-bridge turn-state alias, previous-response owner, file
+    # pin) rather than as a routing preference. That evidence is written when a
+    # turn actually executes, while a sticky row is written at selection time
+    # and can therefore be stale for the very same continuity token.
+    required_account_is_ownership_constraint: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +310,7 @@ async def run_sticky_selection_path(
     relative_availability_power = request.relative_availability_power
     relative_availability_top_k = request.relative_availability_top_k
     required_account_id = request.required_account_id
+    required_account_is_ownership_constraint = request.required_account_is_ownership_constraint
     budget_threshold_pct = request.budget_threshold_pct
     secondary_budget_threshold_pct = request.secondary_budget_threshold_pct
     routing_costs_by_account_id = request.routing_costs_by_account_id
@@ -362,6 +369,10 @@ async def run_sticky_selection_path(
         {legacy_abandoned_account_id} if legacy_abandoned_account_id is not None else set()
     )
     attempt = 0
+    # The stale-row repair below is attempted at most once per selection. A
+    # successful rebind is already visible to the next iteration's re-read; a
+    # failed one must not retry the same write on every capacity-wait retry.
+    upstream_owner_supersede_attempted = False
     suppress_recovery_probe_candidates = False
     pending_initial_owner_lookup = request.initial_sticky_owner_lookup
     while True:
@@ -474,11 +485,62 @@ async def run_sticky_selection_path(
                 sticky_existing_is_legacy or (sticky_kind == StickySessionKind.CODEX_SESSION and not bare_session_key)
             )
             if hard_sticky and required_account_id is not None and sticky_existing_account_id != required_account_id:
-                return _direct_error(
-                    account=None,
-                    error_message="Account-owned continuity sources conflict; retry the logical turn",
-                    error_code="continuity_owner_conflict",
-                )
+                if required_account_is_ownership_constraint and isinstance(sticky_existing_account_id, str):
+                    # Not a genuine two-owner conflict: these are two records
+                    # of one fact that were written at different moments. The
+                    # required owner comes from an upstream state index that is
+                    # written when a turn actually executes (bridge turn-state
+                    # alias, previous-response owner, file pin); the sticky row
+                    # is written at selection time, before the bridge picks the
+                    # session that serves the request. When the bridge reuses a
+                    # session on another account, the row it left behind names
+                    # an account that holds none of this turn's upstream state.
+                    #
+                    # Following it guarantees previous_response_not_found, and
+                    # failing closed wedges the client until it drops the token
+                    # (observed in production: one healthy account, three
+                    # consecutive 502s, then success once the client stopped
+                    # sending the turn state). Follow the executed-state owner
+                    # and repair the routing row so the next turn agrees.
+                    stale_owner_account_id = sticky_existing_account_id
+                    rebound = False
+                    if not upstream_owner_supersede_attempted and sticky_key and sticky_kind is not None:
+                        upstream_owner_supersede_attempted = True
+                        try:
+                            async with owner._repo_factory() as repos:
+                                await repos.sticky_sessions.upsert(
+                                    sticky_key,
+                                    required_account_id,
+                                    kind=sticky_kind,
+                                )
+                            rebound = True
+                        except Exception:
+                            # The rebind is a repair, not a precondition. A
+                            # write failure must not turn a recoverable
+                            # request back into the 502 this branch replaces.
+                            logger.warning(
+                                "Sticky continuity row rebind failed sticky_kind=%s",
+                                sticky_kind.value,
+                                exc_info=True,
+                            )
+                    logger.warning(
+                        "Sticky continuity row superseded by upstream state owner "
+                        "sticky_kind=%s sticky_source=%s stale_account_id=%s owner_account_id=%s rebound=%s",
+                        sticky_kind.value if sticky_kind is not None else None,
+                        sticky_source,
+                        "<redacted>" if redact_sensitive_details else stale_owner_account_id,
+                        "<redacted>" if redact_sensitive_details else required_account_id,
+                        rebound,
+                    )
+                    sticky_existing_account_id = required_account_id
+                    if sticky_existing_is_legacy:
+                        legacy_existing_account_id = required_account_id
+                else:
+                    return _direct_error(
+                        account=None,
+                        error_message="Account-owned continuity sources conflict; retry the logical turn",
+                        error_code="continuity_owner_conflict",
+                    )
             # A resolved hard row proves ownership. Without one, use the
             # same pre-health/pre-cap pool as the no-sticky path above.
             #

@@ -495,6 +495,8 @@ export function createDashboardSettings(
 ): DashboardSettings {
 	return DashboardSettingsSchema.parse({
 		stickyThreadsEnabled: true,
+		verboseLoggingEnabled: false,
+		verboseLoggingIncludePayloads: false,
 		upstreamStreamTransport: "default",
 		httpDownstreamTransportPolicy: "smart",
 		upstreamProxyRoutingEnabled: false,

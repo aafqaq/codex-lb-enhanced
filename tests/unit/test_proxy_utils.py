@@ -4560,6 +4560,34 @@ async def test_compact_turn_state_owner_fails_closed_when_same_account_sessions_
 
 
 @pytest.mark.asyncio
+async def test_compact_turn_state_owner_allows_unregistered_live_session_beside_durable_alias() -> None:
+    """A live session without a durable id is not a second owner.
+
+    Its identity is minted in the ``live:`` namespace and can never equal the
+    durable alias's ``durable:`` identity, so comparing the two across
+    namespaces would fail every such turn closed even though both refs already
+    agree on the account.
+    """
+
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    owner = SimpleNamespace(id="account-owner")
+    turn_state = "turn-owner-live-unregistered"
+    owner_key = proxy_service._http_bridge_turn_state_alias_key(turn_state, None)
+    service._http_bridge_turn_state_index[owner_key] = "bridge-live"  # type: ignore[assignment]
+    service._http_bridge_sessions["bridge-live"] = SimpleNamespace(  # type: ignore[index]
+        account=owner,
+        durable_session_id=None,
+    )
+    service._durable_bridge = SimpleNamespace(
+        lookup_turn_state_target=AsyncMock(
+            return_value=SimpleNamespace(account_id=owner.id, session_id="durable-session")
+        )
+    )
+
+    assert await service._resolve_compact_turn_state_owner(turn_state=turn_state, api_key=None) == owner.id
+
+
+@pytest.mark.asyncio
 async def test_compact_turn_state_owner_never_falls_back_to_unscoped_sticky_sessions() -> None:
     def fail_repo_factory():
         raise AssertionError("turn-state owner resolution must not query unscoped sticky sessions")

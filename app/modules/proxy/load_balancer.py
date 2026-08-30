@@ -774,14 +774,39 @@ class LoadBalancer:
                     if required_account_id is not None and (
                         legacy_existing_account_id is not None and legacy_existing_account_id != required_account_id
                     ):
-                        # The required owner came from a file/response/bridge index,
-                        # while the raw row may be legacy turn-state ownership. Neither
-                        # source can be discarded or rewritten to resolve a conflict.
-                        return AccountSelection(
-                            account=None,
-                            error_message="Account-owned continuity sources conflict; retry the logical turn",
-                            error_code="continuity_owner_conflict",
+                        # The required owner came from a file/response/bridge
+                        # index, while the raw row may be legacy turn-state
+                        # ownership. When the caller proved the required owner
+                        # from executed upstream state, that evidence outranks
+                        # the raw row: the index is written when a turn runs,
+                        # the row at selection time. Repair the row instead of
+                        # wedging the turn (see the matching branch in
+                        # run_sticky_selection_path). Without that proof the
+                        # two sources stay equally weighted and fail closed.
+                        if not owner_restricted_selection:
+                            return AccountSelection(
+                                account=None,
+                                error_message="Account-owned continuity sources conflict; retry the logical turn",
+                                error_code="continuity_owner_conflict",
+                            )
+                        try:
+                            await repos.sticky_sessions.upsert(
+                                legacy_sticky_key,
+                                required_account_id,
+                                kind=StickySessionKind.CODEX_SESSION,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Legacy sticky continuity row rebind failed",
+                                exc_info=True,
+                            )
+                        logger.warning(
+                            "Legacy sticky continuity row superseded by upstream state owner "
+                            "stale_account_id=%s owner_account_id=%s",
+                            "<redacted>" if redact_sensitive_details else legacy_existing_account_id,
+                            "<redacted>" if redact_sensitive_details else required_account_id,
                         )
+                        legacy_existing_account_id = required_account_id
                     owner_snapshot_pinned = True
                 if sticky_seed_key is not None and sticky_seed_kind is not None:
                     if owner_snapshot_pinned:
@@ -930,6 +955,7 @@ class LoadBalancer:
                     allow_usage_exhaustion_error=allow_usage_exhaustion_error,
                     usage_exhaustion_accounts=usage_exhaustion_accounts,
                     initial_sticky_owner_lookup=initial_sticky_owner_lookup,
+                    required_account_is_ownership_constraint=owner_restricted_selection,
                 ),
             )
             selection_inputs = sticky_outcome.selection_inputs

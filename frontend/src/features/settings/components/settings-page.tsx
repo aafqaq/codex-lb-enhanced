@@ -13,6 +13,7 @@ import { QuotaPlannerSection } from "@/features/quota-planner/components/quota-p
 import { buildSettingsUpdateRequest } from "@/features/settings/payload";
 import { AppearanceSettings } from "@/features/settings/components/appearance-settings";
 import { DataRetentionSettings } from "@/features/settings/components/data-retention-settings";
+import { DiagnosticsSettings } from "@/features/settings/components/diagnostics-settings";
 import { GuestAccessSettings } from "@/features/settings/components/guest-access-settings";
 import { ImportSettings } from "@/features/settings/components/import-settings";
 import { PasswordSettings } from "@/features/settings/components/password-settings";
@@ -99,29 +100,32 @@ export function SettingsPage() {
         <p className="mt-1 text-sm text-muted-foreground">{t("settings.page.subtitle")}</p>
       </div>
 
+      {/* Auth-derived, so they are known before the settings query resolves.
+          Rendering them in both states keeps the skeleton from being pushed
+          down when the real content arrives. */}
+      {error ? <AlertMessage variant="error">{error}</AlertMessage> : null}
+      {!canWrite ? (
+        <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium text-foreground">
+          {t("settings.page.readOnlyNotice")}
+        </div>
+      ) : null}
+
+      {authMode === "trusted_header" ? (
+        <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium text-foreground">
+          {t("settings.page.trustedHeaderNotice")}
+        </div>
+      ) : null}
+
+      {authMode === "disabled" ? (
+        <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs font-medium text-foreground">
+          {t("settings.page.disabledNotice")}
+        </div>
+      ) : null}
+
       {!settings ? (
-        <SettingsSkeleton />
+        <SettingsSkeleton tab={activeTab} />
       ) : (
         <>
-          {error ? <AlertMessage variant="error">{error}</AlertMessage> : null}
-          {!canWrite ? (
-            <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium text-foreground">
-              {t("settings.page.readOnlyNotice")}
-            </div>
-          ) : null}
-
-          {authMode === "trusted_header" ? (
-            <div className="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium text-foreground">
-              {t("settings.page.trustedHeaderNotice")}
-            </div>
-          ) : null}
-
-          {authMode === "disabled" ? (
-            <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs font-medium text-foreground">
-              {t("settings.page.disabledNotice")}
-            </div>
-          ) : null}
-
           <div
             className="grid grid-cols-2 gap-1 rounded-xl border bg-muted/30 p-1 sm:grid-cols-4"
             role="tablist"
@@ -157,13 +161,23 @@ export function SettingsPage() {
             id={`settings-panel-${activeTab}`}
             role="tabpanel"
             aria-labelledby={`settings-tab-${activeTab}`}
-            className="grid min-w-0 animate-fade-in-up auto-rows-max content-start items-start grid-cols-1 gap-4 lg:grid-cols-2"
+            className="grid min-w-0 animate-fade-in-up auto-rows-max content-start items-stretch grid-cols-1 gap-4 lg:grid-cols-2"
           >
             {activeTab === "general" ? (
               <>
                 <AppearanceSettings />
-                <ImportSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
-                <ResetCreditSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
+                {/* Appearance is about as tall as the other two stacked, so they
+                    share one column. Letting the grid pair Appearance with a
+                    single-row card instead would stretch that card to match and
+                    leave most of it empty. */}
+                <div className="flex min-w-0 flex-col gap-4">
+                  <div className="min-w-0">
+                    <ImportSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
+                  </div>
+                  <div className="min-w-0">
+                    <ResetCreditSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
+                  </div>
+                </div>
               </>
             ) : null}
 
@@ -258,7 +272,7 @@ export function SettingsPage() {
                 <div className="min-w-0 lg:col-span-2">
                   <StickySessionsSection disabled={controlsDisabled} />
                 </div>
-                <div className="lg:col-span-2">
+                <div className="min-w-0">
                   <DataRetentionSettings
                     key={[
                       settings.requestLogRetentionOverrideDays,
@@ -270,6 +284,9 @@ export function SettingsPage() {
                     busy={controlsDisabled}
                     onSave={handleSave}
                   />
+                </div>
+                <div className="min-w-0">
+                  <DiagnosticsSettings settings={settings} busy={controlsDisabled} onSave={handleSave} />
                 </div>
               </>
             ) : null}

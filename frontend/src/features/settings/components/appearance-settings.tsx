@@ -61,7 +61,7 @@ export function AppearanceSettings() {
   const setDateDisplayFormat = useDateDisplayFormatStore((s) => s.setDateDisplayFormat);
 
   return (
-    <section className="rounded-xl border bg-card p-5">
+    <section className="h-full rounded-xl border bg-card p-5">
       <div className="space-y-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">

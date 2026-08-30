@@ -896,6 +896,11 @@ class DashboardSettings(Base):
         server_default=true(),
         nullable=False,
     )
+    # NULL means "no operator decision"; CODEX_LB_TRACE then stays authoritative
+    # so upgrading cannot change what an env-configured deployment logs. Once
+    # set, these two are the whole answer (see app/core/config/trace.py).
+    verbose_logging_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
+    verbose_logging_include_payloads: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
     routing_strategy: Mapped[str] = mapped_column(
         String,
         default="capacity_weighted",
