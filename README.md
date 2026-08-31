@@ -106,7 +106,7 @@ docker run -d --name codex-lb-enhanced \
   --network codex-lb-net \
   -p 2455:2455 -p 1455:1455 \
   -v codex-lb-enhanced-data:/var/lib/codex-lb \
-  ghcr.io/aafqaq/codex-lb-enhanced:1.25.1
+  ghcr.io/aafqaq/codex-lb-enhanced:1.25.2
 ```
 
 Open [http://localhost:2455](http://localhost:2455), complete initialization, add accounts, and create an API key. For production, keep your existing ports, volume, environment, network, and restart policy; pin a versioned image and back up the data volume before upgrades.
@@ -149,7 +149,7 @@ uv run codex-lb
 
 ## Release and image
 
-Current release: **v1.25.1**. GitHub Actions validates every `main` change, publishes the rolling GHCR image, and publishes versioned images and Python artifacts through GitHub Releases. For production, use the immutable version tag [v1.25.1](https://github.com/aafqaq/codex-lb-enhanced/releases/tag/v1.25.1) instead of `latest`.
+Current release: **v1.25.2**. GitHub Actions validates every `main` change, publishes the rolling GHCR image, and publishes versioned images and Python artifacts through GitHub Releases. For production, use the immutable version tag [v1.25.2](https://github.com/aafqaq/codex-lb-enhanced/releases/tag/v1.25.2) instead of `latest`.
 
 ## License and disclaimer
 
