@@ -3240,6 +3240,12 @@ class _HTTPBridgeStreamingMixin:
                 yield event_block
                 yielded_any = True
         except ProxyResponseError as exc:
+            if exc.failure_detail == "ambiguous_websocket_send":
+                # send_text can fail after upstream accepted the complete
+                # response.create frame. The submit path has already settled
+                # the request as UNKNOWN; a local recovery would risk a
+                # duplicate operation.
+                raise
             _mark_http_bridge_durable_recovery_eligible(
                 exc,
                 request_state=request_state,
@@ -4450,6 +4456,7 @@ class _HTTPBridgeStreamingMixin:
             event_queue = request_state.event_queue
             assert event_queue is not None
             yielded_any = False
+            terminal_event_seen = False
             keepalive_sent = False
             keepalive_count = 0
             completed_delivery_suppression_logged = False
@@ -4879,6 +4886,8 @@ class _HTTPBridgeStreamingMixin:
                 else:
                     event_block = await event_queue.get()
                 if event_block is None:
+                    if terminal_event_seen:
+                        break
                     # The upstream reader closes the queue when its socket
                     # ends without a terminal response.  For a delta
                     # continuation this is indistinguishable from a quota
@@ -4925,6 +4934,12 @@ class _HTTPBridgeStreamingMixin:
                 circuit_keepalive_until = None
                 block_payload = parse_sse_data_json(event_block)
                 block_event_type = _event_type_from_payload(None, block_payload)
+                terminal_event_seen = block_event_type in {
+                    "response.completed",
+                    "response.failed",
+                    "response.incomplete",
+                    "error",
+                }
                 if request_state.latency_first_token_ms is None:
                     ttft_visible_at = _ttft_event_visible_at(
                         block_event_type, block_payload, request_state.ttft_reasoning_deltas

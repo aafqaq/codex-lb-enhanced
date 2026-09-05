@@ -767,14 +767,8 @@ async def test_codex_goal_restart_cannot_retire_owner_outside_api_key_scope(
         },
     )
 
-    assert response.status_code == 200
-    events = [
-        json.loads(line.removeprefix("data: "))
-        for line in response.text.splitlines()
-        if line.startswith("data: ") and line != "data: [DONE]"
-    ]
-    failed_event = next(event for event in events if event.get("type") == "response.failed")
-    assert failed_event["response"]["error"]["code"] == "hard_affinity_saturated"
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "hard_affinity_saturated"
     async with SessionLocal() as session:
         raw_row = await session.scalar(
             select(StickySession).where(

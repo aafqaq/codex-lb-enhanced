@@ -2265,6 +2265,9 @@ class _HTTPBridgeRequestSubmitMixin:
             raise ProxyResponseError(
                 502,
                 openai_error(error_code, failure_error_message),
+                failure_phase="upstream",
+                failure_detail="ambiguous_websocket_send",
+                upstream_error_code=error_code,
             ) from exc
 
     async def _maybe_prewarm_http_bridge_session(
