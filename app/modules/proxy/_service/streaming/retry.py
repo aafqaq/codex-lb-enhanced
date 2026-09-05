@@ -88,6 +88,7 @@ from app.modules.proxy.load_balancer import AccountLease, AccountSelection
 from app.modules.proxy.replay_safety import (
     project_durable_transcript_for_account_neutral_quota_replay,
     project_responses_payload_for_account_neutral_quota_replay,
+    project_unanchored_responses_payload_for_account_neutral_quota_replay,
     responses_payload_is_account_neutral_fresh_replay,
 )
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
@@ -854,6 +855,51 @@ class _StreamingRetryMixin:
             return required_account_id is None and not responses_payload_is_account_neutral_fresh_replay(
                 payload.to_replay_safety_payload()
             )
+
+        def _release_quota_pinned_payload_owner(*, account_id: str) -> bool:
+            """Let an unanchored client turn leave an account that hit its limit.
+
+            ``_authorize_payload_dispatch`` records the dispatch owner so a
+            continuation that may already have committed upstream state cannot
+            silently move accounts.  A definitive usage-limit response is the
+            opposite case: it is returned before the account accepts anything,
+            so the pin protects nothing and instead makes the next selection
+            ask for the very account this walk just excluded.  The balancer
+            then answers ``preferred_account_unavailable`` and the caller
+            surfaces the exhausted account's 429 while the rest of the pool is
+            idle.  Rebuild the client's own transcript in its portable form and
+            drop the pin so the pool walk can continue.  Anchored
+            continuations and file pins stay owner-bound.
+            """
+
+            nonlocal payload, payload_replay_required_account_id
+            if payload_replay_required_account_id != account_id:
+                return False
+            if payload.previous_response_id is not None or file_preferred_account_id is not None:
+                return False
+            projected = project_unanchored_responses_payload_for_account_neutral_quota_replay(
+                payload.to_replay_safety_payload()
+            )
+            if projected is None:
+                return False
+            try:
+                replay = ResponsesRequest.model_validate(projected)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Unable to validate quota failover replay request_id=%s account_id=%s",
+                    request_id,
+                    account_id,
+                    exc_info=True,
+                )
+                return False
+            payload = replay
+            payload_replay_required_account_id = None
+            logger.info(
+                "Released dispatched payload owner after account quota stop request_id=%s account_id=%s",
+                request_id,
+                account_id,
+            )
+            return True
 
         def _move_verified_fresh_replay_from_owner(*, account_id: str, outcome: str) -> bool:
             # Only a proxy-injected owner anchor with locally verified full
@@ -2925,6 +2971,8 @@ class _StreamingRetryMixin:
                                         account_id=account.id,
                                         outcome="owner_previsible_failure",
                                     )
+                                    if definitive_quota:
+                                        _release_quota_pinned_payload_owner(account_id=account.id)
                                     break
                                 raise
                             error_code = tex.code if isinstance(tex, _TransientStreamError) else "server_error"
@@ -3560,6 +3608,8 @@ class _StreamingRetryMixin:
                                         account_id=account.id,
                                         outcome="post_refresh_failover",
                                     )
+                                if definitive_quota:
+                                    _release_quota_pinned_payload_owner(account_id=account.id)
                                 continue
                             health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)
                             if health_write_allowed:
