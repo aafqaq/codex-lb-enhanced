@@ -1694,10 +1694,6 @@ class _HTTPBridgeUpstreamEventsMixin:
                 # side effects. Clean closes remain eligible for the bounded
                 # pre-created retry circuit maintained by the session.
                 account_neutral = is_account_neutral_websocket_error_code(message.error_code)
-                if not account_neutral:
-                    retried = await self._retry_http_bridge_precreated_request(session)
-                if retried:
-                    continue
                 close_classification = (
                     _classify_upstream_close(message.close_code, response_events_seen=response_events_seen)
                     if message.close_code is not None
@@ -1718,6 +1714,16 @@ class _HTTPBridgeUpstreamEventsMixin:
                     )
                 )
                 async with session.lifecycle_lock:
+                    # send_text may have failed after the operation reached
+                    # the kernel. The submitter marks the session closed while
+                    # holding this same lock and owns terminal settlement; a
+                    # reader-side reconnect here could duplicate the request.
+                    if session.closed:
+                        break
+                    if not account_neutral:
+                        retried = await self._retry_http_bridge_precreated_request(session)
+                    if retried:
+                        continue
                     if (
                         session.liveness_settlement_owner == "send"
                         and message.error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE

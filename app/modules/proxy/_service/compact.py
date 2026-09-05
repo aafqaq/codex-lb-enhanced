@@ -1543,7 +1543,7 @@ class _CompactMixin:
                             # stale affinity hint.  Only explicit turn/file
                             # ownership remains hard-bound above.
                             recovery_blocked_reason = None
-                        if replay_payload is None:
+                        if replay_payload is None and recovery_blocked_reason is None:
                             recovery_blocked_reason = "history_not_account_neutral"
                         if replay_payload is None:
                             logger.info(
