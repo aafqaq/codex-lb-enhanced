@@ -537,6 +537,7 @@
   "common.actions.reset": "Reset",
   "common.actions.resume": "Resume",
   "common.actions.retry": "Retry",
+  "common.actions.refresh": "Refresh",
   "common.actions.save": "Save",
   "common.actions.submit": "Submit",
   "common.actions.tryAgain": "Try again",

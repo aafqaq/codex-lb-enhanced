@@ -31,6 +31,7 @@ _IN_FLIGHT_WEBSOCKET_PATHS = frozenset(
     {
         "/backend-api/codex/responses",
         "/v1/responses",
+        "/responses",
     }
 )
 

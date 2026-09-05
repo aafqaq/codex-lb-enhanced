@@ -38,7 +38,7 @@ Field definitions for structured findings. The Finding Analyzer converts Codex r
 | `testing` | Test deficiency (contract change without test update, broken assertion) |
 | `performance` | Performance issue (N+1 query, blocking I/O, unnecessary iteration) |
 | `compatibility` | Compatibility issue (OpenAI-compatible endpoint breaking change) |
-| `convention` | Project convention violation (CLAUDE.md rule violation) |
+| `convention` | Project convention violation (repository rule violation) |
 
 ## Effort Definitions
 
