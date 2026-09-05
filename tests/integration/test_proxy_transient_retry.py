@@ -736,6 +736,72 @@ async def test_stream_connect_phase_429_usage_limit_transparent_failover(async_c
 
 
 @pytest.mark.asyncio
+async def test_stream_codex_transcript_usage_limit_fails_over_without_surfacing_429(async_client, monkeypatch):
+    """A rich Codex first turn must still move accounts on a connect-phase quota stop.
+
+    Codex Desktop sends client bookkeeping (``stream_options``) and response
+    item ids alongside the transcript, so the dispatch owner is recorded for
+    the account that received it.  A usage-limit response is returned before
+    that account accepts anything, so the recorded owner must not survive the
+    failover: keeping it made the follow-up selection require the account the
+    walk had just excluded, and the client received the exhausted account's
+    429 while the rest of the pool was idle.
+    """
+
+    await _import_account(async_client, "acc_codex_quota_a", "codex-quota-a@example.com")
+    await _import_account(async_client, "acc_codex_quota_b", "codex-quota-b@example.com")
+
+    seen_account_ids: list[str | None] = []
+    dispatched_payloads: list[dict] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        seen_account_ids.append(account_id)
+        dispatched_payloads.append(payload)
+        if account_id == "acc_codex_quota_a":
+            raise ProxyResponseError(
+                429,
+                openai_error("usage_limit_reached", "The usage limit has been reached"),
+                failure_phase="status",
+            )
+        yield _success_sse_event("resp_codex_quota_ok")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "hi",
+        "stream": True,
+        "store": False,
+        "prompt_cache_key": "thread-codex-quota",
+        "stream_options": {"include_obfuscation": False},
+        "input": [
+            {"type": "compaction", "id": "cmpt_owner_a", "encrypted_content": "portable-blob"},
+            {
+                "type": "message",
+                "id": "msg_owner_a",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        ],
+    }
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    events = _extract_events(lines)
+    assert [event for event in events if event["type"] == "response.failed"] == []
+    assert len([event for event in events if event["type"] == "response.completed"]) == 1
+    assert seen_account_ids[:2] == ["acc_codex_quota_a", "acc_codex_quota_b"]
+
+    # The replacement account receives the same transcript without the
+    # response-owned item ids that belonged to the exhausted account.
+    replacement_input = dispatched_payloads[1]["input"]
+    assert [item["type"] for item in replacement_input] == ["compaction", "message"]
+    assert all("id" not in item for item in replacement_input)
+    assert replacement_input[0]["encrypted_content"] == "portable-blob"
+
+
+@pytest.mark.asyncio
 async def test_stream_message_only_usage_limit_walks_entire_pool_past_generic_attempt_budget(
     async_client,
     monkeypatch,
