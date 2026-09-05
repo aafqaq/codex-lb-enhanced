@@ -79,8 +79,8 @@ Enhanced 保留上游项目成熟的账号管理、API Key 鉴权、负载均衡
 
 ## 支持的接口与客户端
 
-- **Codex 客户端 / IDE**：`/backend-api/codex`，支持 Responses 与官方额度响应头。
-- **OpenAI 兼容客户端**：`/v1`，保留 Chat Completions、Responses、模型和用量接口。
+- **Codex 客户端 / IDE**：`/backend-api/codex`，支持 Responses 与官方额度响应头。最新版 Codex 也可能直接调用根路径 `/responses` 和 `/responses/compact`，两种形式均受支持。
+- **OpenAI 兼容客户端**：`/v1`，保留 Chat Completions、Responses、模型和用量接口；根路径 `/responses`、`/responses/compact` 是等价兼容别名。
 - **管理仪表盘**：账号池、API Key、用量、额度窗口、请求日志和恢复诊断集中管理。
 - **上游传输**：HTTP 与 WebSocket；可按部署环境选择或让 bridge 承担回退。
 
@@ -104,7 +104,7 @@ docker run -d --name codex-lb-enhanced \
   -e CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_AMBIGUOUS_CONTINUATION_RECOVERY_MODE=server_indefinite_recovery \
   -p 2455:2455 -p 1455:1455 \
   -v codex-lb-enhanced-data:/var/lib/codex-lb \
-  ghcr.io/aafqaq/codex-lb-enhanced:1.25.2
+  ghcr.io/aafqaq/codex-lb-enhanced:1.25.3
 ```
 
 打开 [http://localhost:2455](http://localhost:2455)，完成初始化、添加账号并创建 API Key。生产环境请把端口、卷、环境变量和重启策略替换成你的现有配置；升级前保留旧镜像标签以便回滚。
@@ -128,6 +128,8 @@ requires_openai_auth = true
 
 将 `base_url` 换成反向代理地址即可；API Key 使用仪表盘创建的 Key。其他客户端继续使用 `/v1`，无需改变原有 OpenAI SDK 调用方式。
 
+如果客户端会直接在服务根地址后拼接 `/responses`，可将 base URL 设置为 `http://127.0.0.1:2455`；生成的 `/responses` 和 `/responses/compact` 请求会进入同一套 OpenAI 兼容处理逻辑。
+
 ### 从源码运行
 
 源码、Python 包和 Docker 镜像使用同一个应用启动器：
@@ -147,7 +149,7 @@ uv run codex-lb
 
 ## 版本与构建
 
-当前发布版本：**v1.25.2**。每次 `main` 变更都会经过 GitHub Actions 验证并更新 GHCR 滚动镜像；正式版本还会发布带版本号的镜像和 Python 构建产物。生产环境建议使用不可变的 [v1.25.2](https://github.com/aafqaq/codex-lb-enhanced/releases/tag/v1.25.2) 标签，不要直接使用 `latest`。镜像包位于 [GitHub Container Registry](https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced)。
+当前发布版本：**v1.25.3**。本版本适配最新版 Codex 的 Responses 路由，包括发送根路径 `/responses` 请求的 GPT‑6 兼容客户端。每次 `main` 变更都会经过 GitHub Actions 验证并更新 GHCR 滚动镜像；正式版本还会发布带版本号的镜像和 Python 构建产物。生产环境建议使用不可变的 [v1.25.3](https://github.com/aafqaq/codex-lb-enhanced/releases/tag/v1.25.3) 标签，不要直接使用 `latest`。镜像包位于 [GitHub Container Registry](https://github.com/aafqaq/codex-lb-enhanced/pkgs/container/codex-lb-enhanced)。
 
 ## 许可证与免责声明
 

@@ -29,6 +29,8 @@ _JSON_BODY_DENY_PATHS = frozenset(
         "/backend-api/codex/images/generations",
         "/v1/responses",
         "/v1/responses/compact",
+        "/responses",
+        "/responses/compact",
         "/v1/chat/completions",
         "/v1/embeddings",
         "/v1/images/generations",

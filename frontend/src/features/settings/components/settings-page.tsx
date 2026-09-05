@@ -1,9 +1,10 @@
 import { Suspense, lazy, useState } from "react";
-import { Settings } from "lucide-react";
+import { RefreshCw, Settings } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate } from "react-router-dom";
 
 import { AlertMessage } from "@/components/alert-message";
+import { Button } from "@/components/ui/button";
 import { LoadingOverlay } from "@/components/layout/loading-overlay";
 import { ApiKeysSection } from "@/features/api-keys/components/api-keys-section";
 import { useAccounts } from "@/features/accounts/hooks/use-accounts";
@@ -54,7 +55,7 @@ export function SettingsPage() {
   const location = useLocation();
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => tabForLocation(location.search, location.hash));
-  const { settingsQuery, updateSettingsMutation } = useSettings();
+  const { settingsQuery, refreshSettings, updateSettingsMutation } = useSettings();
   const { accountsQuery } = useAccounts();
   const {
     upstreamProxyQuery,
@@ -76,6 +77,7 @@ export function SettingsPage() {
     addPoolMemberMutation.isPending ||
     testEndpointMutation.isPending;
   const controlsDisabled = busy || !canWrite;
+  const isRefreshing = settingsQuery.isFetching || upstreamProxyQuery.isFetching || accountsQuery.isFetching;
   const error =
     getErrorMessageOrNull(settingsQuery.error) ||
     getErrorMessageOrNull(upstreamProxyQuery.error) ||
@@ -92,12 +94,26 @@ export function SettingsPage() {
   return (
     <div className="animate-fade-in-up space-y-6">
       {/* Page header */}
-      <div>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
         <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
           <Settings className="h-5 w-5 text-primary" />
           {t("settings.page.title")}
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">{t("settings.page.subtitle")}</p>
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="shrink-0 gap-1.5"
+          onClick={() => void refreshSettings()}
+          disabled={isRefreshing}
+          aria-label={t("common.actions.refresh")}
+        >
+          <RefreshCw className={`h-3.5 w-3.5${isRefreshing ? " animate-spin" : ""}`} aria-hidden="true" />
+          {t("common.actions.refresh")}
+        </Button>
       </div>
 
       {/* Auth-derived, so they are known before the settings query resolves.
@@ -161,7 +177,7 @@ export function SettingsPage() {
             id={`settings-panel-${activeTab}`}
             role="tabpanel"
             aria-labelledby={`settings-tab-${activeTab}`}
-            className="grid min-w-0 animate-fade-in-up auto-rows-max content-start items-stretch grid-cols-1 gap-4 lg:grid-cols-2"
+            className="grid min-w-0 animate-fade-in-up auto-rows-max content-start items-start grid-cols-1 gap-5 xl:grid-cols-2"
           >
             {activeTab === "general" ? (
               <>
@@ -200,7 +216,7 @@ export function SettingsPage() {
                     <TotpSettings settings={settings} disabled={busy} onSave={handleSave} />
                   </Suspense>
                 ) : null}
-                <div className="min-w-0 lg:col-span-2">
+                <div className="min-w-0 xl:col-span-2">
                   <ApiKeysSection
                     apiKeyAuthEnabled={settings.apiKeyAuthEnabled}
                     hideUpstreamQuotaFromApiKeys={settings.hideUpstreamQuotaFromApiKeys}
@@ -218,7 +234,7 @@ export function SettingsPage() {
 
             {activeTab === "routing" ? (
               <>
-                <div className="min-w-0 lg:col-span-2">
+                <div className="min-w-0 xl:col-span-2">
                   <RoutingSettings
                     key={[
                       settings.openaiCacheAffinityMaxAgeSeconds,
@@ -241,7 +257,7 @@ export function SettingsPage() {
                   />
                 </div>
                 {upstreamProxyQuery.data ? (
-                  <div className="min-w-0 lg:col-span-2">
+                  <div className="min-w-0 xl:col-span-2">
                     <UpstreamProxySettings
                       admin={upstreamProxyQuery.data}
                       busy={controlsDisabled}
@@ -255,7 +271,7 @@ export function SettingsPage() {
                     />
                   </div>
                 ) : null}
-                <div className="min-w-0 lg:col-span-2">
+                <div className="min-w-0 xl:col-span-2">
                   <ModelSourcesSettings disabled={controlsDisabled} />
                 </div>
               </>
@@ -263,13 +279,13 @@ export function SettingsPage() {
 
             {activeTab === "operations" ? (
               <>
-                <div className="min-w-0 lg:col-span-2">
+                <div className="min-w-0 xl:col-span-2">
                   <FirewallSection disabled={controlsDisabled} />
                 </div>
-                <div className="min-w-0 lg:col-span-2">
+                <div className="min-w-0 xl:col-span-2">
                   <QuotaPlannerSection disabled={controlsDisabled} />
                 </div>
-                <div className="min-w-0 lg:col-span-2">
+                <div className="min-w-0 xl:col-span-2">
                   <StickySessionsSection disabled={controlsDisabled} />
                 </div>
                 <div className="min-w-0">

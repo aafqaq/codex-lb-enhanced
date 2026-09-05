@@ -29,6 +29,12 @@ _CODEX_V1_PREFIX = "/backend-api/codex/v1/"
 _CODEX_V1_PREFIX_BYTES = _CODEX_V1_PREFIX.encode("ascii")
 _CODEX_CANONICAL_PREFIX = "/backend-api/codex/"
 _CODEX_CANONICAL_PREFIX_BYTES = _CODEX_CANONICAL_PREFIX.encode("ascii")
+_ROOT_RESPONSES_ALIASES = {
+    "/responses": "/v1/responses",
+    "/responses/": "/v1/responses/",
+    "/responses/compact": "/v1/responses/compact",
+    "/responses/compact/": "/v1/responses/compact/",
+}
 _V1_LIVE_PREFIX = "/v1/live/"
 _V1_LIVE_PREFIX_BYTES = _V1_LIVE_PREFIX.encode("ascii")
 _V1_REALTIME_PATH = "/v1/realtime"
@@ -65,6 +71,12 @@ def _canonicalize_backend_api_codex_path(path: str) -> str:
     return _CODEX_CANONICAL_PREFIX + path[len(_CODEX_V1_PREFIX) :]
 
 
+def _canonicalize_root_responses_path(path: str) -> str:
+    """Map the root Responses paths emitted by recent Codex clients to /v1."""
+
+    return _ROOT_RESPONSES_ALIASES.get(path, path)
+
+
 def _realtime_live_scope_redaction(path: str) -> tuple[str, bytes] | None:
     if path == _V1_REALTIME_PATH:
         return _V1_REALTIME_PATH, _V1_REALTIME_RAW_PATH
@@ -95,7 +107,11 @@ def redact_realtime_live_path(path: str) -> str:
 
 def _canonicalize_raw_path(raw_path: bytes) -> bytes:
     if not raw_path.startswith(_CODEX_V1_PREFIX_BYTES):
-        return raw_path
+        try:
+            decoded = raw_path.decode("ascii")
+        except UnicodeDecodeError:
+            return raw_path
+        return _canonicalize_root_responses_path(decoded).encode("ascii")
     return _CODEX_CANONICAL_PREFIX_BYTES + raw_path[len(_CODEX_V1_PREFIX_BYTES) :]
 
 
@@ -130,8 +146,8 @@ class BackendApiCodexV1AliasMiddleware:
                 await self.app(routing_scope, receive, send)
                 return
 
-        if scope_type in {"http", "websocket"} and isinstance(path, str) and path.startswith(_CODEX_V1_PREFIX):
-            rewritten = _canonicalize_backend_api_codex_path(path)
+        if scope_type in {"http", "websocket"} and isinstance(path, str):
+            rewritten = _canonicalize_root_responses_path(_canonicalize_backend_api_codex_path(path))
             if rewritten != path:
                 # Preserve the server-owned scope when only downstream routing changes.
                 routing_scope = dict(scope)

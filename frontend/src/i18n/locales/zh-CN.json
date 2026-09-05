@@ -537,6 +537,7 @@
   "common.actions.reset": "重置",
   "common.actions.resume": "恢复",
   "common.actions.retry": "重试",
+  "common.actions.refresh": "刷新",
   "common.actions.save": "保存",
   "common.actions.submit": "提交",
   "common.actions.tryAgain": "重试",
