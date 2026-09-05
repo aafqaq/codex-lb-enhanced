@@ -132,6 +132,7 @@ describe("SettingsPage", () => {
         error: null,
         refetch: vi.fn().mockResolvedValue(undefined),
       },
+      refreshSettings: vi.fn().mockResolvedValue(undefined),
       updateSettingsMutation: {
         isPending: false,
         error: null,
@@ -194,6 +195,25 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Appearance Settings")).toBeInTheDocument();
     expect(screen.getByText("Import Settings")).toBeInTheDocument();
     expect(screen.queryByText("API Keys Section")).not.toBeInTheDocument();
+  });
+
+  it("refreshes all settings-owned queries from the page header", async () => {
+    const refreshSettings = vi.fn().mockResolvedValue(undefined);
+    useSettingsMock.mockReturnValue({
+      settingsQuery: {
+        data: settings,
+        error: null,
+        isFetching: false,
+        refetch: vi.fn().mockResolvedValue(undefined),
+      },
+      refreshSettings,
+      updateSettingsMutation: { isPending: false, error: null, mutateAsync: vi.fn() },
+    });
+
+    renderSettings();
+    await userEvent.setup({ delay: null }).click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(refreshSettings).toHaveBeenCalledOnce();
   });
 
   it("mounts only the selected category and switches without a long page scroll", async () => {

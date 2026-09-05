@@ -895,19 +895,29 @@ async def _handle_stream_error(
             code,
         )
         return classified
-    if classified["failure_class"] == "rate_limit":
-        await proxy._load_balancer.mark_rate_limit(account, error)
-    elif classified["failure_class"] == "quota":
-        await proxy._load_balancer.mark_quota_exceeded(account, error)
-    elif code in PERMANENT_FAILURE_CODES:
-        await proxy._load_balancer.mark_permanent_failure(account, code)
-    else:
-        await proxy._load_balancer.record_error(account)
-        _facade().logger.info(
-            "Recorded transient account error account_id=%s request_id=%s code=%s",
+    try:
+        if classified["failure_class"] == "rate_limit":
+            await proxy._load_balancer.mark_rate_limit(account, error)
+        elif classified["failure_class"] == "quota":
+            await proxy._load_balancer.mark_quota_exceeded(account, error)
+        elif code in PERMANENT_FAILURE_CODES:
+            await proxy._load_balancer.mark_permanent_failure(account, code)
+        else:
+            await proxy._load_balancer.record_error(account)
+            _facade().logger.info(
+                "Recorded transient account error account_id=%s request_id=%s code=%s",
+                "<redacted>" if privacy_policy.redacts_sensitive_details else account.id,
+                get_request_id(),
+                code,
+            )
+    except Exception:
+        # Advisory health accounting must never tear down an otherwise valid
+        # client turn when the health store or replica coordination is down.
+        _facade().logger.warning(
+            "Failed to persist account health; continuing request lifecycle account_id=%s code=%s",
             "<redacted>" if privacy_policy.redacts_sensitive_details else account.id,
-            get_request_id(),
             code,
+            exc_info=True,
         )
     return classified
 
