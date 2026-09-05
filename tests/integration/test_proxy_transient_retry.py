@@ -752,11 +752,11 @@ async def test_stream_codex_transcript_usage_limit_fails_over_without_surfacing_
     await _import_account(async_client, "acc_codex_quota_b", "codex-quota-b@example.com")
 
     seen_account_ids: list[str | None] = []
-    dispatched_payloads: list[dict] = []
+    dispatched_inputs: list[list[dict]] = []
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
         seen_account_ids.append(account_id)
-        dispatched_payloads.append(payload)
+        dispatched_inputs.append(payload.input)
         if account_id == "acc_codex_quota_a":
             raise ProxyResponseError(
                 429,
@@ -795,7 +795,7 @@ async def test_stream_codex_transcript_usage_limit_fails_over_without_surfacing_
 
     # The replacement account receives the same transcript without the
     # response-owned item ids that belonged to the exhausted account.
-    replacement_input = dispatched_payloads[1]["input"]
+    replacement_input = dispatched_inputs[1]
     assert [item["type"] for item in replacement_input] == ["compaction", "message"]
     assert all("id" not in item for item in replacement_input)
     assert replacement_input[0]["encrypted_content"] == "portable-blob"
