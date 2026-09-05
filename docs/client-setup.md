@@ -8,7 +8,7 @@ The examples below use the current frontier lineup: **`gpt-5.6-sol`** (strongest
 
 | Client | Endpoint | Config |
 |--------|----------|--------|
-| [Codex CLI](#codex-cli-ide-extension) | `http://127.0.0.1:2455/backend-api/codex` | `~/.codex/config.toml` |
+| [Codex CLI](#codex-cli-ide-extension) | `http://127.0.0.1:2455/backend-api/codex` (root `/responses` aliases also supported) | `~/.codex/config.toml` |
 | [OpenCode](#opencode) | `http://127.0.0.1:2455/v1` | `~/.config/opencode/opencode.json` |
 | [OpenClaw](#openclaw) | `http://127.0.0.1:2455/v1` | `~/.openclaw/openclaw.json` |
 | [Hermes Agent](#hermes-agent) | `http://127.0.0.1:2455/v1` | `~/.hermes/config.yaml` |

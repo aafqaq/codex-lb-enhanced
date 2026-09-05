@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -31,6 +32,24 @@ export function useSettings() {
   });
   const settingsQuery = { data, error, isFetching, isLoading, isPending, isSuccess, refetch };
 
+  const refreshSettings = useCallback(async () => {
+    await queryClient.refetchQueries({
+      type: "active",
+      predicate: (query) => {
+        const root = query.queryKey[0];
+        return (
+          root === "settings" ||
+          root === "accounts" ||
+          root === "firewall" ||
+          root === "quota-planner" ||
+          root === "sticky-sessions" ||
+          root === "model-sources" ||
+          root === "api-keys"
+        );
+      },
+    });
+  }, [queryClient]);
+
   const updateSettingsMutation = useMutation({
     mutationFn: (payload: SettingsUpdateRequest) => updateSettings(payload),
     onSuccess: () => {
@@ -50,6 +69,7 @@ export function useSettings() {
 
   return {
     settingsQuery,
+    refreshSettings,
     updateSettingsMutation,
   };
 }

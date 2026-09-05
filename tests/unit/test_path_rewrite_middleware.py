@@ -5,6 +5,7 @@ import pytest
 from app.core.middleware.path_rewrite import (
     BackendApiCodexV1AliasMiddleware,
     _canonicalize_backend_api_codex_path,
+    _canonicalize_root_responses_path,
     _canonicalize_raw_path,
 )
 from app.core.middleware.trusted_proxy_headers import TrustedProxyHeadersMiddleware
@@ -60,6 +61,38 @@ def test_canonicalize_raw_path_preserves_query_segment() -> None:
 def test_canonicalize_raw_path_noop_for_canonical() -> None:
     raw = b"/backend-api/codex/models"
     assert _canonicalize_raw_path(raw) is raw or _canonicalize_raw_path(raw) == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("/responses", "/v1/responses"),
+        ("/responses/", "/v1/responses/"),
+        ("/responses/compact", "/v1/responses/compact"),
+        ("/responses/compact/", "/v1/responses/compact/"),
+        ("/api/settings", "/api/settings"),
+    ],
+)
+def test_canonicalize_root_responses_path(raw: str, expected: str) -> None:
+    assert _canonicalize_root_responses_path(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_middleware_rewrites_root_responses_http_and_websocket() -> None:
+    inner = _RecordingApp()
+    middleware = BackendApiCodexV1AliasMiddleware(inner)
+    for scope_type in ("http", "websocket"):
+        await middleware(
+            {
+                "type": scope_type,
+                "path": "/responses",
+                "raw_path": b"/responses",
+            },
+            lambda: None,
+            lambda message: None,
+        )
+    assert [call["path"] for call in inner.calls] == ["/v1/responses", "/v1/responses"]
+    assert [call["raw_path"] for call in inner.calls] == [b"/v1/responses", b"/v1/responses"]
 
 
 # ---- middleware scope-level tests --------------------------------------------

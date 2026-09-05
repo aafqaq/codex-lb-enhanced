@@ -26,7 +26,7 @@ CODE_EXTENSIONS = {".py"}
 CODE_DIRS = {"app/", "tests/"}
 
 # Exclusion patterns
-EXCLUDE_PATTERNS = {"__pycache__/", ".claude/", ".agents/"}
+EXCLUDE_PATTERNS = {"__pycache__/", ".agents/"}
 
 
 def is_code_file(file_path: str, project_dir: str) -> bool:
