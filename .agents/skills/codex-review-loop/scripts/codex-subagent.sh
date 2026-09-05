@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# codex-subagent.sh — Thin wrapper for Codex review via Claude Code
+# codex-subagent.sh — Thin wrapper for Codex review
 #
-# Timeout bypass: run via Bash(run_in_background=true) in Claude Code.
+# Timeout bypass: run from a background-capable shell when needed.
 # No sentinel files, no nohup, no IPC.
 #
 # Usage:

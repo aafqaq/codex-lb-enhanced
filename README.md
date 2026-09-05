@@ -81,8 +81,8 @@ Client request
 
 ## Interfaces and clients
 
-- **Codex desktop, CLI, and IDE integrations:** `/backend-api/codex`, Responses wire protocol, WebSocket support, and Codex quota headers.
-- **OpenAI-compatible clients:** `/v1`, including Responses, Chat Completions, models, and usage endpoints.
+- **Codex desktop, CLI, and IDE integrations:** `/backend-api/codex`, Responses wire protocol, WebSocket support, and Codex quota headers. The latest Codex clients may also call the root `/responses` and `/responses/compact` aliases directly; both forms are supported.
+- **OpenAI-compatible clients:** `/v1`, including Responses, Chat Completions, models, and usage endpoints. Root `/responses` and `/responses/compact` are equivalent compatibility aliases.
 - **Web dashboard:** accounts, API keys, usage windows, reports, request logs, and recovery diagnostics.
 - **Upstream transports:** HTTP and WebSocket, with deployment-level forcing and bridge-assisted fallback.
 
@@ -106,7 +106,7 @@ docker run -d --name codex-lb-enhanced \
   --network codex-lb-net \
   -p 2455:2455 -p 1455:1455 \
   -v codex-lb-enhanced-data:/var/lib/codex-lb \
-  ghcr.io/aafqaq/codex-lb-enhanced:1.25.2
+  ghcr.io/aafqaq/codex-lb-enhanced:1.25.3
 ```
 
 Open [http://localhost:2455](http://localhost:2455), complete initialization, add accounts, and create an API key. For production, keep your existing ports, volume, environment, network, and restart policy; pin a versioned image and back up the data volume before upgrades.
@@ -130,6 +130,8 @@ requires_openai_auth = true
 
 Replace `base_url` with your reverse-proxy address and use an API key created in the dashboard. Other clients can continue using `/v1` without changing their OpenAI SDK integration.
 
+For a client that appends `/responses` directly to the server root, use `http://127.0.0.1:2455` as its base URL. The resulting `/responses` and `/responses/compact` requests are routed to the same OpenAI-compatible handlers.
+
 ### Run locally from source
 
 The application launcher is the same one used by the package and Docker image:
@@ -149,7 +151,7 @@ uv run codex-lb
 
 ## Release and image
 
-Current release: **v1.25.2**. GitHub Actions validates every `main` change, publishes the rolling GHCR image, and publishes versioned images and Python artifacts through GitHub Releases. For production, use the immutable version tag [v1.25.2](https://github.com/aafqaq/codex-lb-enhanced/releases/tag/v1.25.2) instead of `latest`.
+Current release: **v1.25.3**. This release adapts the Responses routing used by the latest Codex clients, including GPT‑6-compatible clients that send root `/responses` requests. GitHub Actions validates every `main` change, publishes the rolling GHCR image, and publishes versioned images and Python artifacts through GitHub Releases. For production, use the immutable version tag [v1.25.3](https://github.com/aafqaq/codex-lb-enhanced/releases/tag/v1.25.3) instead of `latest`.
 
 ## License and disclaimer
 

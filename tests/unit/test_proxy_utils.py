@@ -362,6 +362,27 @@ async def test_account_scoped_invalid_request_error_still_penalizes_account() ->
 
 
 @pytest.mark.asyncio
+async def test_account_health_persistence_failure_is_isolated_from_request() -> None:
+    load_balancer = SimpleNamespace(
+        record_error=AsyncMock(side_effect=RuntimeError("health store unavailable")),
+        mark_rate_limit=AsyncMock(),
+        mark_quota_exceeded=AsyncMock(),
+        mark_permanent_failure=AsyncMock(),
+    )
+    proxy = SimpleNamespace(_load_balancer=load_balancer)
+
+    classified = await streaming_helpers_module._handle_stream_error(
+        proxy,
+        cast(Account, SimpleNamespace(id="acc-health-store")),
+        {"message": "upstream unavailable"},
+        "upstream_error",
+    )
+
+    assert classified["failure_class"] == "retryable_transient"
+    load_balancer.record_error.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_stream_idle_timeout_does_not_penalize_account() -> None:
     load_balancer = SimpleNamespace(
         record_error=AsyncMock(),

@@ -23,6 +23,7 @@ _RESPONSES_INGRESS_PATHS = frozenset(
     {
         "/backend-api/codex/responses",
         "/v1/responses",
+        "/responses",
     }
 )
 _OPENAI_INGRESS_PATH_PREFIXES = (
