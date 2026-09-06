@@ -775,7 +775,15 @@ async def test_stream_codex_transcript_usage_limit_fails_over_without_surfacing_
         "prompt_cache_key": "thread-codex-quota",
         "stream_options": {"include_obfuscation": False},
         "input": [
-            {"type": "compaction", "id": "cmpt_owner_a", "encrypted_content": "portable-blob"},
+            {"type": "reasoning", "id": "rs_owner_a", "encrypted_content": "portable-blob", "summary": []},
+            {
+                "type": "function_call",
+                "id": "fc_owner_a",
+                "call_id": "call_owner_a",
+                "name": "now",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "id": "fco_owner_a", "call_id": "call_owner_a", "output": "12:00"},
             {
                 "type": "message",
                 "id": "msg_owner_a",
@@ -796,7 +804,12 @@ async def test_stream_codex_transcript_usage_limit_fails_over_without_surfacing_
     # The replacement account receives the same transcript without the
     # response-owned item ids that belonged to the exhausted account.
     replacement_input = dispatched_inputs[1]
-    assert [item["type"] for item in replacement_input] == ["compaction", "message"]
+    assert [item["type"] for item in replacement_input] == [
+        "reasoning",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
     assert all("id" not in item for item in replacement_input)
     assert replacement_input[0]["encrypted_content"] == "portable-blob"
 

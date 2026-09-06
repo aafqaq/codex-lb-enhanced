@@ -19,9 +19,6 @@ _TOOL_CALL_TYPE_BY_OUTPUT_TYPE = {
 }
 _TOOL_CALL_TYPES = frozenset(_TOOL_CALL_TYPE_BY_OUTPUT_TYPE.values())
 _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset({"tool_search_call", "tool_search_output", "web_search_call"})
-# Input items whose only account-owned field is the response id: the encrypted
-# payload beside it is the documented portable form of the same state.
-_PORTABLE_ENCRYPTED_ITEM_TYPES = frozenset({"compaction", "reasoning"})
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
 _CODEX_CLIENT_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id", "create_time", "content_item_kinds"})
@@ -48,7 +45,6 @@ _ACCOUNT_NEUTRAL_MESSAGE_ROLES = frozenset({"assistant", "developer", "system", 
 _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = frozenset(
     {
         "additional_tools",
-        "compaction",
         "reasoning",
         "apply_patch_call",
         "apply_patch_call_output",
@@ -78,10 +74,6 @@ _ACCOUNT_NEUTRAL_CONTENT_FIELDS = {
 }
 _ACCOUNT_NEUTRAL_INPUT_ITEM_FIELDS = {
     "additional_tools": frozenset({"role", "tools", "type"}),
-    # Codex replays the compaction item emitted by a remote compact turn the
-    # same way it replays reasoning: the id belongs to the account that
-    # produced it, the encrypted content is portable model context.
-    "compaction": frozenset({"encrypted_content", "id", "status", "type"}),
     # OpenAI documents that ``store:false`` continuations must replay the
     # encrypted reasoning items returned by the previous response.  The
     # response id is account-owned and is removed during projection, while
@@ -262,8 +254,8 @@ def _project_account_neutral_replay_item(
         return item
     if item_type is not None and not isinstance(item_type, str):
         return item
-    if item_type in _PORTABLE_ENCRYPTED_ITEM_TYPES:
-        return _project_portable_encrypted_item(item, item_type)
+    if item_type == "reasoning":
+        return _project_portable_reasoning_item(item)
     if item_type in _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES and item.get("status") == "completed":
         return None
 
@@ -286,29 +278,26 @@ def _project_account_neutral_replay_item(
     return projected_item
 
 
-def _project_portable_encrypted_item(item: Mapping[str, JsonValue], item_type: str) -> dict[str, JsonValue] | None:
-    """Keep the encrypted model state required by ``store:false`` replay.
+def _project_portable_reasoning_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    """Keep the encrypted reasoning state required by ``store:false`` replay.
 
-    Reasoning and compaction response ids belong to the account that issued
-    them and must not be sent to a replacement account.  The encrypted
-    content, however, is the portable state explicitly intended for manual
-    history replay by the Responses API.  Keep only the fields documented for
-    the item type and require a non-empty encrypted payload so
-    malformed/account-bound items fail closed.
+    Reasoning response ids belong to the account that issued them and must not
+    be sent to a replacement account.  The encrypted content, however, is the
+    portable reasoning state explicitly intended for manual history replay by
+    the Responses API.  Keep only the documented reasoning fields and require
+    a non-empty encrypted payload so malformed/account-bound items fail closed.
     """
 
     encrypted_content = item.get("encrypted_content")
     if not _is_nonblank_string(encrypted_content):
         return None
     projected: dict[str, JsonValue] = {
-        "type": item_type,
+        "type": "reasoning",
         "encrypted_content": encrypted_content,
     }
     summary = item.get("summary")
     if summary is not None:
-        # Only reasoning carries a summary; a compaction item that grew one
-        # is an unrecognized shape and must not move accounts silently.
-        if item_type != "reasoning" or not isinstance(summary, list):
+        if not isinstance(summary, list):
             return None
         projected["summary"] = summary
     status = item.get("status")
@@ -475,14 +464,11 @@ def responses_input_suffix_retains_prior_output(
                 return False
             fresh_developer_followup_seen = True
             continue
-        # Portable encrypted reasoning and compaction state is replayable,
-        # not a retained assistant turn boundary.  It may appear between the
-        # stored prefix and the assistant message in Codex full resends;
-        # treat a validated item as transparent while proving that the prior
-        # output is kept.
-        if item_type in _PORTABLE_ENCRYPTED_ITEM_TYPES and (
-            _project_portable_encrypted_item(item, cast(str, item_type)) is not None
-        ):
+        # Portable encrypted reasoning is replayable state, not a retained
+        # assistant turn boundary.  It may appear between the stored prefix
+        # and the assistant message in Codex full resends; treat a validated
+        # item as transparent while proving that the prior output is kept.
+        if item_type == "reasoning" and _project_portable_reasoning_item(item) is not None:
             continue
         return False
     return retained_output_seen and fresh_followup_seen and not pending_suffix_calls
@@ -1530,8 +1516,8 @@ def _input_items_have_valid_account_neutral_shape(input_items: list[JsonValue]) 
         if not isinstance(item, dict):
             return False
         item_type = item.get("type")
-        if item_type in _PORTABLE_ENCRYPTED_ITEM_TYPES:
-            if _project_portable_encrypted_item(item, cast(str, item_type)) is None:
+        if item_type == "reasoning":
+            if _project_portable_reasoning_item(item) is None:
                 return False
             continue
         if item_type in {"input_file", "input_image", "input_text"}:
@@ -1620,12 +1606,11 @@ def _contains_account_scoped_input_state(
         current = pending.pop()
         if isinstance(current, dict):
             item_type = current.get("type")
-            # ``encrypted_content`` is deliberately portable reasoning and
-            # compaction state for store:false history replay.  Validate its
-            # shape separately instead of treating it as a generic
-            # account-scoped reference.
-            if item_type in _PORTABLE_ENCRYPTED_ITEM_TYPES:
-                if _project_portable_encrypted_item(current, cast(str, item_type)) is None:
+            # ``encrypted_content`` is deliberately portable reasoning state
+            # for store:false history replay.  Validate its shape separately
+            # instead of treating it as a generic account-scoped reference.
+            if item_type == "reasoning":
+                if _project_portable_reasoning_item(current) is None:
                     return True
                 continue
             if isinstance(item_type, str) and item_type in _ACCOUNT_SCOPED_HOSTED_INPUT_TYPES:
