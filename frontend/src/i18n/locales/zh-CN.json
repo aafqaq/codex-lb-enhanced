@@ -222,6 +222,8 @@
   "apiKeys.form.enforcedReasoning": "强制 Effort",
   "apiKeys.form.enforcedServiceTier": "强制 service tier",
   "apiKeys.form.expiry": "过期时间",
+  "apiKeys.form.forceFastMode": "强制开启 FAST 模式",
+  "apiKeys.form.forceFastModeHint": "该 Key 的所有请求都走 Codex 的 Fast 档（上游 service_tier: priority）。",
   "apiKeys.form.general": "常规",
   "apiKeys.form.httpClientRouting": "HTTP 客户端路由",
   "apiKeys.form.limits": "限制",

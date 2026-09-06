@@ -33,6 +33,11 @@ const ApiKeyUsageSummarySchema = z.object({
 const SERVICE_TIERS = ["auto", "default", "priority", "flex", "ultrafast"] as const;
 export type ServiceTierType = (typeof SERVICE_TIERS)[number];
 
+// Codex names this tier "Fast" in its model catalog and sends it upstream as
+// `service_tier: "priority"` (ServiceTier::Fast.request_value() in the Codex
+// protocol crate accepts "fast" and "priority" interchangeably).
+export const FAST_MODE_SERVICE_TIER: ServiceTierType = "priority";
+
 export const TRAFFIC_CLASSES = ["foreground", "opportunistic"] as const;
 export type TrafficClass = (typeof TRAFFIC_CLASSES)[number];
 export const CODEX_QUOTA_MODES = ["api_key", "pool"] as const;

@@ -222,6 +222,8 @@
   "apiKeys.form.enforcedReasoning": "Enforced Effort",
   "apiKeys.form.enforcedServiceTier": "강제 service tier",
   "apiKeys.form.expiry": "만료",
+  "apiKeys.form.forceFastMode": "Fast 모드 강제",
+  "apiKeys.form.forceFastModeHint": "이 키의 모든 요청을 Codex Fast 등급으로 보냅니다 (업스트림 service_tier: priority).",
   "apiKeys.form.general": "일반",
   "apiKeys.form.httpClientRouting": "HTTP client routing",
   "apiKeys.form.limits": "Limits",

@@ -39,7 +39,7 @@ import { ModelMultiSelect } from "@/features/api-keys/components/model-multi-sel
 import { ReasoningEffortsMultiSelect } from "@/features/api-keys/components/reasoning-efforts-multi-select";
 import { UsageSectionsMultiSelect } from "@/features/api-keys/components/usage-sections-multi-select";
 import { ModelSourceMultiSelect } from "@/features/model-sources/components/model-source-multi-select";
-import { CODEX_QUOTA_MODES } from "@/features/api-keys/schemas";
+import { CODEX_QUOTA_MODES, FAST_MODE_SERVICE_TIER } from "@/features/api-keys/schemas";
 import type {
   ApiKey,
   ApiKeyUpdateRequest,
@@ -379,6 +379,29 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
                 onChange={(selectedReasoningEfforts) => updateDraft({
                   selectedReasoningEfforts,
                   enforcedReasoningEffort: selectedReasoningEfforts.length > 0 ? "none" : draft.enforcedReasoningEffort,
+                })}
+              />
+            </div>
+
+            <div className="flex items-center justify-between rounded-md border p-2 text-sm">
+              <div>
+                <label htmlFor="edit-api-key-force-fast-mode" className="cursor-pointer font-medium">
+                  {t("apiKeys.form.forceFastMode")}
+                </label>
+                <p className="text-xs text-muted-foreground">{t("apiKeys.form.forceFastModeHint")}</p>
+              </div>
+              <Switch
+                id="edit-api-key-force-fast-mode"
+                checked={draft.enforcedServiceTier === FAST_MODE_SERVICE_TIER}
+                onCheckedChange={(checked) => updateDraft({
+                  // Codex maps its Fast tier onto the upstream "priority"
+                  // service tier; turning the switch off only clears the
+                  // enforcement this switch owns.
+                  enforcedServiceTier: checked
+                    ? FAST_MODE_SERVICE_TIER
+                    : draft.enforcedServiceTier === FAST_MODE_SERVICE_TIER
+                      ? "none"
+                      : draft.enforcedServiceTier,
                 })}
               />
             </div>

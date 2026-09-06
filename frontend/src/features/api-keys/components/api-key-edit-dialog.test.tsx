@@ -556,6 +556,83 @@ describe("ApiKeyEditDialog", () => {
     expect(payload.codexQuotaPassthroughEnabled).toBe(false);
   });
 
+  it("submits the Fast tier when forcing Fast mode on", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={createApiKey()}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("switch", { name: /force fast mode/i }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    // Codex sends its Fast tier upstream as service_tier "priority".
+    expect(onSubmit.mock.calls[0][0].enforcedServiceTier).toBe("priority");
+  });
+
+  it("clears the enforced tier when forcing Fast mode off", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={createApiKey({ enforcedServiceTier: "priority" })}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    const forceFast = screen.getByRole("switch", { name: /force fast mode/i });
+    expect(forceFast).toBeChecked();
+
+    await user.click(forceFast);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    expect(onSubmit.mock.calls[0][0].enforcedServiceTier).toBeNull();
+  });
+
+  it("leaves an unrelated enforced tier alone when Fast mode is off", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={createApiKey({ enforcedServiceTier: "flex" })}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    expect(screen.getByRole("switch", { name: /force fast mode/i })).not.toBeChecked();
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    expect(onSubmit.mock.calls[0][0].enforcedServiceTier).toBe("flex");
+  });
+
   it("shows the stored Ultrafast service tier", () => {
     renderWithProviders(
       <ApiKeyEditDialog

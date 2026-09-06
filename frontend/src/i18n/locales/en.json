@@ -222,6 +222,8 @@
   "apiKeys.form.enforcedReasoning": "Enforced Effort",
   "apiKeys.form.enforcedServiceTier": "Enforced service tier",
   "apiKeys.form.expiry": "Expiry",
+  "apiKeys.form.forceFastMode": "Force Fast mode",
+  "apiKeys.form.forceFastModeHint": "Send every request from this key on Codex's Fast tier (upstream service_tier: priority).",
   "apiKeys.form.general": "General",
   "apiKeys.form.httpClientRouting": "HTTP client routing",
   "apiKeys.form.limits": "Limits",
